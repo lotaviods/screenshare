@@ -23,9 +23,11 @@ pub fn run() {
                 audio: tokio::sync::Mutex::new(AudioEngine::default()),
                 capture: tokio::sync::Mutex::new(capture),
                 call: tokio::sync::Mutex::new(None),
+                share: std::sync::Mutex::new(None),
                 mic_running: std::sync::atomic::AtomicBool::new(false),
                 app: app.handle().clone(),
             });
+            commands::spawn_hotplug_watcher(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -50,6 +52,7 @@ pub fn run() {
             commands::join_room,
             commands::leave_room,
             commands::delete_room,
+            commands::local_frame,
             commands::remote_frame,
             commands::set_peer_volume,
         ])

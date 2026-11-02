@@ -251,6 +251,7 @@ input[readonly] {
 }
 .stage-surface {
   flex: 1;
+  position: relative;
   background: #17181a;
   border-radius: 10px;
   display: flex;
@@ -268,6 +269,33 @@ input[readonly] {
   max-height: 100%;
   border-radius: 6px;
   background: #000;
+}
+
+.self-preview {
+  position: absolute;
+  right: 1rem;
+  bottom: 1rem;
+  margin: 0;
+  width: 22%;
+  min-width: 160px;
+  border: 1px solid #3a3b3f;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #000;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+}
+
+.self-preview canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.self-preview figcaption {
+  padding: 0.15rem 0.4rem;
+  font-size: 0.75rem;
+  color: #b8b9bd;
+  background: rgba(0, 0, 0, 0.6);
 }
 
 .peer-volume {

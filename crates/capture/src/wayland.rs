@@ -38,6 +38,13 @@ impl Default for WaylandCapture {
     }
 }
 
+impl WaylandCapture {
+    /// Latest JPEG self-view frame of the running capture.
+    pub fn latest_preview(&self) -> Option<Vec<u8>> {
+        self.active.as_ref().and_then(|a| a.stream.latest_preview())
+    }
+}
+
 #[async_trait]
 impl ScreenCapture for WaylandCapture {
     fn list_sources(&self) -> Vec<CaptureSource> {

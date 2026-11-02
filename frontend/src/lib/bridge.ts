@@ -42,6 +42,8 @@ export const api = {
 
   /** Latest decoded video frame (JPEG) from a peer; empty when unavailable. */
   remoteFrame: (peerId: string) => invoke<ArrayBuffer>("remote_frame", { peerId }),
+  /** Latest JPEG frame of the local share, for the self-view preview. */
+  localFrame: () => invoke<ArrayBuffer>("local_frame"),
   setPeerVolume: (peerId: string, volume: number) =>
     invoke<void>("set_peer_volume", { peerId, volume }),
 };

@@ -36,7 +36,12 @@ spec against the current code. Checkboxes are off until implemented.
 - [x] Source enumeration — Wayland delegates to the portal picker.
 - [x] Cursor mode (hidden / embedded / metadata) mapping.
 - [x] Resolution + frame-rate + bitrate + codec selection.
-- [ ] Dynamic monitor change (hotplug) while sharing.
+- [x] Local self-view: the capture pipeline tees a JPEG branch (10 fps) for a
+      picture-in-picture preview of what is being shared.
+- [x] Dynamic monitor change (hotplug): a watcher re-checks the source list
+      every 3 s while sharing and moves capture to a remaining source when the
+      shared one disappears. Linux portal/X11 expose one synthetic source, so
+      this only takes effect where sources are enumerable (Windows).
 - [x] Start/stop without restarting the call; portal session close + thread join.
 - [x] Runtime backend selection from `CaptureBackend`.
 - Note: H.264 is encoded as constrained-baseline Annex-B, which is what the

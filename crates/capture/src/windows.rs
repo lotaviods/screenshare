@@ -29,6 +29,13 @@ impl Default for WindowsCapture {
     }
 }
 
+impl WindowsCapture {
+    /// Latest JPEG self-view frame of the running capture.
+    pub fn latest_preview(&self) -> Option<Vec<u8>> {
+        self.stream.as_ref().and_then(|s| s.latest_preview())
+    }
+}
+
 #[async_trait]
 impl ScreenCapture for WindowsCapture {
     fn list_sources(&self) -> Vec<CaptureSource> {

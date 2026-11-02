@@ -14,7 +14,7 @@ use std::sync::atomic::Ordering;
 use tauri::{Emitter, Manager, State};
 use tokio::sync::mpsc;
 
-use crate::state::AppState;
+use crate::state::{AppState, ShareTarget};
 
 /// Event name the frontend listens on for call state changes.
 pub const CALL_EVENT: &str = "call-event";
@@ -112,10 +112,11 @@ pub async fn start_screen_share(
     }
     let mut engine = state.capture.lock().await;
     engine
-        .start(source, options, tx)
+        .start(source.clone(), options.clone(), tx)
         .await
         .map_err(|e| e.to_string())?;
     drop(engine);
+    *state.share.lock().unwrap() = Some(ShareTarget { source, options });
     // Tell the other participants that a screen is being shared, so they know
     // whose video to render.
     let call = state.call.lock().await;
@@ -127,6 +128,7 @@ pub async fn start_screen_share(
 
 #[tauri::command]
 pub async fn stop_screen_share(state: State<'_, AppState>) -> Result<(), String> {
+    *state.share.lock().unwrap() = None;
     let mut engine = state.capture.lock().await;
     engine.stop().await.map_err(|e| e.to_string())?;
     drop(engine);
@@ -290,6 +292,7 @@ fn remember_room(app: &tauri::AppHandle, room_id: &str) {
 /// Disconnect from the signaling server and tear down the call session.
 #[tauri::command]
 pub async fn disconnect_server(state: State<'_, AppState>) -> Result<(), String> {
+    *state.share.lock().unwrap() = None;
     let mut call = state.call.lock().await;
     if let Some(session) = call.as_ref() {
         // Close the peer connections and stop the decoders before dropping
@@ -343,6 +346,58 @@ pub async fn remote_frame(
         Some(bytes) => tauri::ipc::Response::new(bytes),
         None => tauri::ipc::Response::new(Vec::new()),
     })
+}
+
+/// The latest JPEG self-view frame of the local screen share. Empty when not
+/// sharing or when the capture backend has not produced a frame yet.
+#[tauri::command]
+pub async fn local_frame(state: State<'_, AppState>) -> Result<tauri::ipc::Response, String> {
+    let frame = {
+        let engine = state.capture.lock().await;
+        engine.latest_preview()
+    };
+    Ok(match frame {
+        Some(bytes) => tauri::ipc::Response::new(bytes),
+        None => tauri::ipc::Response::new(Vec::new()),
+    })
+}
+
+/// Follow monitor hotplug: when the shared source disappears, restart capture
+/// on the first remaining source so the share does not silently go black.
+pub fn spawn_hotplug_watcher(app: tauri::AppHandle) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+            let state = app.state::<AppState>();
+            let Some(target) = state.share.lock().unwrap().clone() else {
+                continue;
+            };
+
+            let sources = state.capture.lock().await.list_sources();
+            if sources.iter().any(|s| s.id == target.source.id) {
+                continue;
+            }
+            let Some(next) = sources.into_iter().next() else {
+                continue;
+            };
+
+            let tx = media_sink(&state, LocalStream::Screen).await;
+            let mut engine = state.capture.lock().await;
+            if engine
+                .start(next.clone(), target.options.clone(), tx)
+                .await
+                .is_ok()
+            {
+                drop(engine);
+                *state.share.lock().unwrap() = Some(ShareTarget {
+                    source: next,
+                    options: target.options,
+                });
+                tracing::info!("shared source disappeared, moved capture to a remaining source");
+            }
+        }
+    });
 }
 
 /// Set the playback volume for one peer's audio.

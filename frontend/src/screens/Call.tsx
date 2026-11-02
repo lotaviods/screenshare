@@ -35,7 +35,9 @@ export default function Call({
   const [shareOpen, setShareOpen] = useState(false);
   const [micVolume, setMicVolume] = useState(config.audio.mic_volume);
   const [status, setStatus] = useState<string | null>(null);
+  const [pip, setPip] = useState(true);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const selfCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const sharer = participants.find((p) => p.screen_on);
 
   // Poll the decoded remote frame and paint it onto the canvas.
@@ -79,6 +81,49 @@ export default function Call({
       if (timer) window.clearTimeout(timer);
     };
   }, [sharer]);
+
+  // Poll the local capture preview and paint it into the PiP canvas, so the
+  // sharer can see what they are sharing.
+  useEffect(() => {
+    if (!sharing) return;
+    let cancelled = false;
+    let timer: number | undefined;
+
+    const tick = async () => {
+      try {
+        const buffer = await api.localFrame();
+        if (cancelled || !buffer || buffer.byteLength === 0) return;
+        const bitmap = await createImageBitmap(
+          new Blob([buffer], { type: "image/jpeg" }),
+        );
+        if (cancelled) {
+          bitmap.close();
+          return;
+        }
+        const canvas = selfCanvasRef.current;
+        if (canvas) {
+          canvas.width = bitmap.width;
+          canvas.height = bitmap.height;
+          canvas.getContext("2d")?.drawImage(bitmap, 0, 0);
+        }
+        bitmap.close();
+      } catch {
+        // No preview frame yet; keep polling.
+      }
+    };
+
+    const loop = () => {
+      void tick().finally(() => {
+        if (!cancelled) timer = window.setTimeout(loop, 200);
+      });
+    };
+    void loop();
+
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [sharing]);
 
   // Mirror the configured device/volume into the audio engine.
   useEffect(() => {
@@ -189,7 +234,18 @@ export default function Call({
               <canvas ref={canvasRef} className="remote-canvas" />
             </>
           ) : (
-            <p className="muted">No one is sharing a screen.</p>
+            <p className="muted">
+              {sharing
+                ? "You are sharing your screen."
+                : "No one is sharing a screen."}
+            </p>
+          )}
+
+          {sharing && pip && (
+            <figure className="self-preview" title="Your screen (picture in picture)">
+              <canvas ref={selfCanvasRef} />
+              <figcaption>You</figcaption>
+            </figure>
           )}
         </div>
 
@@ -228,6 +284,13 @@ export default function Call({
               Share screen
             </button>
           )}
+          <button
+            className={pip ? "control active" : "control"}
+            onClick={() => setPip((v) => !v)}
+            title="Toggle picture in picture"
+          >
+            PiP
+          </button>
           <div className="grow" />
           <button className="control" onClick={onDeleteRoom}>
             Delete room

@@ -4,7 +4,7 @@
 //! code; they differ only in the source element and how they obtain it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Mutex, Once};
 use std::thread::JoinHandle;
 
 #[cfg(unix)]
@@ -28,12 +28,19 @@ pub type KeepAlive = ();
 pub struct Stream {
     running: Arc<AtomicBool>,
     thread: JoinHandle<()>,
+    /// Latest JPEG preview of the captured frames, for the local self-view.
+    preview: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 impl Stream {
     pub fn stop(self) {
         self.running.store(false, Ordering::SeqCst);
         let _ = self.thread.join();
+    }
+
+    /// Latest JPEG frame of what this stream is capturing, if any.
+    pub fn latest_preview(&self) -> Option<Vec<u8>> {
+        self.preview.lock().unwrap().clone()
     }
 }
 
@@ -154,7 +161,8 @@ pub fn encoder_chain(
     software_chain(codec, bitrate_kbps)
 }
 
-/// Build a full capture pipeline: `source` → scale → rate → encode → appsink.
+/// Build a full capture pipeline: `source` → scale → rate → tee, where one
+/// branch encodes for the call and the other produces JPEG self-view frames.
 pub fn build_launch(source: &str, opts: &CaptureOptions) -> String {
     let (enc, caps) =
         encoder_chain(opts.codec, opts.bitrate_kbps, opts.hardware_encoding, &element_exists);
@@ -162,8 +170,12 @@ pub fn build_launch(source: &str, opts: &CaptureOptions) -> String {
         "{source} ! videoconvert ! videoscale ! \
          video/x-raw,width={w},height={h} ! \
          videorate ! video/x-raw,framerate={fps}/1 ! \
-         {enc} ! \
-         appsink name=sink sync=false max-buffers=2 drop=true caps={caps}",
+         tee name=t \
+         t. ! queue ! {enc} ! \
+         appsink name=sink sync=false max-buffers=2 drop=true caps={caps} \
+         t. ! queue ! videorate ! video/x-raw,framerate=10/1 ! \
+         jpegenc quality=70 ! \
+         appsink name=preview sync=false max-buffers=1 drop=true",
         w = opts.width,
         h = opts.height,
         fps = opts.fps,
@@ -180,23 +192,30 @@ pub fn spawn(
     keep_alive: KeepAlive,
 ) -> Result<Stream, CaptureError> {
     let running = Arc::new(AtomicBool::new(true));
+    let preview = Arc::new(Mutex::new(None));
     let thread = std::thread::Builder::new()
         .name("sharescreen-capture".into())
         .spawn({
             let running = running.clone();
+            let preview = preview.clone();
             move || {
                 let _keep_alive = keep_alive;
-                run_pipeline(launch, running, sink, codec);
+                run_pipeline(launch, running, preview, sink, codec);
             }
         })
         .map_err(|e| CaptureError::Failed(format!("failed to spawn capture thread: {e}")))?;
 
-    Ok(Stream { running, thread })
+    Ok(Stream {
+        running,
+        thread,
+        preview,
+    })
 }
 
 fn run_pipeline(
     launch: String,
     running: Arc<AtomicBool>,
+    preview: Arc<Mutex<Option<Vec<u8>>>>,
     sink: mpsc::Sender<EncodedSample>,
     codec: Codec,
 ) {
@@ -240,6 +259,10 @@ fn run_pipeline(
         return;
     };
 
+    let preview_sink = pipeline
+        .by_name("preview")
+        .and_then(|el| el.downcast::<gstreamer_app::AppSink>().ok());
+
     let timeout = gst::ClockTime::from_mseconds(100);
 
     'outer: while running.load(Ordering::SeqCst) {
@@ -247,6 +270,17 @@ fn run_pipeline(
             if let Some(enc) = sample_to_encoded(&sample, codec) {
                 if sink.blocking_send(enc).is_err() {
                     break 'outer; // consumer dropped
+                }
+            }
+        }
+
+        // Keep the self-view branch drained even when the UI is not polling.
+        if let Some(preview_sink) = &preview_sink {
+            while let Some(sample) = preview_sink.try_pull_sample(gst::ClockTime::ZERO) {
+                if let Some(buffer) = sample.buffer() {
+                    if let Ok(map) = buffer.map_readable() {
+                        *preview.lock().unwrap() = Some(map.as_slice().to_vec());
+                    }
                 }
             }
         }
@@ -382,5 +416,34 @@ mod tests {
         assert!(s.contains("framerate=30/1"));
         assert!(s.contains("vp8enc deadline=1 cpu-used=6 target-bitrate=2500000"));
         assert!(s.contains("name=sink"));
+        assert!(s.contains("name=preview"));
+    }
+
+    #[test]
+    fn preview_branch_emits_jpeg() {
+        // The self-view branch must actually produce decodable JPEG frames.
+        gst::init().unwrap();
+        let launch = build_launch("videotestsrc num-buffers=10", &opts(Codec::Vp8));
+        let pipeline = gst::parse::launch(&launch)
+            .expect("pipeline parses")
+            .downcast::<gst::Pipeline>()
+            .unwrap();
+        let preview = pipeline
+            .by_name("preview")
+            .unwrap()
+            .downcast::<gstreamer_app::AppSink>()
+            .unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+
+        let sample = preview
+            .try_pull_sample(gst::ClockTime::from_mseconds(3000))
+            .expect("a preview frame");
+        let buffer = sample.buffer().unwrap();
+        let map = buffer.map_readable().unwrap();
+        assert!(
+            map.as_slice().starts_with(&[0xff, 0xd8]),
+            "preview frame is not a JPEG"
+        );
+        pipeline.set_state(gst::State::Null).unwrap();
     }
 }

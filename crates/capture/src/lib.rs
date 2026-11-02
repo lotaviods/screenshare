@@ -39,6 +39,19 @@ pub enum CaptureEngine {
 }
 
 impl CaptureEngine {
+    /// Latest JPEG self-view frame of the running capture, for the local
+    /// picture-in-picture preview.
+    pub fn latest_preview(&self) -> Option<Vec<u8>> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Wayland(w) => w.latest_preview(),
+            #[cfg(target_os = "linux")]
+            Self::X11(x) => x.latest_preview(),
+            #[cfg(windows)]
+            Self::Windows(w) => w.latest_preview(),
+        }
+    }
+
     /// Build the engine for the requested backend. `Auto` and `Portal` select
     /// the desktop-portal path on Linux (which also covers X11 sessions via the
     /// portal) and `gdiscreencapsrc` on Windows; `X11` selects the native
