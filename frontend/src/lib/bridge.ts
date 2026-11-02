@@ -44,6 +44,14 @@ export const api = {
   remoteFrame: (peerId: string) => invoke<ArrayBuffer>("remote_frame", { peerId }),
   /** Latest JPEG frame of the local share, for the self-view preview. */
   localFrame: () => invoke<ArrayBuffer>("local_frame"),
+  /** The shared screen frame for the picture-in-picture window. */
+  pipFrame: () => invoke<ArrayBuffer>("pip_frame"),
+  /** Open the OS-level always-on-top PiP window. Idempotent. */
+  openPipWindow: () => invoke<void>("open_pip_window"),
+  /** Close the PiP window. */
+  closePipWindow: () => invoke<void>("close_pip_window"),
+  /** Whether a signaling server session is active. */
+  isConnected: () => invoke<boolean>("is_connected"),
   setPeerVolume: (peerId: string, volume: number) =>
     invoke<void>("set_peer_volume", { peerId, volume }),
 };

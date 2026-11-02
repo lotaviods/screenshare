@@ -126,7 +126,7 @@ export default function ShareDialog({
           <label>
             <span>Frame rate</span>
             <select value={fps} onChange={(e) => setFps(Number(e.target.value))}>
-              {[15, 24, 30, 60].map((f) => (
+              {[15, 24, 30, 60, 90, 120].map((f) => (
                 <option key={f} value={f}>
                   {f} fps
                 </option>

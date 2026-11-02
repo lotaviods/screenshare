@@ -54,6 +54,10 @@ pub fn run() {
             commands::delete_room,
             commands::local_frame,
             commands::remote_frame,
+            commands::pip_frame,
+            commands::open_pip_window,
+            commands::close_pip_window,
+            commands::is_connected,
             commands::set_peer_volume,
         ])
         .run(tauri::generate_context!())

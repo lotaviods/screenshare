@@ -219,6 +219,19 @@ impl CallSession {
         self.shared.remote.latest_frame(peer_id)
     }
 
+    /// The latest decoded frame of whichever participant is sharing, if any.
+    pub fn shared_screen_frame(&self) -> Option<Vec<u8>> {
+        let sharer = self
+            .shared
+            .roster
+            .read()
+            .unwrap()
+            .values()
+            .find(|p| p.screen_on)
+            .map(|p| p.id.clone())?;
+        self.shared.remote.latest_frame(&sharer)
+    }
+
     /// Set the playback volume for a peer's audio.
     pub fn set_peer_volume(&self, peer_id: &str, volume: f64) {
         self.shared.remote.set_peer_volume(peer_id, volume);

@@ -31,6 +31,7 @@ export default function App() {
       .getConfig()
       .then(setConfig)
       .catch((e) => setError(errorMessage(e)));
+    api.isConnected().then(setConnected).catch(() => undefined);
   }, []);
 
   useEffect(() => {

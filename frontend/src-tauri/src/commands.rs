@@ -10,8 +10,9 @@ use sharescreen_core::{
 };
 use sharescreen_config::Config;
 use sharescreen_network as network;
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use tauri::{Emitter, Manager, State};
+use tauri::{Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::mpsc;
 
 use crate::state::{AppState, ShareTarget};
@@ -224,7 +225,7 @@ pub async fn set_system_volume(state: State<'_, AppState>, volume: f32) -> Resul
 pub async fn connect_server(state: State<'_, AppState>) -> Result<(), String> {
     let mut call = state.call.lock().await;
     if call.is_some() {
-        return Err("already connected to a signaling server".into());
+        return Ok(()); // idempotent
     }
 
     let config = {
@@ -287,6 +288,12 @@ fn remember_room(app: &tauri::AppHandle, room_id: &str) {
     };
     store.config_mut().record_joined_room(room_id.to_string());
     let _ = store.save();
+}
+
+/// Whether a signaling server session is active.
+#[tauri::command]
+pub async fn is_connected(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.call.lock().await.is_some())
 }
 
 /// Disconnect from the signaling server and tear down the call session.
@@ -360,6 +367,58 @@ pub async fn local_frame(state: State<'_, AppState>) -> Result<tauri::ipc::Respo
         Some(bytes) => tauri::ipc::Response::new(bytes),
         None => tauri::ipc::Response::new(Vec::new()),
     })
+}
+
+/// The latest decoded video frame (JPEG) of whoever is sharing their screen,
+/// for the picture-in-picture window. Falls back to the local capture preview
+/// when nobody else is sharing.
+#[tauri::command]
+pub async fn pip_frame(state: State<'_, AppState>) -> Result<tauri::ipc::Response, String> {
+    let frame = {
+        let call = state.call.lock().await;
+        call.as_ref().and_then(|s| s.shared_screen_frame())
+    };
+    if frame.is_some() {
+        return Ok(tauri::ipc::Response::new(frame.unwrap()));
+    }
+    // Fall back to local preview when no remote sharer.
+    let preview = {
+        let engine = state.capture.lock().await;
+        engine.latest_preview()
+    };
+    Ok(match preview {
+        Some(bytes) => tauri::ipc::Response::new(bytes),
+        None => tauri::ipc::Response::new(Vec::new()),
+    })
+}
+
+/// Open a separate always-on-top PiP window showing the shared screen.
+/// Uses the same frontend bundle with `?pip=1`. Idempotent: returns Ok
+/// if the window already exists.
+#[tauri::command]
+pub async fn open_pip_window(app: tauri::AppHandle) -> Result<(), String> {
+    // If the window already exists, focus it.
+    if app.get_webview_window("pip").is_some() {
+        return Ok(());
+    }
+    WebviewWindowBuilder::new(&app, "pip", WebviewUrl::App(PathBuf::from("index.html?pip=1")))
+        .title("Sharescreen PiP")
+        .always_on_top(true)
+        .decorations(false)
+        .resizable(false)
+        .inner_size(320.0, 240.0)
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Close the PiP window if it is open.
+#[tauri::command]
+pub async fn close_pip_window(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("pip") {
+        window.close().map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Follow monitor hotplug: when the shared source disappears, restart capture

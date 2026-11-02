@@ -142,6 +142,12 @@ spec against the current code. Checkboxes are off until implemented.
       mic mute+volume, system volume.
 - [x] Call commands: connect/disconnect server, create/join/leave room.
 - [x] `CallEvent` → Tauri event bridge (`call-event`).
+- [x] `is_connected` command + `connect_server` idempotent (returns `Ok(())`
+      when already connected). Frontend checks `is_connected` on mount to
+      restore state after hot reload.
+- [x] PiP window: `open_pip_window` / `close_pip_window` / `pip_frame`
+      commands. OS-level always-on-top webview window with no decorations,
+      running `index.html?pip=1` which loads the Pip.tsx screen.
 - [x] Local media routed into the call session when connected, discarded otherwise.
 - [x] App state: `tokio::sync::Mutex` engines + sync config store.
 - [x] Wired `core`/`config`/`capture`/`audio`/`call`/`network` crates into state.
@@ -174,10 +180,12 @@ spec against the current code. Checkboxes are off until implemented.
       room, recent rooms, participant list.
 - [x] **Call screen** — participant list with connection state, mic toggle +
       volume, system-audio toggle, share start/stop, leave, settings.
-- [x] **Screen-sharing dialog** — source picker, resolution, fps, bitrate,
-      hardware-encode toggle, system-audio toggle. The codec is shown read-only:
-      it is fixed per call (negotiated with the peer connection) and set in
-      Settings.
+      PiP is a Firefox-style overlay button on the remote video that opens
+      an OS-level always-on-top window (`?pip=1`).
+- [x] **Screen-sharing dialog** — source picker, resolution, fps (15–120),
+      bitrate, hardware-encode toggle, system-audio toggle. The codec is shown
+      read-only: it is fixed per call (negotiated with the peer connection) and
+      set in Settings.
 - [x] **Settings screen** — identity, network (host/port/secure, STUN/TURN),
       audio devices + volumes, video quality, capture backend.
 - [x] **Error / permission UX** — error banner, portal permission denials
