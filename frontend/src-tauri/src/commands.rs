@@ -296,6 +296,13 @@ pub async fn is_connected(state: State<'_, AppState>) -> Result<bool, String> {
     Ok(state.call.lock().await.is_some())
 }
 
+/// The current room id, if any.
+#[tauri::command]
+pub async fn get_current_room(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    let call = state.call.lock().await;
+    Ok(call.as_ref().and_then(|s| s.room_id()))
+}
+
 /// Disconnect from the signaling server and tear down the call session.
 #[tauri::command]
 pub async fn disconnect_server(state: State<'_, AppState>) -> Result<(), String> {

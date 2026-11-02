@@ -31,7 +31,16 @@ export default function App() {
       .getConfig()
       .then(setConfig)
       .catch((e) => setError(errorMessage(e)));
-    api.isConnected().then(setConnected).catch(() => undefined);
+    api.isConnected().then(async (ok) => {
+      if (!ok) return;
+      setConnected(true);
+      // On hot reload, restore the room the process was in.
+      const rid = await api.getCurrentRoom();
+      if (rid) {
+        setRoomId(rid);
+        setScreen("call");
+      }
+    }).catch(() => undefined);
   }, []);
 
   useEffect(() => {
@@ -44,6 +53,8 @@ export default function App() {
         case "room_joined":
           setRoomId(event.room_id);
           setScreen("call");
+          // Refresh config to pick up updated recent_rooms.
+          api.getConfig().then(setConfig).catch(() => undefined);
           break;
         case "room_deleted":
           setRoomId(null);

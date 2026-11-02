@@ -52,6 +52,8 @@ export const api = {
   closePipWindow: () => invoke<void>("close_pip_window"),
   /** Whether a signaling server session is active. */
   isConnected: () => invoke<boolean>("is_connected"),
+  /** Current room id, if any. Use to restore room state after reload. */
+  getCurrentRoom: () => invoke<string | null>("get_current_room"),
   setPeerVolume: (peerId: string, volume: number) =>
     invoke<void>("set_peer_volume", { peerId, volume }),
 };
