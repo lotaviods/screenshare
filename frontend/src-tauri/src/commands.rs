@@ -365,7 +365,8 @@ pub async fn local_frame(state: State<'_, AppState>) -> Result<tauri::ipc::Respo
 /// Follow monitor hotplug: when the shared source disappears, restart capture
 /// on the first remaining source so the share does not silently go black.
 pub fn spawn_hotplug_watcher(app: tauri::AppHandle) {
-    tokio::spawn(async move {
+    // `setup` runs outside a Tokio runtime, so spawn on Tauri's.
+    tauri::async_runtime::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
