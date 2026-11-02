@@ -1,0 +1,25 @@
+[package]
+name = "sharescreen-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Screen capture backends for Sharescreen (XDG portal + PipeWire + GStreamer)"
+
+[dependencies]
+sharescreen-core = { path = "../core" }
+
+gstreamer = "0.25"
+gstreamer-app = "0.25"
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.13", features = ["screencast"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }

@@ -1,0 +1,17 @@
+[package]
+name = "sharescreen-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Remote media ingestion and decoding for Sharescreen"
+
+[dependencies]
+sharescreen-core = { path = "../core" }
+sharescreen-webrtc = { path = "../webrtc" }
+
+gstreamer = "0.25"
+gstreamer-app = "0.25"
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

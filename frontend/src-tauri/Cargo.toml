@@ -1,0 +1,27 @@
+[package]
+name = "sharescreen-tauri"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Tauri shell and commands for Sharescreen"
+
+[lib]
+name = "sharescreen_tauri_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+sharescreen-core = { path = "../../crates/core" }
+sharescreen-config = { path = "../../crates/config" }
+sharescreen-capture = { path = "../../crates/capture" }
+sharescreen-audio = { path = "../../crates/audio" }
+sharescreen-call = { path = "../../crates/call" }
+sharescreen-network = { path = "../../crates/network" }

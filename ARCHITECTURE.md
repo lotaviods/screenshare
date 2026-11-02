@@ -1,0 +1,229 @@
+# Sharescreen Architecture
+
+Discord-like voice + screen sharing desktop application. Rust owns the native
+functionality and the media pipeline; Tauri provides the shell and UI; WebRTC
+carries real-time media.
+
+## Goals
+
+- Cross-platform: Linux (Wayland + X11, Hyprland/KDE/GNOME/Sway) and Windows 10/11.
+- Low-latency screen sharing with system audio and microphone audio.
+- Self-hostable signaling, STUN/TURN, and optional SFU.
+- Configurable, modular, extensible to an SFU without a rewrite.
+
+## Non-goals
+
+- Chat/messaging. This is calls + screen sharing only, for now.
+- MCU (mixing) — selective forwarding, not transcoding, if an SFU is added.
+- iOS/Android/macOS in the first release.
+
+## High-level architecture
+
+```
+┌────────────────────────────── Desktop app (Tauri) ─────────────────────────────┐
+│                                                                                │
+│  React/TS UI  ── commands/events ──►  tauri crate (commands, state)            │
+│                                          │                                     │
+│              ┌───────────────────────────┼───────────────────────────┐          │
+│              ▼                           ▼                           ▼          │
+│        capture crate               audio crate                webrtc crate      │
+│   (portal/PipeWire, X11, WGC)  (mic + system loopback)   (peer connections)    │
+│              │                           │                           │          │
+│              └───────────────►  GStreamer encode  ◄──────────────────┘          │
+│                                          │                                     │
+│                                    signaling crate                             │
+│                              (WebSocket client to server)                      │
+└──────────────────────────────────────────┬─────────────────────────────────────┘
+                                           │ WSS
+                                 ┌─────────▼─────────┐
+                                 │  signaling server  │  Rust + axum
+                                 │  (rooms, relay)    │
+                                 └─────────┬─────────┘
+                    ┌──────────────────────┼──────────────────────┐
+                    ▼                      ▼                      ▼
+                STUN (coturn)          TURN (coturn)        optional SFU
+            NAT discovery          relay fallback        (LiveKit / rheomesh)
+```
+
+Media flows peer-to-peer through WebRTC. The signaling server never proxies
+media, only SDP/ICE/room state. TURN relays only when direct paths fail.
+
+## Key decisions
+
+### WebRTC library: `webrtc` crate (webrtc-rs) v0.21
+
+The `webrtc` crate is the recommended Rust client stack. It exposes an async
+`RTCPeerConnection` (Tokio), maps cleanly to the browser model the UI and
+server expect, and includes media track support (VP8/VP9/H264/H265, Opus),
+ICE, DTLS-SRTP, NACK, TWCC, and bandwidth estimation.
+
+- **Why not `str0m`**: str0m is a Sans-I/O core with no capture, encode, decode,
+  render, or TURN client. It is an excellent fit for an SFU/server later, not
+  for a desktop client that must capture and encode media. We keep signaling
+  and media transport decoupled so an SFU built on `str0m`/`rheomesh`/LiveKit
+  can replace the mesh later without touching capture/audio.
+- Pin the exact 0.21 minor version: the 0.21 line is pre-1.0 and may break API
+  on a minor bump.
+
+### Linux capture: XDG Desktop Portal + PipeWire + GStreamer
+
+Wayland capture is not compositor-specific. The standard path is
+`org.freedesktop.portal.ScreenCast` + PipeWire, which Hyprland, KDE Plasma,
+GNOME, and Sway all implement via their portal backends.
+
+- `ashpd` crate: typed zbus wrapper for the ScreenCast portal. Creates a
+  session, lets the user pick monitor/window (compositor-native permission
+  dialog), starts the stream, and returns the PipeWire node id + remote fd.
+- `pipewire` crate: consumes the captured frames.
+- **GStreamer** (via `gstreamer` Rust bindings): receives PipeWire frames and
+  encodes them (`vaapih264enc`, `nvh264enc`, `vah264enc`, `vp8enc`, `x264enc`),
+  then hands encoded frames to `webrtc` tracks through an `appsink`. This gives
+  hardware-accelerated encoding without writing encoder code by hand, and the
+  same pipeline shape works on Windows.
+
+The portal permission dialog is handled by the compositor; the app only observes
+the result and surfaces `PermissionDenied` if the user declines.
+
+X11 uses a separate backend (XCB + GStreamer `ximagesrc`, or `x11grab`).
+
+### Windows capture
+
+- `Windows.Graphics.Capture` (WGC) for screen/window capture (Win10 1803+).
+- Desktop Duplication API (DXGI) as a fallback where WGC is unsuitable.
+- WASAPI for microphone capture; WASAPI loopback for system audio.
+- Hardware encode via Media Foundation / DXVA, or GStreamer with `d3d11h264enc`
+  / `nvh264enc`.
+
+The `ScreenCapture` / `AudioCapture` traits hide all of this behind one
+interface per platform; nothing platform-specific leaks into `core`, `webrtc`,
+or the frontend.
+
+### Audio
+
+Two independent local sources plus remote audio:
+
+1. Microphone — `pulsesrc`/`autoaudiosrc` (Linux), WASAPI (Windows).
+2. System audio — PulseAudio/PipeWire monitor source (Linux), WASAPI loopback
+   (Windows).
+
+Both encode to Opus independently and are sent as separate WebRTC tracks so a
+remote user can mute screen audio without muting the mic. Volume, mute, echo
+cancellation, and noise suppression apply per source. Device disconnection is
+surfaced as an event and the track is re-negotiated, not torn down blindly.
+
+### Signaling: axum + WebSocket
+
+The signaling server is a separate Rust crate (`server/`) using axum + tokio.
+Responsibilities: room create/join, participant roster, SDP offer/answer relay,
+ICE candidate relay, optional room password/token, and ephemeral TURN
+credential provisioning. It never touches media.
+
+### TURN/STUN: coturn
+
+coturn provides STUN for discovery and TURN for relay. TURN credentials are
+provisioned per-session by the signaling server (HMAC or REST auth) rather than
+baked into the client, so long-lived secrets never sit in the desktop app.
+
+### Configuration store
+
+User preferences are a TOML file (`~/.config/sharescreen/config.toml`) via the
+`directories` crate, with compiled-in defaults written on first launch. SQLite
+is reserved for server-side room metadata only if in-memory proves insufficient
+— not for desktop preferences.
+
+## Workspace layout
+
+```
+sharescreen/
+├── crates/
+│   ├── core/        # domain model + traits (no OS/Tauri/GStreamer deps)
+│   ├── config/      # config + preferences persistence + validation
+│   ├── capture/     # ScreenCapture trait impls (portal/PipeWire, X11, WGC)
+│   ├── audio/       # AudioCapture trait impls (mic + system loopback)
+│   ├── webrtc/      # peer connection wrapper, track wiring, renegotiation
+│   ├── signaling/   # client-side WebSocket signaling
+│   ├── network/     # ICE/STUN/TURN config, candidate handling
+│   ├── platform/    # OS detection, device enumeration, permissions
+│   └── tauri/       # Tauri commands, events, app state, lifecycle
+├── server/          # axum signaling server (independent of the app)
+├── frontend/        # React + TypeScript UI
+├── deploy/          # Docker Compose, Dockerfiles, .env.example
+└── Cargo.toml       # workspace
+```
+
+Dependency direction is one-way: `core` is the lowest layer; `config` depends on
+`core`; capture/audio/webrtc depend on `core`; `tauri` composes everything. No
+crate named `core` collides with the builtin `core` crate because packages are
+`sharescreen-core`, etc.
+
+## Media pipeline
+
+Capture → encode → sample queue → WebRTC track. No raw frames cross Tauri IPC.
+
+```
+portal/pipewire (or WGC/DXGI, X11)  ──►  GStreamer encoder  ──►  appsink
+                                                                   │ EncodedSample
+                                                                   ▼
+                                                        mpsc channel (bounded)
+                                                                   │
+                                                              webrtc crate
+                                                       TrackLocalStaticSample
+                                                                   │ RTP
+                                                                   ▼
+                                                              UDP sockets
+```
+
+`EncodedSample { kind, codec, data, timestamp_micros, keyframe }` is the shared
+unit between capture/audio backends and the WebRTC layer, defined in `core`.
+
+## Signaling protocol (draft)
+
+JSON messages over WebSocket:
+
+- `client → server`: `create_room`, `join_room { room_id, token? }`,
+  `leave_room`, `offer { to, sdp }`, `answer { to, sdp }`,
+  `ice_candidate { to, candidate }`, `get_turn_credentials`.
+- `server → client`: `room_created`, `joined`, `peer_joined`, `peer_left`,
+  `offer`, `answer`, `ice_candidate`, `turn_credentials`, `error`.
+
+The exact schema is implemented with `serde` in `core`/`signaling` and mirrored
+in TypeScript.
+
+## Security
+
+- WSS for production signaling (plain WS only for local dev).
+- Ephemeral TURN credentials provisioned by the server; never persist long-lived
+  TURN secrets in the client config.
+- Room access tokens / optional passwords; the server validates input and
+  enforces ownership, so no unauthenticated room administration.
+- Local config holds no secrets by default.
+
+## Deployment
+
+`deploy/compose.yaml` defines independently toggleable `signaling`, `coturn`,
+and (optional) `sfu` services, with env-var config, health checks, restart
+policies, and a `.env.example`. The app also works against externally hosted
+infrastructure without Docker.
+
+## Testing matrix
+
+Automated: config validation + persistence, signaling integration, WebRTC
+connectivity (loopback), device enumeration, capture start/stop, reconnection,
+and resource-cleanup tests.
+
+Manual: Hyprland Wayland, KDE Plasma Wayland, GNOME Wayland, Sway, X11,
+Windows 10, Windows 11 — for mic-only, screen-only, screen+system-audio, and
+simultaneous mic+system-audio calls.
+
+## Roadmap
+
+1. Architecture doc + workspace scaffold (this increment).
+2. `core` domain model + traits, `config` persistence + validation.
+3. Linux Wayland capture (portal + PipeWire + GStreamer).
+4. Windows capture (WGC/DXGI).
+5. Microphone + system audio capture.
+6. WebRTC media transport (mesh).
+7. Signaling server + client.
+8. Tauri commands/events + React/TS frontend.
+9. Docker Compose infrastructure.
+10. Automated tests + manual testing matrix.

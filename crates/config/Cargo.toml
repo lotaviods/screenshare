@@ -1,0 +1,16 @@
+[package]
+name = "sharescreen-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Configuration and persistent user preferences for Sharescreen"
+
+[dependencies]
+sharescreen-core = { path = "../core" }
+
+serde.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+directories.workspace = true

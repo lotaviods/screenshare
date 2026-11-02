@@ -1,0 +1,80 @@
+# Sharescreen infrastructure.
+#
+#   docker compose -f deploy/compose.yaml --env-file deploy/.env up -d
+#
+# Services:
+#   signaling  room management + WebRTC signaling + TURN credential issuance
+#   coturn     STUN/TURN for NAT traversal and relay fallback
+#
+# The `sfu` service is optional and off by default (profile `sfu`); the desktop
+# client currently negotiates a peer-to-peer mesh only.
+
+name: sharescreen
+
+services:
+  signaling:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.signaling
+    image: sharescreen-signaling:latest
+    restart: unless-stopped
+    environment:
+      PORT: "8080"
+      RUST_LOG: "${RUST_LOG:-info}"
+      # TURN credentials handed to clients (coturn's shared-secret scheme).
+      TURN_URLS: "turn:turn:3478?transport=udp,turn:turn:3478?transport=tcp,turns:turn:5349?transport=tcp"
+      TURN_SECRET: "${TURN_SECRET:?set TURN_SECRET in deploy/.env}"
+      TURN_TTL: "${TURN_TTL:-3600}"
+      TURN_USER: "${TURN_USER:-sharescreen}"
+    ports:
+      - "${SIGNALING_PORT:-8080}:8080"
+    depends_on:
+      coturn:
+        condition: service_started
+    networks: [sharescreen]
+
+  coturn:
+    image: coturn/coturn:latest
+    restart: unless-stopped
+    # The shared secret must match the signaling server's TURN_SECRET.
+    command:
+      - --listening-port=3478
+      - --tls-listening-port=5349
+      - --fingerprint
+      - --lt-cred-mech
+      - --use-auth-secret
+      - --static-auth-secret=${TURN_SECRET:?set TURN_SECRET in deploy/.env}
+      - --realm=${TURN_REALM:-turn.example.com}
+      - --no-multicast-peers
+      - --min-port=49152
+      - --max-port=65535
+    # Relay ports must be reachable for TURN to relay media.
+    ports:
+      - "${TURN_PORT:-3478}:3478/udp"
+      - "${TURN_PORT:-3478}:3478/tcp"
+      - "${TURN_TLS_PORT:-5349}:5349/tcp"
+      - "${TURN_MIN_PORT:-49152}-${TURN_MAX_PORT:-65535}:${TURN_MIN_PORT:-49152}-${TURN_MAX_PORT:-65535}/udp"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 3478 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks: [sharescreen]
+
+  # Optional SFU. Enable with: --profile sfu
+  sfu:
+    image: livekit/livekit-server:latest
+    profiles: ["sfu"]
+    restart: unless-stopped
+    command: --dev --bind 0.0.0.0
+    environment:
+      LIVEKIT_KEYS: "${LIVEKIT_KEY:-devkey: secret}"
+    ports:
+      - "${SFU_PORT:-7880}:7880/tcp"
+      - "${SFU_UDP_PORT:-7881}:7881/udp"
+    networks: [sharescreen]
+
+networks:
+  sharescreen:
+    driver: bridge

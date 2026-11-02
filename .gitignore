@@ -1,0 +1,37 @@
+# --- Rust ---------------------------------------------------------------
+/target
+**/target
+*.rs.bk
+*.pdb
+
+# --- Node / frontend ----------------------------------------------------
+node_modules/
+dist/
+.pnpm-store/
+.vite/
+*.tsbuildinfo
+pnpm-debug.log*
+npm-debug.log*
+yarn-error.log*
+
+# --- Tauri --------------------------------------------------------------
+frontend/src-tauri/gen/
+frontend/src-tauri/target/
+*.dmg
+*.AppImage
+*.msi
+*.deb
+*.rpm
+
+# --- Secrets and local state --------------------------------------------
+.env
+.env.*
+!.env.example
+*.log
+*.pid
+
+# --- Editors / OS -------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,32 @@
+[package]
+name = "sharescreen-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Signaling server for Sharescreen (axum + WebSocket)"
+
+[lib]
+name = "sharescreen_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sharescreen-server"
+path = "src/main.rs"
+
+[dependencies]
+sharescreen-core = { path = "../crates/core" }
+
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hmac = "0.12"
+sha1 = "0.10"
+base64 = "0.22"
+
+[dev-dependencies]
+sharescreen-signaling = { path = "../crates/signaling" }

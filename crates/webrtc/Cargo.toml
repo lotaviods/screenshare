@@ -1,0 +1,23 @@
+[package]
+name = "sharescreen-webrtc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "WebRTC media transport for Sharescreen (mesh peer connections)"
+
+[dependencies]
+sharescreen-core = { path = "../core" }
+
+webrtc = "0.21.1"
+rtc = "0.21.1"
+bytes = "1"
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+sharescreen-core = { path = "../core" }

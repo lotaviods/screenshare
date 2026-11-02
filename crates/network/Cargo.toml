@@ -1,0 +1,11 @@
+[package]
+name = "sharescreen-network"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ICE/STUN/TURN and signaling endpoint configuration for Sharescreen"
+
+[dependencies]
+sharescreen-config = { path = "../config" }
+sharescreen-webrtc = { path = "../webrtc" }

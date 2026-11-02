@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/config",
+    "crates/capture",
+    "crates/audio",
+    "crates/webrtc",
+    "crates/signaling",
+    "crates/call",
+    "crates/media",
+    "crates/network",
+    "server",
+    "frontend/src-tauri",
+    # Added incrementally:
+    # "crates/capture",
+    # "crates/audio",
+    # "crates/webrtc",
+    # "crates/signaling",
+    # "crates/network",
+    # "crates/platform",
+    # "crates/tauri",
+    # "server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.80"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+thiserror = "2"
+tracing = "0.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "net", "time", "io-util"] }
+async-trait = "0.1"
+directories = "6"
+axum = { version = "0.8", features = ["ws"] }
+tokio-tungstenite = "0.30"
+futures-util = "0.3"

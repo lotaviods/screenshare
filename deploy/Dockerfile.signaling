@@ -1,0 +1,32 @@
+# syntax=docker/dockerfile:1
+
+# --- build ------------------------------------------------------------------
+FROM rust:1-bookworm AS builder
+
+WORKDIR /src
+
+# The signaling server depends only on core + serde/axum/tokio, so no
+# GStreamer or WebKit system libraries are needed in the image. Only the
+# selected package is built; other workspace members are not compiled.
+COPY . .
+RUN cargo build --release -p sharescreen-server
+
+# --- runtime ----------------------------------------------------------------
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /src/target/release/sharescreen-server /usr/local/bin/sharescreen-server
+
+ENV PORT=8080 \
+    RUST_LOG=info
+
+EXPOSE 8080
+
+# The image ships no curl/wget; the server checks its own listening socket.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["sharescreen-server", "--health-check"]
+
+ENTRYPOINT ["sharescreen-server"]

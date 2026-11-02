@@ -1,0 +1,8 @@
+target
+node_modules
+frontend/dist
+frontend/src-tauri/target
+.git
+.gitignore
+deploy/.env
+*.log
