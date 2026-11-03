@@ -448,6 +448,9 @@ async fn feed(
             );
         }
         packets += 1;
+        if packets % 500 == 0 {
+            tracing::info!("remote track: {packets} RTP packets received");
+        }
         let mut buffer = gst::Buffer::from_mut_slice(packet.to_bytes());
         if let Some(raw) = buffer.get_mut() {
             raw.set_pts(gst::ClockTime::from_nseconds(

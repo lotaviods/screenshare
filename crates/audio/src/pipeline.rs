@@ -170,10 +170,16 @@ fn run(
     };
 
     let timeout = gst::ClockTime::from_mseconds(100);
+    tracing::info!("audio capture started");
+    let mut samples: u64 = 0;
 
     'outer: while running.load(Ordering::SeqCst) {
         if let Some(sample) = appsink.try_pull_sample(timeout) {
             if let Some(enc) = sample_to_encoded(&sample) {
+                samples += 1;
+                if samples == 1 || samples % 250 == 0 {
+                    tracing::info!("audio capture: {samples} encoded sample(s)");
+                }
                 if sink.blocking_send(enc).is_err() {
                     break 'outer; // consumer dropped
                 }
