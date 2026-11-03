@@ -59,6 +59,11 @@ fn rtp_pts(buffer: &gst::Buffer, clock_rate: u32) -> Option<gst::ClockTime> {
 impl Decoder {
     /// Create a decoder pipeline for a remote track of the given kind/codec.
     pub fn new(kind: RemoteTrackKind, codec: Codec) -> Result<Self, MediaError> {
+        // `video_pipeline`/`audio_pipeline` build `gst::Caps`, which panics if
+        // GStreamer has not been initialized yet. The first remote track can
+        // arrive before any other GStreamer use in the process (e.g. a viewer
+        // that is not sharing), so initialize here, before touching caps.
+        ensure_gst_init();
         let (launch, caps) = match kind {
             RemoteTrackKind::Audio => audio_pipeline(codec)?,
             RemoteTrackKind::Video => video_pipeline(codec)?,

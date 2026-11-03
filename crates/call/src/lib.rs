@@ -62,6 +62,9 @@ struct Shared {
     /// apart from the roster because the state can arrive before the roster
     /// names the peer.
     remote_media: Arc<RwLock<HashMap<String, RemoteMediaState>>>,
+    /// ICE candidates that arrived before the peer existed, or before its
+    /// remote description was set. Flushed once the connection can accept them.
+    pending_ice: Arc<RwLock<HashMap<String, Vec<IceCandidate>>>>,
     /// What this peer is publishing, mirrored to the other participants.
     local: Arc<RwLock<LocalMedia>>,
     mic: Arc<MediaHub>,
@@ -104,6 +107,7 @@ impl CallSession {
             peers: Arc::new(RwLock::new(HashMap::new())),
             roster: Arc::new(RwLock::new(HashMap::new())),
             remote_media: Arc::new(RwLock::new(HashMap::new())),
+            pending_ice: Arc::new(RwLock::new(HashMap::new())),
             local: Arc::new(RwLock::new(LocalMedia::default())),
             mic: mic.clone(),
             system: system.clone(),
@@ -317,6 +321,8 @@ async fn handle_message(shared: &Shared, msg: SignalMessage) {
                     if let Some(peer) = peer {
                         if let Err(e) = peer.set_remote_description(&desc).await {
                             tracing::warn!("failed to set answer on {from}: {e}");
+                        } else {
+                            flush_pending_candidates(shared, &from).await;
                         }
                     }
                 }
@@ -324,14 +330,7 @@ async fn handle_message(shared: &Shared, msg: SignalMessage) {
             },
             PeerPayload::IceCandidate { candidate } => {
                 match serde_json::from_str::<IceCandidate>(&candidate) {
-                    Ok(cand) => {
-                        let peer = shared.peers.read().unwrap().get(&from).cloned();
-                        if let Some(peer) = peer {
-                            if let Err(e) = peer.add_ice_candidate(cand).await {
-                                tracing::warn!("failed to add ice candidate from {from}: {e}");
-                            }
-                        }
-                    }
+                    Ok(cand) => add_or_buffer_candidate(shared, &from, cand).await,
                     Err(e) => tracing::warn!("bad ice candidate from {from}: {e}"),
                 }
             }
@@ -437,6 +436,10 @@ fn broadcast_local_state(shared: &Shared) {
 async fn offer_to(shared: &Shared, peer_id: &str) -> Result<(), CallError> {
     let peer = create_peer(shared, peer_id).await?;
     let offer = peer.create_offer().await?;
+    // Applying the local description starts ICE gathering and sends our
+    // candidates; without it the remote never gets a usable candidate pair
+    // and the connection stalls in `Connecting`.
+    peer.set_local_description(&offer).await?;
     shared.sender.send(SignalMessage::ToPeer {
         to: peer_id.to_string(),
         payload: PeerPayload::Offer {
@@ -460,6 +463,7 @@ async fn answer_peer(
         None => create_peer(shared, peer_id).await?,
     };
     peer.set_remote_description(&offer).await?;
+    flush_pending_candidates(shared, peer_id).await;
     let answer = peer.create_answer().await?;
     peer.set_local_description(&answer).await?;
     shared.sender.send(SignalMessage::ToPeer {
@@ -501,6 +505,7 @@ async fn close_peer(shared: &Shared, peer_id: &str) {
     shared.mic.unregister(peer_id);
     shared.system.unregister(peer_id);
     shared.screen.unregister(peer_id);
+    shared.pending_ice.write().unwrap().remove(peer_id);
     // Stop the decoder pipelines for this peer's tracks; otherwise they keep
     // running (and, for audio, keep playing) after the peer is gone.
     shared.remote.detach(peer_id);
@@ -518,6 +523,44 @@ async fn close_all_peers(shared: &Shared) {
     }
     shared.roster.write().unwrap().clear();
     shared.remote_media.write().unwrap().clear();
+    shared.pending_ice.write().unwrap().clear();
+}
+
+/// Try to add an ICE candidate for a peer; if the peer is not ready yet,
+/// buffer the candidate until its remote description is set.
+async fn add_or_buffer_candidate(shared: &Shared, from: &str, cand: IceCandidate) {
+    let peer = shared.peers.read().unwrap().get(from).cloned();
+    if let Some(peer) = peer {
+        if peer.add_ice_candidate(cand.clone()).await.is_ok() {
+            return;
+        }
+    }
+    shared
+        .pending_ice
+        .write()
+        .unwrap()
+        .entry(from.to_string())
+        .or_default()
+        .push(cand);
+}
+
+/// Flush ICE candidates buffered before the peer's remote description existed.
+async fn flush_pending_candidates(shared: &Shared, peer_id: &str) {
+    let pending = shared
+        .pending_ice
+        .write()
+        .unwrap()
+        .remove(peer_id)
+        .unwrap_or_default();
+    if pending.is_empty() {
+        return;
+    }
+    let peer = shared.peers.read().unwrap().get(peer_id).cloned();
+    if let Some(p) = peer {
+        for cand in pending {
+            let _ = p.add_ice_candidate(cand).await;
+        }
+    }
 }
 
 /// Build the per-peer event callback: relays ICE candidates and reports

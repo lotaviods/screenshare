@@ -162,6 +162,10 @@ spec against the current code. Checkboxes are off until implemented.
       connected, encoded Opus crossed the wire.
 - [x] Video track payload type follows the track's codec.
 - [x] Remote decode tests: VP8 RTP → JPEG, H264 RTP (STAP-A) → JPEG.
+- [x] End-to-end H.264 over a real WebRTC peer connection → JPEG, both
+      directions (media crate).
+- [x] Full-call video through the real signaling server: two `CallSession`s,
+      offer/answer/ICE, H.264 frames reach the viewer (call crate).
 - [ ] Device enumeration (list mic/output/monitor on each platform).
 - [ ] Capture start/stop + resource-cleanup test.
 - [ ] Reconnection test.

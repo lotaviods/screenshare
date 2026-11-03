@@ -20,3 +20,5 @@ tracing.workspace = true
 [dev-dependencies]
 sharescreen-server = { path = "../../server" }
 axum.workspace = true
+gstreamer = "0.25"
+gstreamer-app = "0.25"

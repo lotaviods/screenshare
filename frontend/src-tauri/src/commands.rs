@@ -413,7 +413,7 @@ pub async fn open_pip_window(app: tauri::AppHandle) -> Result<(), String> {
         .always_on_top(true)
         .decorations(false)
         .resizable(false)
-        .inner_size(320.0, 240.0)
+        .inner_size(480.0, 270.0)
         .build()
         .map_err(|e| e.to_string())?;
     Ok(())

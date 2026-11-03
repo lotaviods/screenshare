@@ -101,7 +101,7 @@ pub fn software_chain(codec: Codec, bitrate_kbps: u32) -> (String, &'static str)
         #[cfg(target_os = "linux")]
         Codec::H264 => (
             format!(
-                "x264enc tune=zerolatency speed-preset=veryfast bitrate={bitrate_kbps} ! h264parse"
+                "x264enc tune=zerolatency speed-preset=veryfast key-int-max=60 bitrate={bitrate_kbps} ! h264parse"
             ),
             "video/x-h264,profile=constrained-baseline,stream-format=byte-stream,alignment=au",
         ),
@@ -114,14 +114,14 @@ pub fn software_chain(codec: Codec, bitrate_kbps: u32) -> (String, &'static str)
         ),
         Codec::Vp9 => (
             format!(
-                "vp9enc deadline=1 cpu-used=6 target-bitrate={}",
+                "vp9enc deadline=1 cpu-used=6 keyframe-max-dist=60 target-bitrate={}",
                 bitrate_kbps * 1000
             ),
             "video/x-vp9",
         ),
         _ => (
             format!(
-                "vp8enc deadline=1 cpu-used=6 target-bitrate={}",
+                "vp8enc deadline=1 cpu-used=6 keyframe-max-dist=60 target-bitrate={}",
                 bitrate_kbps * 1000
             ),
             "video/x-vp8",
@@ -340,7 +340,7 @@ mod tests {
         let (chain, caps) = software_chain(Codec::Vp8, 2500);
         assert_eq!(
             chain,
-            "vp8enc deadline=1 cpu-used=6 target-bitrate=2500000"
+            "vp8enc deadline=1 cpu-used=6 keyframe-max-dist=60 target-bitrate=2500000"
         );
         assert_eq!(caps, "video/x-vp8");
     }
@@ -348,7 +348,7 @@ mod tests {
     #[test]
     fn h264_software_chain_includes_parser() {
         let (chain, caps) = software_chain(Codec::H264, 2500);
-        assert_eq!(chain, "x264enc tune=zerolatency speed-preset=veryfast bitrate=2500 ! h264parse");
+        assert_eq!(chain, "x264enc tune=zerolatency speed-preset=veryfast key-int-max=60 bitrate=2500 ! h264parse");
         // Annex-B start codes and the profile the SDP advertises.
         assert_eq!(
             caps,
@@ -404,7 +404,10 @@ mod tests {
     #[test]
     fn hardware_falls_back_when_none_available() {
         let (chain, caps) = encoder_chain(Codec::Vp8, 2500, true, &|_| false);
-        assert_eq!(chain, "vp8enc deadline=1 cpu-used=6 target-bitrate=2500000");
+        assert_eq!(
+            chain,
+            "vp8enc deadline=1 cpu-used=6 keyframe-max-dist=60 target-bitrate=2500000"
+        );
         assert_eq!(caps, "video/x-vp8");
     }
 
@@ -414,7 +417,7 @@ mod tests {
         assert!(s.starts_with("pipewiresrc fd=42 path=7"));
         assert!(s.contains("video/x-raw,width=1920,height=1080"));
         assert!(s.contains("framerate=30/1"));
-        assert!(s.contains("vp8enc deadline=1 cpu-used=6 target-bitrate=2500000"));
+        assert!(s.contains("vp8enc deadline=1 cpu-used=6 keyframe-max-dist=60 target-bitrate=2500000"));
         assert!(s.contains("name=sink"));
         assert!(s.contains("name=preview"));
     }
