@@ -11,7 +11,7 @@ spec against the current code. Checkboxes are off until implemented.
 | `sharescreen-config` — config, persistence, validation, tests | done |
 | `sharescreen-tauri` — Tauri shell | done (commands, events, app state) |
 | `frontend` — React + TS + Vite | done (screens, bridge, media rendering) |
-| capture / audio / webrtc / signaling / server / deploy | everything except Windows audio/room-auth done |
+| capture / audio / webrtc / signaling / server / deploy | core path works; Windows packaging, reconnection, room auth remain |
 
 ---
 
@@ -77,7 +77,7 @@ spec against the current code. Checkboxes are off until implemented.
 - [x] WebSocket client (tokio-tungstenite): connect/send/receive/disconnect detection.
 - [x] Message schema shared with server (`SignalMessage` in `core::protocol`).
 - [ ] Auto-reconnect after a dropped connection (disconnect is detected; retry pending).
-- [ ] TURN credential fetch (ephemeral, never persisted).
+- [x] TURN credential fetch (ephemeral, never persisted).
 
 ### `server/` — signaling server (axum)
 - [x] Room create/join/leave + participant roster.
@@ -112,7 +112,9 @@ spec against the current code. Checkboxes are off until implemented.
 - [x] Per-peer remote audio volume.
 - [x] Decode test with real VP8 RTP (GStreamer source → depayload → decode → JPEG).
 - [x] Decode test with real H264 RTP (STAP-A aggregated, as WebRTC sends it).
-- [ ] Audio playback not runtime-tested (needs a real output device).
+- [x] Audio playback manually verified in a two-client call; remote playback
+      uses `pulsesink sync=false buffer-time=60000` to avoid mute-gap stalls.
+      Platform/device matrix remains untested.
 - Note: the H.264 pipeline decodes the byte-stream directly. The GStreamer
       depayloader cannot build a decoder config without `sprop-parameter-sets`,
       which WebRTC does not send (the parameter sets arrive in-band).
@@ -166,8 +168,9 @@ spec against the current code. Checkboxes are off until implemented.
       directions (media crate).
 - [x] Full-call video through the real signaling server: two `CallSession`s,
       offer/answer/ICE, H.264 frames reach the viewer (call crate).
+- [x] WebRTC audio receives packets after a 2 s mute-like pause (loopback test).
 - [ ] Device enumeration (list mic/output/monitor on each platform).
-- [ ] Capture start/stop + resource-cleanup test.
+- [x] Capture start/stop + resource-cleanup test (GStreamer stream joins on stop).
 - [ ] Reconnection test.
 - [ ] Manual matrix (Hyprland/KDE/GNOME/Sway/X11/Win10/Win11; mic-only,
       screen-only, screen+system-audio, mic+system-audio).
@@ -223,6 +226,7 @@ spec against the current code. Checkboxes are off until implemented.
 
 4. **Windows** requires a Windows host to build/test; Linux-side code must not
    assume it compiles unverified.
+   The Windows installer still needs its matching GStreamer runtime and plugins.
 
 ## Suggested build order
 

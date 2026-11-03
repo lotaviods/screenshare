@@ -457,4 +457,25 @@ mod tests {
         );
         pipeline.set_state(gst::State::Null).unwrap();
     }
+
+    #[test]
+    fn capture_stream_stops_and_joins_cleanly() {
+        gst::init().unwrap();
+        let launch = build_launch("videotestsrc num-buffers=3", &opts(Codec::Vp8));
+        let (tx, mut rx) = mpsc::channel(8);
+        #[cfg(unix)]
+        let keep_alive = None;
+        #[cfg(not(unix))]
+        let keep_alive = ();
+
+        let stream = spawn(launch, tx, Codec::Vp8, keep_alive).expect("spawn capture");
+        let sample = rx
+            .blocking_recv()
+            .expect("capture emits an encoded sample");
+        assert_eq!(sample.codec, Codec::Vp8);
+        assert!(!sample.data.is_empty());
+
+        // stop joins capture thread after transitioning pipeline to NULL.
+        stream.stop();
+    }
 }
