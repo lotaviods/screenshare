@@ -194,7 +194,11 @@ impl RemoteMedia {
         let appsrc = decoder.appsrc_handle();
         let running = decoder.running.clone();
         tokio::spawn(async move {
-            feed(track, appsrc, running).await;
+            let clock_rate = match kind {
+                RemoteTrackKind::Audio => 48_000,
+                RemoteTrackKind::Video => 90_000,
+            };
+            feed(track, appsrc, running, clock_rate).await;
         });
 
         self.tracks.write().unwrap().insert(
@@ -422,7 +426,9 @@ async fn feed(
     track: RemoteTrack,
     appsrc_slot: Arc<Mutex<Option<gstreamer_app::AppSrc>>>,
     running: Arc<AtomicBool>,
+    clock_rate: u32,
 ) {
+    let mut base_ts: Option<u32> = None;
     // Wait until the pipeline thread publishes its appsrc.
     let src = loop {
         if let Some(src) = appsrc_slot.lock().unwrap().clone() {
@@ -453,8 +459,14 @@ async fn feed(
         }
         let mut buffer = gst::Buffer::from_mut_slice(packet.to_bytes());
         if let Some(raw) = buffer.get_mut() {
+            // RTP timestamps count clock ticks from a random start. Convert the
+            // ticks since the first packet to nanoseconds with the clock rate;
+            // a sync'ing sink such as pulsesink would otherwise wait for a
+            // presentation time billions of seconds away and play nothing.
+            let base = *base_ts.get_or_insert(packet.timestamp);
+            let ticks = packet.timestamp.wrapping_sub(base) as u64;
             raw.set_pts(gst::ClockTime::from_nseconds(
-                packet.timestamp as u64 * 1_000_000,
+                ticks * 1_000_000_000 / clock_rate as u64,
             ));
         }
         // A full queue drops the packet; the next one follows immediately.
