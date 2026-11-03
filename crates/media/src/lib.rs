@@ -422,6 +422,13 @@ fn report_bus_errors(bus: &Option<gst::Bus>) {
 }
 
 /// Push the track's RTP packets into the pipeline's `appsrc`.
+/// Presentation time in nanoseconds of an RTP timestamp, relative to the first
+/// packet's timestamp `base`. Handles the 32-bit wraparound.
+fn rtp_pts_ns(timestamp: u32, base: u32, clock_rate: u32) -> u64 {
+    let ticks = timestamp.wrapping_sub(base) as u64;
+    ticks * 1_000_000_000 / clock_rate as u64
+}
+
 async fn feed(
     track: RemoteTrack,
     appsrc_slot: Arc<Mutex<Option<gstreamer_app::AppSrc>>>,
@@ -464,10 +471,11 @@ async fn feed(
             // a sync'ing sink such as pulsesink would otherwise wait for a
             // presentation time billions of seconds away and play nothing.
             let base = *base_ts.get_or_insert(packet.timestamp);
-            let ticks = packet.timestamp.wrapping_sub(base) as u64;
-            raw.set_pts(gst::ClockTime::from_nseconds(
-                ticks * 1_000_000_000 / clock_rate as u64,
-            ));
+            raw.set_pts(gst::ClockTime::from_nseconds(rtp_pts_ns(
+                packet.timestamp,
+                base,
+                clock_rate,
+            )));
         }
         // A full queue drops the packet; the next one follows immediately.
         let _ = src.push_buffer(buffer);
@@ -486,6 +494,25 @@ fn ensure_gst_init() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: the first Opus packet of a call has a large random RTP
+    /// timestamp. Its presentation time must start at 0, not billions of
+    /// seconds ahead, or a syncing sink never plays it.
+    #[test]
+    fn pts_starts_at_zero_for_large_rtp_timestamps() {
+        let base = 4_052_363_971;
+        assert_eq!(rtp_pts_ns(base, base, 48_000), 0);
+        // One 20 ms Opus packet later.
+        assert_eq!(rtp_pts_ns(base + 960, base, 48_000), 20_000_000);
+        // Still well under a second after 50 packets (1 s of audio).
+        assert_eq!(rtp_pts_ns(base + 48_000, base, 48_000), 1_000_000_000);
+    }
+
+    #[test]
+    fn pts_handles_rtp_timestamp_wraparound() {
+        let base = u32::MAX - 100;
+        assert_eq!(rtp_pts_ns(base.wrapping_add(960), base, 48_000), 20_000_000);
+    }
 
     #[test]
     fn audio_pipeline_is_valid() {
