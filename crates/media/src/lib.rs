@@ -452,6 +452,7 @@ async fn feed(
     };
 
     let mut packets: u64 = 0;
+    let mut last_arrival: Option<std::time::Instant> = None;
     while running.load(Ordering::SeqCst) {
         let Some(packet) = track.next_packet().await else {
             tracing::info!("remote track ended after {packets} packets");
@@ -464,6 +465,14 @@ async fn feed(
                 packet.payload.len()
             );
         }
+        let now = std::time::Instant::now();
+        if let Some(prev) = last_arrival {
+            let gap = now.duration_since(prev);
+            if gap > Duration::from_secs(1) {
+                tracing::info!("remote track resumed after {:.1}s without packets", gap.as_secs_f32());
+            }
+        }
+        last_arrival = Some(now);
         packets += 1;
         if packets % 500 == 0 {
             tracing::info!("remote track: {packets} RTP packets received");
