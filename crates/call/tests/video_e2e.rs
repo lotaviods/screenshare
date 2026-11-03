@@ -64,7 +64,8 @@ async fn full_call_video_reaches_viewer() {
     let peer_config = sharescreen_webrtc::PeerConfig::default();
 
     // Alice – creates a room.
-    let (a_events, mut a_rx) = tokio::sync::mpsc::unbounded_channel::<sharescreen_core::CallEvent>();
+    let (a_events, mut a_rx) =
+        tokio::sync::mpsc::unbounded_channel::<sharescreen_core::CallEvent>();
     let a = CallSession::start(
         CallConfig {
             self_id: "alice".to_string(),
@@ -91,7 +92,8 @@ async fn full_call_video_reaches_viewer() {
     .expect("room created within timeout");
 
     // Bob – join the room.
-    let (b_events, mut b_rx) = tokio::sync::mpsc::unbounded_channel::<sharescreen_core::CallEvent>();
+    let (b_events, mut b_rx) =
+        tokio::sync::mpsc::unbounded_channel::<sharescreen_core::CallEvent>();
     let b = CallSession::start(
         CallConfig {
             self_id: "bob".to_string(),

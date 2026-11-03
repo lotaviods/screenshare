@@ -5,10 +5,10 @@
 //! session the samples are discarded.
 
 use sharescreen_call::{CallConfig, CallSession};
+use sharescreen_config::Config;
 use sharescreen_core::{
     AudioCapture, CallEvent, CaptureOptions, CaptureSource, Device, EncodedSample, ScreenCapture,
 };
-use sharescreen_config::Config;
 use sharescreen_network as network;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -31,15 +31,16 @@ enum LocalStream {
 /// Spawn a task that drains (discards) media samples.
 fn drain(channel: usize) -> mpsc::Sender<EncodedSample> {
     let (tx, mut rx) = mpsc::channel(channel);
-    tokio::spawn(async move {
-        while rx.recv().await.is_some() {}
-    });
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
     tx
 }
 
 /// The sink for a local media stream: the call session's fan-out when
 /// connected, otherwise a discard sink.
-async fn media_sink(state: &State<'_, AppState>, stream: LocalStream) -> mpsc::Sender<EncodedSample> {
+async fn media_sink(
+    state: &State<'_, AppState>,
+    stream: LocalStream,
+) -> mpsc::Sender<EncodedSample> {
     let call = state.call.lock().await;
     match call.as_ref() {
         Some(session) => {
@@ -94,7 +95,9 @@ pub async fn list_system_monitors(state: State<'_, AppState>) -> Result<Vec<Devi
 }
 
 #[tauri::command]
-pub async fn list_capture_sources(state: State<'_, AppState>) -> Result<Vec<CaptureSource>, String> {
+pub async fn list_capture_sources(
+    state: State<'_, AppState>,
+) -> Result<Vec<CaptureSource>, String> {
     let engine = state.capture.lock().await;
     Ok(engine.list_sources())
 }
@@ -414,14 +417,18 @@ pub async fn open_pip_window(app: tauri::AppHandle) -> Result<(), String> {
     if app.get_webview_window("pip").is_some() {
         return Ok(());
     }
-    WebviewWindowBuilder::new(&app, "pip", WebviewUrl::App(PathBuf::from("index.html?pip=1")))
-        .title("Sharescreen PiP")
-        .always_on_top(true)
-        .decorations(false)
-        .resizable(false)
-        .inner_size(480.0, 270.0)
-        .build()
-        .map_err(|e| e.to_string())?;
+    WebviewWindowBuilder::new(
+        &app,
+        "pip",
+        WebviewUrl::App(PathBuf::from("index.html?pip=1")),
+    )
+    .title("Sharescreen PiP")
+    .always_on_top(true)
+    .decorations(false)
+    .resizable(false)
+    .inner_size(480.0, 270.0)
+    .build()
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 

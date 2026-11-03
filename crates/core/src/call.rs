@@ -29,17 +29,31 @@ pub struct Participant {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CallEvent {
-    RoomCreated { room_id: String },
-    RoomJoined { room_id: String },
+    RoomCreated {
+        room_id: String,
+    },
+    RoomJoined {
+        room_id: String,
+    },
     /// The room was closed by its creator and this peer was removed from it.
-    RoomDeleted { room_id: String },
-    ParticipantJoined { participant: Participant },
-    ParticipantLeft { id: String },
+    RoomDeleted {
+        room_id: String,
+    },
+    ParticipantJoined {
+        participant: Participant,
+    },
+    ParticipantLeft {
+        id: String,
+    },
     /// The full state of a participant changed (mic, screen, connection).
-    ParticipantUpdated { participant: Participant },
+    ParticipantUpdated {
+        participant: Participant,
+    },
     ConnectionStateChanged {
         participant_id: String,
         state: ConnectionState,
     },
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }

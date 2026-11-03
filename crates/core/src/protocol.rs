@@ -17,13 +17,22 @@ pub struct PeerInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PeerPayload {
-    Offer { sdp: String },
-    Answer { sdp: String },
-    IceCandidate { candidate: String },
+    Offer {
+        sdp: String,
+    },
+    Answer {
+        sdp: String,
+    },
+    IceCandidate {
+        candidate: String,
+    },
     /// Whether the sender is publishing microphone audio and/or a screen.
     /// The media itself rides the peer connection; this tells the UI whose
     /// screen to render.
-    MediaState { mic_on: bool, screen_on: bool },
+    MediaState {
+        mic_on: bool,
+        screen_on: bool,
+    },
 }
 
 /// A signaling message exchanged over the WebSocket, both directions.
@@ -32,29 +41,50 @@ pub enum PeerPayload {
 pub enum SignalMessage {
     // --- client → server ---
     CreateRoom,
-    JoinRoom { room_id: String },
+    JoinRoom {
+        room_id: String,
+    },
     LeaveRoom,
     /// Close the current room for everyone in it (creator only).
     DeleteRoom,
     /// Ask the server for time-limited TURN credentials.
     GetTurnCredentials,
-    ToPeer { to: String, payload: PeerPayload },
+    ToPeer {
+        to: String,
+        payload: PeerPayload,
+    },
 
     // --- server → client ---
-    RoomCreated { room_id: String },
-    Joined { room_id: String, peers: Vec<PeerInfo> },
+    RoomCreated {
+        room_id: String,
+    },
+    Joined {
+        room_id: String,
+        peers: Vec<PeerInfo>,
+    },
     /// The room was closed by its creator; everyone was removed from it.
-    RoomDeleted { room_id: String },
-    PeerJoined { peer: PeerInfo },
-    PeerLeft { id: String },
-    FromPeer { from: String, payload: PeerPayload },
+    RoomDeleted {
+        room_id: String,
+    },
+    PeerJoined {
+        peer: PeerInfo,
+    },
+    PeerLeft {
+        id: String,
+    },
+    FromPeer {
+        from: String,
+        payload: PeerPayload,
+    },
     /// Time-limited TURN credentials (coturn REST scheme).
     TurnCredentials {
         urls: Vec<String>,
         username: String,
         credential: String,
     },
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 #[cfg(test)]
@@ -88,7 +118,9 @@ mod tests {
                     name: "Alice".into(),
                 }],
             },
-            SignalMessage::PeerLeft { id: "peer-2".into() },
+            SignalMessage::PeerLeft {
+                id: "peer-2".into(),
+            },
             SignalMessage::FromPeer {
                 from: "peer-2".into(),
                 payload: PeerPayload::IceCandidate {

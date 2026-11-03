@@ -39,7 +39,10 @@ async fn main() {
     engine.stop_system().await.expect("stop system");
 }
 
-async fn count_for(rx: &mut mpsc::Receiver<sharescreen_core::EncodedSample>, ms: u64) -> (u64, u64) {
+async fn count_for(
+    rx: &mut mpsc::Receiver<sharescreen_core::EncodedSample>,
+    ms: u64,
+) -> (u64, u64) {
     let start = std::time::Instant::now();
     let mut n = 0u64;
     let mut bytes = 0u64;

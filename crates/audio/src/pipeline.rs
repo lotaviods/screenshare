@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::thread::JoinHandle;
 
+use gst::prelude::*;
 use gstreamer as gst;
 use gstreamer_app;
-use gst::prelude::*;
 use tokio::sync::mpsc;
 
 use sharescreen_core::{AudioError, Codec, EncodedSample, MediaKind};

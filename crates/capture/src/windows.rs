@@ -89,9 +89,8 @@ fn windows_source(source: &CaptureSource, cursor: CursorMode) -> Result<String, 
     let show_cursor = matches!(cursor, CursorMode::Embedded | CursorMode::Metadata);
 
     if let Some(handle) = source.id.strip_prefix("window:") {
-        let handle = parse_handle(handle).ok_or_else(|| {
-            CaptureError::Failed(format!("invalid window handle: {}", source.id))
-        })?;
+        let handle = parse_handle(handle)
+            .ok_or_else(|| CaptureError::Failed(format!("invalid window handle: {}", source.id)))?;
         if !has_d3d11() {
             return Err(CaptureError::Unavailable(
                 "window capture needs d3d11screencapturesrc (GStreamer 1.22+)".into(),
@@ -192,15 +191,9 @@ mod windows {
         // SAFETY: the callback only writes into `entries`, which outlives the
         // call, and every Win32 handle it reads is owned by the OS.
         unsafe {
-            EnumWindows(
-                Some(collect),
-                &mut entries as *mut Vec<Entry> as LPARAM,
-            );
+            EnumWindows(Some(collect), &mut entries as *mut Vec<Entry> as LPARAM);
         }
-        entries
-            .into_iter()
-            .map(|e| (e.handle, e.title))
-            .collect()
+        entries.into_iter().map(|e| (e.handle, e.title)).collect()
     }
 
     unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> BOOL {

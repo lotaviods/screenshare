@@ -106,7 +106,10 @@ impl ScreenCapture for WaylandCapture {
             .map_err(map_ashpd)?;
 
         gst::ensure_gst_init();
-        let source = format!("pipewiresrc fd={} path={node_id} do-timestamp=true", fd.as_raw_fd());
+        let source = format!(
+            "pipewiresrc fd={} path={node_id} do-timestamp=true",
+            fd.as_raw_fd()
+        );
         let launch = gst::build_launch(&source, &options);
         let stream = gst::spawn(launch, sink, options.codec, Some(fd))?;
 

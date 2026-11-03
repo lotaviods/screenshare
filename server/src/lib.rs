@@ -70,7 +70,10 @@ async fn ws_handler(
 }
 
 async fn handle_connection(mut socket: WebSocket, state: AppState, id: String, name: String) {
-    let info = PeerInfo { id: id.clone(), name };
+    let info = PeerInfo {
+        id: id.clone(),
+        name,
+    };
     let (tx, mut rx) = mpsc::unbounded_channel::<SignalMessage>();
     let mut room_id: Option<String> = None;
 
@@ -209,11 +212,10 @@ async fn handle_connection(mut socket: WebSocket, state: AppState, id: String, n
     if let Some(rid) = room_id {
         if let Some(remaining) = state.rooms.leave(&rid, &id) {
             for p in remaining {
-                let _ = state.rooms.send_to(
-                    &rid,
-                    &p.id,
-                    SignalMessage::PeerLeft { id: id.clone() },
-                );
+                let _ =
+                    state
+                        .rooms
+                        .send_to(&rid, &p.id, SignalMessage::PeerLeft { id: id.clone() });
             }
         }
     }

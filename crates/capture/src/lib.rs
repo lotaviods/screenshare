@@ -10,10 +10,10 @@ mod gst;
 
 #[cfg(target_os = "linux")]
 mod wayland;
-#[cfg(target_os = "linux")]
-mod x11;
 #[cfg(windows)]
 mod windows;
+#[cfg(target_os = "linux")]
+mod x11;
 
 #[cfg(target_os = "linux")]
 /// GStreamer elements the app cannot run without. Missing ones mean capture,
@@ -43,10 +43,10 @@ pub fn missing_elements() -> Vec<&'static str> {
 }
 
 pub use wayland::WaylandCapture;
-#[cfg(target_os = "linux")]
-pub use x11::X11Capture;
 #[cfg(windows)]
 pub use windows::WindowsCapture;
+#[cfg(target_os = "linux")]
+pub use x11::X11Capture;
 
 use async_trait::async_trait;
 use sharescreen_core::{

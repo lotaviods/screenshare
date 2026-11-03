@@ -28,9 +28,7 @@ pub struct SignalingSender {
 
 impl SignalingSender {
     pub fn send(&self, msg: SignalMessage) -> Result<(), SignalingError> {
-        self.out
-            .send(msg)
-            .map_err(|_| SignalingError::Disconnected)
+        self.out.send(msg).map_err(|_| SignalingError::Disconnected)
     }
 }
 
@@ -78,15 +76,16 @@ impl SignalingClient {
         tokio::spawn(async move {
             while let Some(msg) = ws_stream.next().await {
                 match msg {
-                    Ok(WsMessage::Text(text)) => match serde_json::from_str::<SignalMessage>(text.as_str())
-                    {
-                        Ok(m) => {
-                            if incoming_tx.send(Incoming::Message(m)).is_err() {
-                                return;
+                    Ok(WsMessage::Text(text)) => {
+                        match serde_json::from_str::<SignalMessage>(text.as_str()) {
+                            Ok(m) => {
+                                if incoming_tx.send(Incoming::Message(m)).is_err() {
+                                    return;
+                                }
                             }
+                            Err(e) => tracing::warn!("ignoring malformed signaling message: {e}"),
                         }
-                        Err(e) => tracing::warn!("ignoring malformed signaling message: {e}"),
-                    },
+                    }
                     Ok(WsMessage::Close(_)) => break,
                     Ok(_) => {}
                     Err(e) => {

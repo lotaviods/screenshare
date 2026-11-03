@@ -52,7 +52,10 @@ async fn media_state_is_relayed_between_peers() {
     })
     .unwrap();
     match recv_msg(&mut b.incoming).await {
-        SignalMessage::Joined { room_id: rid, peers } => {
+        SignalMessage::Joined {
+            room_id: rid,
+            peers,
+        } => {
             assert_eq!(rid, room_id);
             assert_eq!(peers.len(), 1);
         }

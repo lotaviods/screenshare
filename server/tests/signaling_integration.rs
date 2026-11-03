@@ -55,9 +55,18 @@ async fn two_peers_create_join_and_relay() {
 
     // B receives the roster (just A).
     match recv_msg(&mut b.incoming).await {
-        SignalMessage::Joined { room_id: rid, peers } => {
+        SignalMessage::Joined {
+            room_id: rid,
+            peers,
+        } => {
             assert_eq!(rid, room_id);
-            assert_eq!(peers, vec![PeerInfo { id: "a".into(), name: "Alice".into() }]);
+            assert_eq!(
+                peers,
+                vec![PeerInfo {
+                    id: "a".into(),
+                    name: "Alice".into()
+                }]
+            );
         }
         other => panic!("expected Joined, got {other:?}"),
     }
@@ -132,8 +141,14 @@ async fn room_creator_deletes_room_for_everyone() {
         room_id: room_id.clone(),
     })
     .unwrap();
-    assert!(matches!(recv_msg(&mut b.incoming).await, SignalMessage::Joined { .. }));
-    assert!(matches!(recv_msg(&mut a.incoming).await, SignalMessage::PeerJoined { .. }));
+    assert!(matches!(
+        recv_msg(&mut b.incoming).await,
+        SignalMessage::Joined { .. }
+    ));
+    assert!(matches!(
+        recv_msg(&mut a.incoming).await,
+        SignalMessage::PeerJoined { .. }
+    ));
 
     // Any member can delete the room, including a peer that rejoined after a
     // reconnect (it no longer shares the creator's peer id).

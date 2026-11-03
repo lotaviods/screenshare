@@ -7,8 +7,8 @@
 
 use base64::Engine;
 use hmac::{Hmac, Mac};
-use sha1::Sha1;
 use serde::{Deserialize, Serialize};
+use sha1::Sha1;
 
 /// TURN server configuration and shared secret.
 #[derive(Debug, Clone, Default)]

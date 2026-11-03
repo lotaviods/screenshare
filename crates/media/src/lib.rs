@@ -16,9 +16,9 @@ use std::sync::{Arc, Mutex, Once, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use gst::prelude::*;
 use gstreamer as gst;
 use gstreamer_app;
-use gst::prelude::*;
 use sharescreen_core::Codec;
 use sharescreen_webrtc::{RemoteTrack, RemoteTrackKind};
 
@@ -469,7 +469,10 @@ async fn feed(
         if let Some(prev) = last_arrival {
             let gap = now.duration_since(prev);
             if gap > Duration::from_secs(1) {
-                tracing::info!("remote track resumed after {:.1}s without packets", gap.as_secs_f32());
+                tracing::info!(
+                    "remote track resumed after {:.1}s without packets",
+                    gap.as_secs_f32()
+                );
             }
         }
         last_arrival = Some(now);
@@ -544,7 +547,10 @@ mod tests {
             let (launch, caps) = video_pipeline(codec).unwrap();
             gst::parse::launch(&launch)
                 .unwrap_or_else(|e| panic!("{codec:?} pipeline failed to parse: {e}"));
-            assert!(caps.to_string().contains("media=(string)video"), "caps: {caps}");
+            assert!(
+                caps.to_string().contains("media=(string)video"),
+                "caps: {caps}"
+            );
         }
     }
 

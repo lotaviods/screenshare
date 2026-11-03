@@ -8,9 +8,7 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use sharescreen_core::{Codec, EncodedSample, MediaKind};
 use sharescreen_media::RemoteMedia;
-use sharescreen_webrtc::{
-    PeerConfig, PeerEvent, TrackId, TrackWriter, WebRtcPeer,
-};
+use sharescreen_webrtc::{PeerConfig, PeerEvent, TrackId, TrackWriter, WebRtcPeer};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -351,4 +349,3 @@ async fn answerer_screen_reaches_offerer() {
         "answerer's screen never reached the offerer (offerer got no decoded frame)"
     );
 }
-

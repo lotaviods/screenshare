@@ -274,9 +274,8 @@ impl Config {
             problems.push("video.max_fps must be between 1 and 240".into());
         }
         if !(320..=7680).contains(&v.width) || !(240..=4320).contains(&v.height) {
-            problems.push(
-                "video resolution out of range (width 320..=7680, height 240..=4320)".into(),
-            );
+            problems
+                .push("video resolution out of range (width 320..=7680, height 240..=4320)".into());
         }
         if !(64..=50000).contains(&v.max_bitrate_kbps) {
             problems.push("video.max_bitrate_kbps must be between 64 and 50000".into());
@@ -343,7 +342,11 @@ mod tests {
         c.record_joined_room("room5");
         assert_eq!(c.state.recent_rooms[0], "room5");
         assert_eq!(
-            c.state.recent_rooms.iter().filter(|r| *r == "room5").count(),
+            c.state
+                .recent_rooms
+                .iter()
+                .filter(|r| *r == "room5")
+                .count(),
             1
         );
     }
@@ -352,7 +355,11 @@ mod tests {
     fn invalid_values_are_reported() {
         let mut c = Config::default();
         c.network.signaling_port = 0;
-        assert!(c.validate().unwrap_err().to_string().contains("signaling_port"));
+        assert!(c
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("signaling_port"));
 
         let mut c = Config::default();
         c.video.max_fps = 0;
@@ -360,7 +367,11 @@ mod tests {
 
         let mut c = Config::default();
         c.video.codec = Codec::Opus;
-        assert!(c.validate().unwrap_err().to_string().contains("cannot be opus"));
+        assert!(c
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("cannot be opus"));
 
         let mut c = Config::default();
         c.network.stun_servers[0].url = "http://not-an-ice-scheme".to_string();

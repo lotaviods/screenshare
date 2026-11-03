@@ -108,20 +108,14 @@ async fn two_peers_connect_and_exchange_media() {
     let offer = a.create_offer().await.unwrap();
     a.set_local_description(&offer).await.unwrap();
     wait_for_gathering(&mut a_rx).await;
-    let a_local = a
-        .local_description()
-        .await
-        .expect("a local description");
+    let a_local = a.local_description().await.expect("a local description");
 
     // B answers.
     b.set_remote_description(&a_local).await.unwrap();
     let answer = b.create_answer().await.unwrap();
     b.set_local_description(&answer).await.unwrap();
     wait_for_gathering(&mut b_rx).await;
-    let b_local = b
-        .local_description()
-        .await
-        .expect("b local description");
+    let b_local = b.local_description().await.expect("b local description");
 
     a.set_remote_description(&b_local).await.unwrap();
 

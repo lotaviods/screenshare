@@ -15,7 +15,7 @@ use rtc::peer_connection::configuration::RTCConfigurationBuilder;
 use rtc::peer_connection::sdp::RTCSessionDescription;
 use rtc::peer_connection::transport::{RTCIceCandidateInit, RTCIceServer};
 use rtc::rtp_transceiver::rtp_sender::{
-    RtpCodecKind, RTCRtpCodingParameters, RTCRtpEncodingParameters,
+    RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind,
 };
 use rtc::rtp_transceiver::PayloadType;
 use serde::{Deserialize, Serialize};
@@ -336,7 +336,10 @@ impl WebRtcPeer {
             ),
         )?);
 
-        let sender = self.pc.add_track(track.clone() as Arc<dyn TrackLocal>).await?;
+        let sender = self
+            .pc
+            .add_track(track.clone() as Arc<dyn TrackLocal>)
+            .await?;
 
         Ok(TrackWriter {
             track,

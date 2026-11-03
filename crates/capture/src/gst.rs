@@ -10,9 +10,9 @@ use std::thread::JoinHandle;
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
 
+use gst::prelude::*;
 use gstreamer as gst;
 use gstreamer_app;
-use gst::prelude::*;
 use tokio::sync::mpsc;
 
 use sharescreen_core::{CaptureError, CaptureOptions, Codec, EncodedSample, MediaKind};
@@ -164,8 +164,12 @@ pub fn encoder_chain(
 /// Build a full capture pipeline: `source` → scale → rate → tee, where one
 /// branch encodes for the call and the other produces JPEG self-view frames.
 pub fn build_launch(source: &str, opts: &CaptureOptions) -> String {
-    let (enc, caps) =
-        encoder_chain(opts.codec, opts.bitrate_kbps, opts.hardware_encoding, &element_exists);
+    let (enc, caps) = encoder_chain(
+        opts.codec,
+        opts.bitrate_kbps,
+        opts.hardware_encoding,
+        &element_exists,
+    );
     format!(
         "{source} ! videoconvert ! videoscale ! \
          video/x-raw,width={w},height={h} ! \
@@ -392,7 +396,9 @@ mod tests {
         let map = buffer.map_readable().unwrap();
         let bytes = map.as_slice();
         assert!(
-            bytes.windows(4).any(|w| w == [0, 0, 0, 1] || w[..3] == [0, 0, 1]),
+            bytes
+                .windows(4)
+                .any(|w| w == [0, 0, 0, 1] || w[..3] == [0, 0, 1]),
             "no Annex-B start code in the encoded frame"
         );
         pipeline.set_state(gst::State::Null).unwrap();
@@ -421,11 +427,16 @@ mod tests {
 
     #[test]
     fn launch_has_expected_shape() {
-        let s = build_launch("pipewiresrc fd=42 path=7 do-timestamp=true", &opts(Codec::Vp8));
+        let s = build_launch(
+            "pipewiresrc fd=42 path=7 do-timestamp=true",
+            &opts(Codec::Vp8),
+        );
         assert!(s.starts_with("pipewiresrc fd=42 path=7"));
         assert!(s.contains("video/x-raw,width=1920,height=1080"));
         assert!(s.contains("framerate=30/1"));
-        assert!(s.contains("vp8enc deadline=1 cpu-used=6 keyframe-max-dist=60 target-bitrate=2500000"));
+        assert!(
+            s.contains("vp8enc deadline=1 cpu-used=6 keyframe-max-dist=60 target-bitrate=2500000")
+        );
         assert!(s.contains("name=sink"));
         assert!(s.contains("name=preview"));
     }
@@ -469,9 +480,7 @@ mod tests {
         let keep_alive = ();
 
         let stream = spawn(launch, tx, Codec::Vp8, keep_alive).expect("spawn capture");
-        let sample = rx
-            .blocking_recv()
-            .expect("capture emits an encoded sample");
+        let sample = rx.blocking_recv().expect("capture emits an encoded sample");
         assert_eq!(sample.codec, Codec::Vp8);
         assert!(!sample.data.is_empty());
 

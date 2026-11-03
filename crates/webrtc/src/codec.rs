@@ -3,7 +3,7 @@
 use rtc::peer_connection::configuration::media_engine::{
     MediaEngine, MIME_TYPE_H264, MIME_TYPE_OPUS, MIME_TYPE_VP8, MIME_TYPE_VP9,
 };
-use rtc::rtp_transceiver::rtp_sender::{RtpCodecKind, RTCRtpCodec, RTCRtpCodecParameters};
+use rtc::rtp_transceiver::rtp_sender::{RTCRtpCodec, RTCRtpCodecParameters, RtpCodecKind};
 use webrtc::error::Result;
 
 use sharescreen_core::Codec;

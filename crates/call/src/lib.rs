@@ -145,7 +145,9 @@ impl CallSession {
 
     /// Ask the server to join an existing room.
     pub fn join_room(&self, room_id: String) -> Result<(), CallError> {
-        self.shared.sender.send(SignalMessage::JoinRoom { room_id })?;
+        self.shared
+            .sender
+            .send(SignalMessage::JoinRoom { room_id })?;
         Ok(())
     }
 
@@ -278,7 +280,9 @@ async fn handle_message(shared: &Shared, msg: SignalMessage) {
             *shared.room_id.write().unwrap() = Some(room_id.clone());
             for p in &peers {
                 let participant = upsert_participant(shared, p);
-                let _ = shared.events.send(CallEvent::ParticipantJoined { participant });
+                let _ = shared
+                    .events
+                    .send(CallEvent::ParticipantJoined { participant });
                 // Tell the peers already in the room what we are publishing.
                 send_local_state(shared, &p.id);
             }
@@ -293,7 +297,9 @@ async fn handle_message(shared: &Shared, msg: SignalMessage) {
         }
         SignalMessage::PeerJoined { peer } => {
             let participant = upsert_participant(shared, &peer);
-            let _ = shared.events.send(CallEvent::ParticipantJoined { participant });
+            let _ = shared
+                .events
+                .send(CallEvent::ParticipantJoined { participant });
             send_local_state(shared, &peer.id);
             // Peers already in the room offer to the newcomer.
             if let Err(e) = offer_to(shared, &peer.id).await {
@@ -344,7 +350,9 @@ async fn handle_message(shared: &Shared, msg: SignalMessage) {
                     p.mic_on = mic_on;
                     p.screen_on = screen_on;
                 }) {
-                    let _ = shared.events.send(CallEvent::ParticipantUpdated { participant });
+                    let _ = shared
+                        .events
+                        .send(CallEvent::ParticipantUpdated { participant });
                 }
             }
         },
@@ -354,12 +362,17 @@ async fn handle_message(shared: &Shared, msg: SignalMessage) {
             credential,
         } => {
             let mut cfg = shared.cfg.write().unwrap();
-            cfg.peer_config.ice_servers.push(sharescreen_webrtc::IceServer {
-                urls,
-                username,
-                credential,
-            });
-            tracing::info!("received TURN credentials, {} ICE server(s)", cfg.peer_config.ice_servers.len());
+            cfg.peer_config
+                .ice_servers
+                .push(sharescreen_webrtc::IceServer {
+                    urls,
+                    username,
+                    credential,
+                });
+            tracing::info!(
+                "received TURN credentials, {} ICE server(s)",
+                cfg.peer_config.ice_servers.len()
+            );
         }
         SignalMessage::Error { message } => {
             let _ = shared.events.send(CallEvent::Error { message });
@@ -486,9 +499,7 @@ async fn create_peer(shared: &Shared, peer_id: &str) -> Result<Arc<WebRtcPeer>, 
     );
     let callback: Arc<dyn Fn(PeerEvent) + Send + Sync> =
         peer_event_handler(shared.clone(), peer_id.to_string());
-    let peer = Arc::new(
-        WebRtcPeer::new(cfg.peer_config.clone(), cfg.video_codec, callback).await?,
-    );
+    let peer = Arc::new(WebRtcPeer::new(cfg.peer_config.clone(), cfg.video_codec, callback).await?);
 
     let mic = peer.add_track(TrackId::Mic, Codec::Opus).await?;
     let system = peer.add_track(TrackId::System, Codec::Opus).await?;
@@ -589,7 +600,9 @@ fn peer_event_handler(shared: Shared, peer_id: String) -> Arc<dyn Fn(PeerEvent) 
             if let Some(participant) = update_participant(&shared, &peer_id, |p| {
                 p.connection = state;
             }) {
-                let _ = shared.events.send(CallEvent::ParticipantUpdated { participant });
+                let _ = shared
+                    .events
+                    .send(CallEvent::ParticipantUpdated { participant });
             }
         }
         PeerEvent::TrackReceived { track } => {

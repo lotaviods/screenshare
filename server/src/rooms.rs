@@ -60,12 +60,7 @@ impl RoomManager {
     /// Any member may delete the room.
     pub fn delete(&self, room_id: &str) -> Option<Vec<(PeerInfo, PeerSender)>> {
         let room = self.rooms.lock().unwrap().remove(room_id)?;
-        Some(
-            room.peers
-                .into_values()
-                .map(|p| (p.info, p.tx))
-                .collect(),
-        )
+        Some(room.peers.into_values().map(|p| (p.info, p.tx)).collect())
     }
 
     /// Add a peer to a room, returning the peers already present.
@@ -182,7 +177,9 @@ mod tests {
         let rm = RoomManager::new();
         let id = rm.create_room();
         assert_eq!(id.len(), CODE_LEN);
-        assert!(id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+        assert!(id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
     }
 
     #[test]
@@ -259,7 +256,12 @@ mod tests {
         let (tx1, _rx1) = mpsc::unbounded_channel();
         rm.join(&rid, peer("a"), tx1).unwrap();
         assert!(matches!(
-            rm.relay(&rid, "a", "nobody", PeerPayload::Answer { sdp: "{}".into() }),
+            rm.relay(
+                &rid,
+                "a",
+                "nobody",
+                PeerPayload::Answer { sdp: "{}".into() }
+            ),
             Err(RoomError::PeerNotFound)
         ));
     }

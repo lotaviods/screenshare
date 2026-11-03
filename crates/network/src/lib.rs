@@ -17,11 +17,7 @@ pub fn signaling_url(config: &NetworkConfig) -> String {
 }
 
 /// Signaling URL including the peer identity query parameters.
-pub fn signaling_url_with_identity(
-    config: &NetworkConfig,
-    id: &str,
-    name: &str,
-) -> String {
+pub fn signaling_url_with_identity(config: &NetworkConfig, id: &str, name: &str) -> String {
     format!(
         "{}?id={}&name={}",
         signaling_url(config),

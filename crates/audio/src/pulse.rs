@@ -30,8 +30,8 @@ pub struct DeviceInfo {
 /// Enumerate all sources and sinks. Returns `(sources, sinks)`.
 pub fn enumerate() -> Result<(Vec<DeviceInfo>, Vec<DeviceInfo>), String> {
     let mut mainloop = Mainloop::new().ok_or("failed to create PulseAudio mainloop")?;
-    let mut context =
-        Context::new(&mainloop, "sharescreen-audio").ok_or("failed to create PulseAudio context")?;
+    let mut context = Context::new(&mainloop, "sharescreen-audio")
+        .ok_or("failed to create PulseAudio context")?;
     context
         .connect(None, FlagSet::NOFLAGS, None)
         .map_err(|e| format!("PulseAudio connect failed: {e}"))?;
@@ -73,7 +73,11 @@ fn collect_sources(mainloop: &mut Mainloop, context: &mut Context) -> Vec<Device
         let introspect = context.introspect();
         let _op = introspect.get_source_info_list(move |r: ListResult<&SourceInfo>| match r {
             ListResult::Item(info) => out_cb.borrow_mut().push(DeviceInfo {
-                name: info.name.as_ref().map(|s| s.to_string()).unwrap_or_default(),
+                name: info
+                    .name
+                    .as_ref()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default(),
                 description: info
                     .description
                     .as_ref()
@@ -98,7 +102,11 @@ fn collect_sinks(mainloop: &mut Mainloop, context: &mut Context) -> Vec<DeviceIn
         let introspect = context.introspect();
         let _op = introspect.get_sink_info_list(move |r: ListResult<&SinkInfo>| match r {
             ListResult::Item(info) => out_cb.borrow_mut().push(DeviceInfo {
-                name: info.name.as_ref().map(|s| s.to_string()).unwrap_or_default(),
+                name: info
+                    .name
+                    .as_ref()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default(),
                 description: info
                     .description
                     .as_ref()
