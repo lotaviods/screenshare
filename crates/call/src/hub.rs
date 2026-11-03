@@ -32,6 +32,7 @@ impl MediaHub {
     pub async fn broadcast(&self, sample: &EncodedSample) {
         let writers: Vec<Arc<TrackWriter>> =
             self.writers.read().unwrap().values().cloned().collect();
+        tracing::debug!("broadcasting sample to {} peer(s)", writers.len());
         for writer in writers {
             if let Err(e) = writer.write(sample.clone()).await {
                 tracing::warn!("failed to write sample to peer: {e}");

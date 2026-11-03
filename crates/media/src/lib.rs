@@ -179,6 +179,7 @@ impl RemoteMedia {
     pub async fn attach(&self, peer_id: &str, track: RemoteTrack) -> Result<(), MediaError> {
         let kind = track.kind().await;
         let codec = track.codec().await.unwrap_or(Codec::Opus);
+        tracing::info!("remote track from {peer_id}: kind={kind:?} codec={codec:?}");
         let key = format!("{peer_id}#{}", self.counter.fetch_add(1, Ordering::Relaxed));
 
         let decoder = Decoder::new(kind, codec)?;
@@ -369,11 +370,19 @@ fn spawn_pipeline(
             match (&frames, sink) {
                 (Some(slot), Some(sink)) => {
                     let timeout = gst::ClockTime::from_mseconds(100);
+                    let mut decoded: u64 = 0;
                     while running.load(Ordering::SeqCst) {
                         if let Some(sample) = sink.try_pull_sample(timeout) {
                             if let Some(buffer) = sample.buffer() {
                                 if let Ok(map) = buffer.map_readable() {
                                     *slot.lock().unwrap() = Some(map.as_slice().to_vec());
+                                    if decoded == 0 {
+                                        tracing::info!(
+                                            "decoded first video frame ({} bytes)",
+                                            map.as_slice().len()
+                                        );
+                                    }
+                                    decoded += 1;
                                 }
                             }
                         }
@@ -425,10 +434,20 @@ async fn feed(
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
 
+    let mut packets: u64 = 0;
     while running.load(Ordering::SeqCst) {
         let Some(packet) = track.next_packet().await else {
+            tracing::info!("remote track ended after {packets} packets");
             return;
         };
+        if packets == 0 {
+            tracing::info!(
+                "first RTP packet on remote track: pt={} len={}",
+                packet.payload_type,
+                packet.payload.len()
+            );
+        }
+        packets += 1;
         let mut buffer = gst::Buffer::from_mut_slice(packet.to_bytes());
         if let Some(raw) = buffer.get_mut() {
             raw.set_pts(gst::ClockTime::from_nseconds(

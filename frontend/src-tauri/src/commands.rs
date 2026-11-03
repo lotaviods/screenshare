@@ -21,7 +21,7 @@ use crate::state::{AppState, ShareTarget};
 pub const CALL_EVENT: &str = "call-event";
 
 /// Which local media stream a command feeds.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum LocalStream {
     Mic,
     System,
@@ -42,12 +42,18 @@ fn drain(channel: usize) -> mpsc::Sender<EncodedSample> {
 async fn media_sink(state: &State<'_, AppState>, stream: LocalStream) -> mpsc::Sender<EncodedSample> {
     let call = state.call.lock().await;
     match call.as_ref() {
-        Some(session) => match stream {
-            LocalStream::Mic => session.mic_sender(),
-            LocalStream::System => session.system_sender(),
-            LocalStream::Screen => session.screen_sender(),
-        },
-        None => drain(64),
+        Some(session) => {
+            tracing::info!("routing {stream:?} samples into the call session");
+            match stream {
+                LocalStream::Mic => session.mic_sender(),
+                LocalStream::System => session.system_sender(),
+                LocalStream::Screen => session.screen_sender(),
+            }
+        }
+        None => {
+            tracing::warn!("no call session; discarding {stream:?} samples");
+            drain(64)
+        }
     }
 }
 

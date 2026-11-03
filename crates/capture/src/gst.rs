@@ -220,6 +220,7 @@ fn run_pipeline(
     codec: Codec,
 ) {
     ensure_gst_init();
+    tracing::info!("starting capture pipeline: {launch}");
 
     let pipeline = match gst::parse::launch(&launch) {
         Ok(el) => match el.downcast::<gst::Pipeline>() {
@@ -268,6 +269,13 @@ fn run_pipeline(
     'outer: while running.load(Ordering::SeqCst) {
         if let Some(sample) = appsink.try_pull_sample(timeout) {
             if let Some(enc) = sample_to_encoded(&sample, codec) {
+                if enc.timestamp_micros == 0 || enc.keyframe {
+                    tracing::debug!(
+                        "capture sample: {} bytes keyframe={}",
+                        enc.data.len(),
+                        enc.keyframe
+                    );
+                }
                 if sink.blocking_send(enc).is_err() {
                     break 'outer; // consumer dropped
                 }

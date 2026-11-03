@@ -434,6 +434,7 @@ fn broadcast_local_state(shared: &Shared) {
 
 /// Create a peer connection with the standard local tracks and offer to it.
 async fn offer_to(shared: &Shared, peer_id: &str) -> Result<(), CallError> {
+    tracing::info!("offering to {peer_id}");
     let peer = create_peer(shared, peer_id).await?;
     let offer = peer.create_offer().await?;
     // Applying the local description starts ICE gathering and sends our
@@ -455,6 +456,7 @@ async fn answer_peer(
     peer_id: &str,
     offer: SessionDescription,
 ) -> Result<(), CallError> {
+    tracing::info!("answering {peer_id}");
     // Read the guard in its own statement: holding it across the `await` in
     // `create_peer` would make the future non-`Send`.
     let existing = shared.peers.read().unwrap().get(peer_id).cloned();
@@ -478,6 +480,10 @@ async fn answer_peer(
 /// Build a peer connection with the mic, system-audio and screen tracks.
 async fn create_peer(shared: &Shared, peer_id: &str) -> Result<Arc<WebRtcPeer>, CallError> {
     let cfg = shared.cfg.read().unwrap().clone();
+    tracing::info!(
+        "creating peer {peer_id} with mic/system/screen tracks (video {:?})",
+        cfg.video_codec
+    );
     let callback: Arc<dyn Fn(PeerEvent) + Send + Sync> =
         peer_event_handler(shared.clone(), peer_id.to_string());
     let peer = Arc::new(
@@ -542,6 +548,7 @@ async fn add_or_buffer_candidate(shared: &Shared, from: &str, cand: IceCandidate
         .entry(from.to_string())
         .or_default()
         .push(cand);
+    tracing::debug!("buffered ICE candidate for {from} (peer/description not ready)");
 }
 
 /// Flush ICE candidates buffered before the peer's remote description existed.
@@ -557,9 +564,11 @@ async fn flush_pending_candidates(shared: &Shared, peer_id: &str) {
     }
     let peer = shared.peers.read().unwrap().get(peer_id).cloned();
     if let Some(p) = peer {
+        let n = pending.len();
         for cand in pending {
             let _ = p.add_ice_candidate(cand).await;
         }
+        tracing::debug!("flushed {n} buffered ICE candidate(s) for {peer_id}");
     }
 }
 
@@ -576,6 +585,7 @@ fn peer_event_handler(shared: Shared, peer_id: String) -> Arc<dyn Fn(PeerEvent) 
             }
         }
         PeerEvent::ConnectionState(state) => {
+            tracing::info!("peer {peer_id} connection state: {state:?}");
             if let Some(participant) = update_participant(&shared, &peer_id, |p| {
                 p.connection = state;
             }) {

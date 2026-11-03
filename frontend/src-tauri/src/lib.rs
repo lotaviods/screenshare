@@ -11,6 +11,15 @@ use state::AppState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Without a subscriber every `tracing` log in the crates is dropped, which
+    // hides media/capture failures. Default to `info`; override with RUST_LOG.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .try_init();
+
     tauri::Builder::default()
         .setup(|app| {
             let config = ConfigStore::load_or_default().map_err(|e| e.to_string())?;
