@@ -256,11 +256,15 @@ impl RemoteMedia {
 }
 
 /// The audio pipeline: RTP → Opus → PCM → system output.
+///
+/// `pulsesink sync=false`: the sink must not sync to the pipeline clock. The
+/// sender's RTP timestamps stop advancing while muted, but the clock does not,
+/// so after an unmute every packet is late and a syncing sink drops them.
 fn audio_pipeline(codec: Codec) -> Result<(String, gst::Caps), MediaError> {
     match codec {
         Codec::Opus => Ok((
             "appsrc name=src ! rtpopusdepay ! opusdec ! audioconvert ! audioresample ! \
-             audio/x-raw,rate=48000 ! volume name=vol ! pulsesink"
+             audio/x-raw,rate=48000 ! volume name=vol ! pulsesink sync=false"
                 .to_string(),
             rtp_caps("audio", 48_000, "OPUS", 111),
         )),
