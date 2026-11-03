@@ -35,7 +35,11 @@ icons: ## regenerate Tauri icon set from $(TAURI_DIR)/app-icon.png
 dev: ## run Tauri dev with hot reload
 	pnpm --dir $(APP) tauri dev
 
+# The AppImage bundles GStreamer plugins and the plugin scanner. Their locations
+# come from pkg-config so the bundle works on any distro layout.
 bundle: ## build a production bundle
+	GSTREAMER_PLUGINS_DIR="$$(pkg-config --variable=pluginsdir gstreamer-1.0)" \
+	GSTREAMER_HELPERS_DIR="$$(pkg-config --variable=pluginscannerdir gstreamer-1.0)" \
 	pnpm --dir $(APP) tauri build
 
 build: bundle ## alias for bundle

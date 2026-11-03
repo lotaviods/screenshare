@@ -20,6 +20,16 @@ pub fn run() {
         .with_target(true)
         .try_init();
 
+    let missing = sharescreen_capture::missing_elements();
+    if missing.is_empty() {
+        tracing::info!("GStreamer runtime complete");
+    } else {
+        tracing::error!(
+            "GStreamer is missing required elements, capture/audio/decode will fail: {}",
+            missing.join(", ")
+        );
+    }
+
     tauri::Builder::default()
         .setup(|app| {
             let config = ConfigStore::load_or_default().map_err(|e| e.to_string())?;

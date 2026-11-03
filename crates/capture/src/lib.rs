@@ -16,6 +16,32 @@ mod x11;
 mod windows;
 
 #[cfg(target_os = "linux")]
+/// GStreamer elements the app cannot run without. Missing ones mean capture,
+/// audio, or decode will fail, so the app reports them at startup.
+pub const REQUIRED_ELEMENTS: &[&str] = &[
+    "pipewiresrc",
+    "pulsesrc",
+    "pulsesink",
+    "videoconvert",
+    "videoscale",
+    "videorate",
+    "jpegenc",
+    "opusenc",
+    "opusdec",
+    "rtph264depay",
+    "avdec_h264",
+];
+
+/// Required GStreamer elements that are not installed.
+pub fn missing_elements() -> Vec<&'static str> {
+    gst::ensure_gst_init();
+    REQUIRED_ELEMENTS
+        .iter()
+        .copied()
+        .filter(|name| !gst::element_exists(name))
+        .collect()
+}
+
 pub use wayland::WaylandCapture;
 #[cfg(target_os = "linux")]
 pub use x11::X11Capture;
