@@ -264,7 +264,7 @@ fn audio_pipeline(codec: Codec) -> Result<(String, gst::Caps), MediaError> {
     match codec {
         Codec::Opus => Ok((
             "appsrc name=src ! rtpopusdepay ! opusdec ! audioconvert ! audioresample ! \
-             audio/x-raw,rate=48000 ! volume name=vol ! pulsesink sync=false"
+             audio/x-raw,rate=48000 ! volume name=vol ! pulsesink sync=false buffer-time=60000"
                 .to_string(),
             rtp_caps("audio", 48_000, "OPUS", 111),
         )),
