@@ -442,6 +442,15 @@ mod tests {
     }
 
     #[test]
+    fn selected_resolution_is_applied_to_capture_pipeline() {
+        let mut options = opts(Codec::Vp8);
+        options.width = 1280;
+        options.height = 720;
+        let launch = build_launch("videotestsrc", &options);
+        assert!(launch.contains("video/x-raw,width=1280,height=720"));
+    }
+
+    #[test]
     fn preview_branch_emits_jpeg() {
         // The self-view branch must actually produce decodable JPEG frames.
         gst::init().unwrap();

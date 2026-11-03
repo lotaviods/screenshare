@@ -21,6 +21,14 @@ const RESOLUTIONS: [number, number][] = [
   [3840, 2160],
 ];
 
+const BITRATE_PRESETS = [
+  { label: "1,500 kbps · lower bandwidth", value: 1500 },
+  { label: "2,500 kbps · balanced", value: 2500 },
+  { label: "4,000 kbps · default", value: 4000 },
+  { label: "8,000 kbps · high detail", value: 8000 },
+  { label: "16,000 kbps · very high detail", value: 16000 },
+];
+
 export default function ShareDialog({
   config,
   onClose,
@@ -141,12 +149,38 @@ export default function ShareDialog({
             <input value={config.video.codec.toUpperCase()} readOnly spellCheck={false} />
           </label>
           <label>
-            <span>Bitrate (kbps)</span>
+            <span>Video bitrate (kbps)</span>
+            <select
+              aria-label="Video bitrate preset"
+              value={
+                BITRATE_PRESETS.some((preset) => preset.value === bitrate)
+                  ? String(bitrate)
+                  : "custom"
+              }
+              onChange={(e) => {
+                if (e.target.value !== "custom") {
+                  setBitrate(Number(e.target.value));
+                }
+              }}
+            >
+              {BITRATE_PRESETS.map((preset) => (
+                <option key={preset.value} value={preset.value}>
+                  {preset.label}
+                </option>
+              ))}
+              <option value="custom">Custom</option>
+            </select>
             <input
               type="number"
+              min={64}
+              max={50_000}
+              step={100}
               value={bitrate}
               onChange={(e) => setBitrate(Number(e.target.value))}
             />
+            <span className="small muted">
+              Higher bitrate preserves more detail and uses more bandwidth.
+            </span>
           </label>
         </div>
 
@@ -173,7 +207,11 @@ export default function ShareDialog({
           <button className="ghost" onClick={onClose}>
             Cancel
           </button>
-          <button className="primary" disabled={!source} onClick={start}>
+          <button
+            className="primary"
+            disabled={!source || bitrate < 64 || bitrate > 50_000}
+            onClick={start}
+          >
             Start sharing
           </button>
         </div>

@@ -110,6 +110,9 @@ pub async fn start_screen_share(
     source: CaptureSource,
     options: CaptureOptions,
 ) -> Result<(), String> {
+    if !(64..=50_000).contains(&options.bitrate_kbps) {
+        return Err("video bitrate must be between 64 and 50000 kbps".into());
+    }
     let tx = media_sink(&state, LocalStream::Screen).await;
     // The screen track's codec is fixed at call setup, so capture must encode
     // with the same codec or the samples cannot be decoded.
@@ -120,6 +123,14 @@ pub async fn start_screen_share(
             options.codec = session.video_codec();
         }
     }
+    tracing::info!(
+        "starting screen share: source={} resolution={}x{} fps={} bitrate={} kbps",
+        source.id,
+        options.width,
+        options.height,
+        options.fps,
+        options.bitrate_kbps
+    );
     let mut engine = state.capture.lock().await;
     engine
         .start(source.clone(), options.clone(), tx)
@@ -425,7 +436,8 @@ pub async fn open_pip_window(app: tauri::AppHandle) -> Result<(), String> {
     .title("Sharescreen PiP")
     .always_on_top(true)
     .decorations(false)
-    .resizable(false)
+    .resizable(true)
+    .min_inner_size(320.0, 180.0)
     .inner_size(480.0, 270.0)
     .build()
     .map_err(|e| e.to_string())?;

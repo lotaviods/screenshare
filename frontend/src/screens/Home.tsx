@@ -26,6 +26,14 @@ export default function Home({
   onSaveConfig,
 }: HomeProps) {
   const [roomId, setRoomId] = useState("");
+  const [displayName, setDisplayName] = useState(config.state.display_name);
+  const nameNeedsSave = displayName.trim() !== config.state.display_name;
+
+  const saveDisplayName = () => {
+    const name = displayName.trim();
+    if (!name || !nameNeedsSave) return;
+    onSaveConfig({ ...config, state: { ...config.state, display_name: name } });
+  };
 
   const setHost = (host: string) =>
     onSaveConfig({
@@ -48,14 +56,57 @@ export default function Home({
   return (
     <div className="home">
       <header className="home-header">
-        <h1>Sharescreen</h1>
+        <div className="home-brand">
+          <span className="brand-mark" aria-hidden="true">
+            S
+          </span>
+          <div>
+            <p className="eyebrow">SHARESCREEN</p>
+            <h1>Share your screen, together.</h1>
+          </div>
+        </div>
         <button className="ghost" onClick={onOpenSettings}>
           Settings
         </button>
       </header>
 
+      <section className="profile-card">
+        <span className="avatar profile-avatar">{initials(displayName)}</span>
+        <label className="grow">
+          <span>Your display name</span>
+          <input
+            value={displayName}
+            maxLength={32}
+            onChange={(e) => setDisplayName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") saveDisplayName();
+            }}
+            placeholder="Name others will see"
+          />
+        </label>
+        <button
+          className={nameNeedsSave ? "secondary" : "ghost"}
+          disabled={!displayName.trim() || !nameNeedsSave}
+          onClick={saveDisplayName}
+        >
+          Save name
+        </button>
+        <span className="small muted profile-hint">
+          Used when you connect next time.
+        </span>
+      </section>
+
       <section className="card">
-        <h2>Server</h2>
+        <div className="section-heading">
+          <div>
+            <p className="eyebrow">CONNECTION</p>
+            <h2>Signaling server</h2>
+          </div>
+          <span className={connected ? "status-pill online" : "status-pill"}>
+            <span className="status-dot" />
+            {connected ? "Connected" : "Not connected"}
+          </span>
+        </div>
         <div className="row">
           <label className="grow">
             <span>Address</span>
@@ -90,7 +141,11 @@ export default function Home({
               Disconnect
             </button>
           ) : (
-            <button className="primary" onClick={onConnect}>
+            <button
+              className="primary"
+              disabled={!config.state.display_name.trim() || nameNeedsSave}
+              onClick={onConnect}
+            >
               Connect
             </button>
           )}
@@ -102,8 +157,13 @@ export default function Home({
         </p>
       </section>
 
-      <section className="card">
-        <h2>Room</h2>
+      <section className="card room-card">
+        <div className="section-heading">
+          <div>
+            <p className="eyebrow">GET TOGETHER</p>
+            <h2>Join or create a room</h2>
+          </div>
+        </div>
         <div className="row">
           <label className="grow">
             <span>Room ID</span>
@@ -143,7 +203,10 @@ export default function Home({
 
       {participants.length > 0 && (
         <section className="card">
-          <h2>Participants</h2>
+          <div className="section-heading">
+            <h2>Participants</h2>
+            <span className="status-pill">{participants.length} online</span>
+          </div>
           <ul className="participants">
             {participants.map((p) => (
               <li key={p.id}>

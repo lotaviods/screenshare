@@ -20,6 +20,23 @@ interface CallProps {
   onSaveConfig: (config: Config) => void;
 }
 
+function MicStatus({ on }: { on: boolean }) {
+  return (
+    <span
+      className={on ? "mic-status on" : "mic-status off"}
+      role="img"
+      aria-label={on ? "Microphone on" : "Microphone muted"}
+      title={on ? "Microphone on" : "Microphone muted"}
+    >
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+        <path d="M5 10v1a7 7 0 0 0 14 0v-1M12 18v4m-4 0h8" />
+        {!on && <path d="m4 4 16 16" />}
+      </svg>
+    </span>
+  );
+}
+
 export default function Call({
   config,
   roomId,
@@ -35,8 +52,18 @@ export default function Call({
   const [shareOpen, setShareOpen] = useState(false);
   const [micVolume, setMicVolume] = useState(config.audio.mic_volume);
   const [status, setStatus] = useState<string | null>(null);
+  const [roomCopied, setRoomCopied] = useState(false);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const sharer = participants.find((p) => p.screen_on);
+
+  const copyRoomId = async () => {
+    try {
+      await navigator.clipboard.writeText(roomId);
+      setRoomCopied(true);
+    } catch (e) {
+      setStatus(errorMessage(e));
+    }
+  };
 
   // Poll the decoded remote frame and paint it onto the canvas.
   useEffect(() => {
@@ -121,6 +148,14 @@ export default function Call({
       setShareOpen(false);
       onSaveConfig({
         ...config,
+        video: {
+          ...config.video,
+          width: options.width,
+          height: options.height,
+          max_fps: options.fps,
+          max_bitrate_kbps: options.bitrate_kbps,
+          hardware_encoding: options.hardware_encoding,
+        },
         capture: { ...config.capture, last_monitor_id: source.id },
       });
     } catch (e) {
@@ -141,16 +176,40 @@ export default function Call({
     <div className="call">
       <aside className="sidebar">
         <header className="sidebar-header">
+          <p className="eyebrow">CURRENT ROOM</p>
           <h2>Room</h2>
-          <span className="room-id">{roomId}</span>
+          <div className="room-code-row">
+            <span className="room-id" title={roomId}>
+              {roomId}
+            </span>
+            <button
+              className="icon-button"
+              title={roomCopied ? "Room ID copied" : "Copy room ID"}
+              aria-label={roomCopied ? "Room ID copied" : "Copy room ID"}
+              onClick={copyRoomId}
+            >
+              {roomCopied ? "✓" : "⧉"}
+            </button>
+          </div>
         </header>
+        <div className="sidebar-profile">
+          <span className="avatar">{initials(config.state.display_name)}</span>
+          <div className="profile-copy">
+            <span className="small muted">You</span>
+            <strong>{config.state.display_name}</strong>
+          </div>
+        </div>
+        <div className="section-heading sidebar-section-heading">
+          <h3>Participants</h3>
+          <span className="small muted">{participants.length}</span>
+        </div>
         <ul className="participants">
           {participants.map((p) => (
             <li key={p.id}>
               <span className="avatar">{initials(p.name)}</span>
-              <span className="grow">
-                {p.name}
-                <span className="muted small"> {p.connection}</span>
+              <span className="participant-copy grow" title={p.name}>
+                <strong>{p.name}</strong>
+                <span className="muted small">{p.connection}</span>
               </span>
               <input
                 className="peer-volume"
@@ -160,13 +219,14 @@ export default function Call({
                 step={0.05}
                 defaultValue={1}
                 title={`Volume for ${p.name}`}
+                aria-label={`Volume for ${p.name}`}
                 onChange={(e) =>
                   api
                     .setPeerVolume(p.id, Number(e.target.value))
                     .catch(() => undefined)
                 }
               />
-              <span className="badge">{p.mic_on ? "mic" : "muted"}</span>
+              <MicStatus on={p.mic_on} />
             </li>
           ))}
           {participants.length === 0 && (
@@ -174,7 +234,7 @@ export default function Call({
           )}
         </ul>
         <div className="grow" />
-        <button className="ghost" onClick={onOpenSettings}>
+        <button className="ghost sidebar-settings" onClick={onOpenSettings}>
           Settings
         </button>
       </aside>
@@ -233,12 +293,12 @@ export default function Call({
               Stop share
             </button>
           ) : (
-            <button className="control" onClick={() => setShareOpen(true)}>
+            <button className="control primary" onClick={() => setShareOpen(true)}>
               Share screen
             </button>
           )}
           <div className="grow" />
-          <button className="control" onClick={onDeleteRoom}>
+          <button className="control destructive" onClick={onDeleteRoom}>
             Delete room
           </button>
           <button className="control danger" onClick={onLeave}>
