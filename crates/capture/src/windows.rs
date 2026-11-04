@@ -243,7 +243,6 @@ mod tests {
         }
     }
 
-    /// `has_d3d11` probes the element registry, which needs GStreamer up.
     fn init() {
         gstreamer::init().unwrap();
     }

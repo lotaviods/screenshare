@@ -32,8 +32,6 @@ pub const REQUIRED_ELEMENTS: &[&str] = &[
     "avdec_h264",
 ];
 
-/// GStreamer elements the app cannot run without. Missing ones mean capture,
-/// audio, or decode will fail, so the app reports them at startup.
 #[cfg(windows)]
 pub const REQUIRED_ELEMENTS: &[&str] = &[
     "wasapi2src",

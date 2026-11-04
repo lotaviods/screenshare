@@ -71,7 +71,7 @@ pub fn hardware_encoder_candidates(codec: Codec) -> &'static [&'static str] {
 
 /// Hardware encoder candidates for a codec, in preference order.
 #[cfg(windows)]
-pub fn hw_candidates(codec: Codec) -> &'static [&'static str] {
+pub fn hardware_encoder_candidates(codec: Codec) -> &'static [&'static str] {
     match codec {
         Codec::H264 => &["mfh264enc", "nvh264enc", "qsvh264enc"],
         Codec::Vp9 => &["nvvp9enc"],
@@ -79,14 +79,6 @@ pub fn hw_candidates(codec: Codec) -> &'static [&'static str] {
     }
 }
 
-/// Caps the WebRTC H.264 payloader needs: Annex-B start codes
-/// (`stream-format=byte-stream`) and access-unit alignment.
-///
-/// The profile is deliberately not pinned. `mfh264enc` writes a baseline SPS
-/// even when asked for constrained-baseline; pinning the profile made the
-/// appsink reject its caps event, which surfaced as "Internal data stream
-/// error" and no outgoing video. Both profiles decode the same way, and the
-/// SDP still advertises `profile-level-id=42e01f`.
 const H264_APPSINK_CAPS: &str = "video/x-h264,stream-format=byte-stream,alignment=au";
 
 /// Software encoder chain for a codec. Returns `(encoder elements, appsink caps)`.
@@ -99,10 +91,6 @@ pub fn software_encoder_chain(codec: Codec, bitrate_kbps: u32) -> (String, &'sta
             ),
             H264_APPSINK_CAPS,
         ),
-        // openh264enc is the always-available H.264 encoder in the Windows
-        // GStreamer distribution. Unlike the GPU encoders, its `bitrate` is in
-        // bit/s. It already emits constrained-baseline, so no profile property
-        // is needed (this build has none).
         #[cfg(windows)]
         Codec::H264 => (
             format!("openh264enc bitrate={} ! h264parse", bitrate_kbps * 1000),
@@ -125,12 +113,6 @@ pub fn software_encoder_chain(codec: Codec, bitrate_kbps: u32) -> (String, &'sta
     }
 }
 
-/// Hardware encoder chain for a codec. Returns `(encoder elements, appsink caps)`.
-///
-/// The GPU and Media Foundation encoders take `bitrate` in kbit/s, so the
-/// configured value is passed through unchanged; only the software
-/// `openh264enc` takes bit/s. `mfh264enc` also defaults to `low-latency=false`,
-/// which buffers frames and adds latency to a live share.
 fn hardware_encoder_chain(
     encoder_factory: &str,
     codec: Codec,
@@ -306,9 +288,6 @@ fn run_pipeline(
             use gst::MessageView;
             match msg.view() {
                 MessageView::Error(err) => {
-                    // `error()` is often the generic "Internal data stream
-                    // error"; `debug()` carries the real cause (usually a
-                    // not-negotiated caps mismatch), so log both.
                     let source = err
                         .src()
                         .map(|src| src.path_string().to_string())
@@ -380,14 +359,11 @@ mod tests {
         assert_eq!(chain, "x264enc tune=zerolatency speed-preset=veryfast key-int-max=60 bitrate=2500 ! h264parse");
         #[cfg(windows)]
         assert_eq!(chain, "openh264enc bitrate=2500000 ! h264parse");
-        // Annex-B start codes, access-unit alignment, no pinned profile.
         assert_eq!(caps, H264_APPSINK_CAPS);
     }
 
     #[test]
     fn mfh264enc_gets_kbps_and_low_latency() {
-        // Regression: mfh264enc takes kbit/s (not bit/s), and low-latency must
-        // be enabled for a live share.
         let (chain, caps) = hardware_encoder_chain("mfh264enc", Codec::H264, 4000);
         assert_eq!(chain, "mfh264enc bitrate=4000 low-latency=true ! h264parse");
         assert_eq!(caps, H264_APPSINK_CAPS);
@@ -441,7 +417,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn hardware_prefers_first_available_candidate() {
-        // Media Foundation is the first H.264 candidate on Windows.
         let (chain, caps) = select_encoder_chain(Codec::H264, 2500, true, &|n| n == "mfh264enc");
         assert_eq!(chain, "mfh264enc bitrate=2500 low-latency=true ! h264parse");
         assert_eq!(caps, H264_APPSINK_CAPS);
