@@ -65,8 +65,23 @@ pnpm --dir frontend install
 pnpm --dir frontend tauri dev
 ```
 
-The app loads the GStreamer DLLs from `%GSTREAMER_1_0_ROOT_MSVC_X86_64%\bin`,
-so the `bin` directory must be on `PATH` when it starts.
+To create the portable Windows ZIP, run this from PowerShell on a Windows
+x86_64 machine with the prerequisites above:
+
+```powershell
+.\scripts\build-windows-portable.ps1
+```
+
+It creates a ZIP with the app and GStreamer runtime in `dist/`. Recipients
+extract it and run `sharescreen-tauri.exe`. Windows WebView2 Runtime is still
+required (normally present on Windows 11). The recipient does not need the
+source checkout, Rust, or Node.js.
+
+For Linux, use the existing `make bundle` target documented above.
+
+When running a developer build, put
+`%GSTREAMER_1_0_ROOT_MSVC_X86_64%\bin` on `PATH`. The portable package sets up
+the bundled runtime automatically.
 
 Icons are regenerated from `frontend/src-tauri/app-icon.png` via `make icons`.
 

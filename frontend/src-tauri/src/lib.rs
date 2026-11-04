@@ -20,6 +20,9 @@ pub fn run() {
         .with_target(true)
         .try_init();
 
+    #[cfg(windows)]
+    configure_bundled_gstreamer();
+
     let missing = sharescreen_capture::missing_elements();
     if missing.is_empty() {
         tracing::info!("GStreamer runtime complete");
@@ -82,4 +85,39 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// Make the portable Windows build use the GStreamer runtime shipped beside
+/// the executable. A normal developer install continues to use its existing
+/// GStreamer environment when the bundled runtime is absent.
+#[cfg(windows)]
+fn configure_bundled_gstreamer() {
+    use std::{env, path::PathBuf};
+
+    let Ok(exe) = env::current_exe() else {
+        return;
+    };
+    let Some(app_dir) = exe.parent() else {
+        return;
+    };
+    let gst_dir = app_dir.join("gstreamer");
+    let plugins_dir = gst_dir.join("lib/gstreamer-1.0");
+    if !plugins_dir.is_dir() {
+        return;
+    }
+
+    let bin_dir = PathBuf::from(app_dir);
+    let path = env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![bin_dir];
+    paths.extend(env::split_paths(&path));
+    if let Ok(path) = env::join_paths(paths) {
+        env::set_var("PATH", path);
+    }
+    env::set_var("GST_PLUGIN_PATH_1_0", &plugins_dir);
+    env::set_var("GST_PLUGIN_SYSTEM_PATH_1_0", &plugins_dir);
+    env::set_var("GST_PLUGIN_SCANNER", app_dir.join("gst-plugin-scanner.exe"));
+    env::set_var("GST_PLUGIN_SCANNER_1_0", app_dir.join("gst-plugin-scanner.exe"));
+    env::set_var("GST_PLUGIN_PATH", &plugins_dir);
+    env::set_var("GST_PLUGIN_SYSTEM_PATH", &plugins_dir);
+    env::set_var("GST_REGISTRY", app_dir.join("gstreamer-registry.bin"));
 }
