@@ -79,23 +79,17 @@ pub fn hw_candidates(codec: Codec) -> &'static [&'static str] {
     }
 }
 
-/// Encoder `bitrate` unit: x264enc and the vpx encoders take kbit/s, Media
-/// Foundation and openh264 take bit/s.
-#[cfg(target_os = "linux")]
-fn bitrate_prop(kbps: u32) -> u32 {
-    kbps
-}
-
-#[cfg(windows)]
-fn bitrate_prop(kbps: u32) -> u32 {
-    kbps * 1000
-}
+/// Caps the WebRTC H.264 payloader needs: Annex-B start codes
+/// (`stream-format=byte-stream`) and access-unit alignment.
+///
+/// The profile is deliberately not pinned. `mfh264enc` writes a baseline SPS
+/// even when asked for constrained-baseline; pinning the profile made the
+/// appsink reject its caps event, which surfaced as "Internal data stream
+/// error" and no outgoing video. Both profiles decode the same way, and the
+/// SDP still advertises `profile-level-id=42e01f`.
+const H264_SINK_CAPS: &str = "video/x-h264,stream-format=byte-stream,alignment=au";
 
 /// Software encoder chain for a codec. Returns `(encoder elements, appsink caps)`.
-///
-/// The H.264 caps pin the format the WebRTC payloader needs: Annex-B
-/// start codes (`stream-format=byte-stream`) and the constrained-baseline
-/// profile the SDP advertises (`profile-level-id=42e01f`).
 pub fn software_chain(codec: Codec, bitrate_kbps: u32) -> (String, &'static str) {
     match codec {
         #[cfg(target_os = "linux")]
@@ -103,14 +97,16 @@ pub fn software_chain(codec: Codec, bitrate_kbps: u32) -> (String, &'static str)
             format!(
                 "x264enc tune=zerolatency speed-preset=veryfast key-int-max=60 bitrate={bitrate_kbps} ! h264parse"
             ),
-            "video/x-h264,profile=constrained-baseline,stream-format=byte-stream,alignment=au",
+            H264_SINK_CAPS,
         ),
         // openh264enc is the always-available H.264 encoder in the Windows
-        // GStreamer distribution.
+        // GStreamer distribution. Unlike the GPU encoders, its `bitrate` is in
+        // bit/s. It already emits constrained-baseline, so no profile property
+        // is needed (this build has none).
         #[cfg(windows)]
         Codec::H264 => (
-            format!("openh264enc bitrate={} ! h264parse", bitrate_prop(bitrate_kbps)),
-            "video/x-h264,profile=constrained-baseline,stream-format=byte-stream,alignment=au",
+            format!("openh264enc bitrate={} ! h264parse", bitrate_kbps * 1000),
+            H264_SINK_CAPS,
         ),
         Codec::Vp9 => (
             format!(
@@ -129,6 +125,25 @@ pub fn software_chain(codec: Codec, bitrate_kbps: u32) -> (String, &'static str)
     }
 }
 
+/// Hardware encoder chain for a codec. Returns `(encoder elements, appsink caps)`.
+///
+/// The GPU and Media Foundation encoders take `bitrate` in kbit/s, so the
+/// configured value is passed through unchanged; only the software
+/// `openh264enc` takes bit/s. `mfh264enc` also defaults to `low-latency=false`,
+/// which buffers frames and adds latency to a live share.
+fn hardware_chain(enc: &str, codec: Codec, bitrate_kbps: u32) -> (String, &'static str) {
+    let encoder = if enc == "mfh264enc" {
+        format!("mfh264enc bitrate={bitrate_kbps} low-latency=true")
+    } else {
+        format!("{enc} bitrate={bitrate_kbps}")
+    };
+    match codec {
+        Codec::H264 => (format!("{encoder} ! h264parse"), H264_SINK_CAPS),
+        Codec::Vp9 => (encoder, "video/x-vp9"),
+        _ => (encoder, "video/x-vp8"),
+    }
+}
+
 /// Pick the encoder chain for a codec. When `hardware` is true, prefer the first
 /// available hardware encoder (per `exists`); otherwise fall back to software.
 pub fn encoder_chain(
@@ -140,21 +155,7 @@ pub fn encoder_chain(
     if hardware {
         for enc in hw_candidates(codec) {
             if exists(enc) {
-                let chain = format!("{enc} bitrate={}", bitrate_prop(bitrate_kbps));
-                return match codec {
-                    Codec::H264 => (
-                        format!("{chain} ! h264parse"),
-                        "video/x-h264,profile=constrained-baseline,stream-format=byte-stream,alignment=au",
-                    ),
-                    _ => (
-                        chain,
-                        if codec == Codec::Vp9 {
-                            "video/x-vp9"
-                        } else {
-                            "video/x-vp8"
-                        },
-                    ),
-                };
+                return hardware_chain(enc, codec, bitrate_kbps);
             }
         }
     }
@@ -301,7 +302,18 @@ fn run_pipeline(
             use gst::MessageView;
             match msg.view() {
                 MessageView::Error(err) => {
-                    tracing::error!("capture pipeline error: {}", err.error());
+                    // `error()` is often the generic "Internal data stream
+                    // error"; `debug()` carries the real cause (usually a
+                    // not-negotiated caps mismatch), so log both.
+                    let source = err
+                        .src()
+                        .map(|src| src.path_string().to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    tracing::error!(
+                        "capture pipeline error from {source}: {} (debug: {})",
+                        err.error(),
+                        err.debug().as_deref().unwrap_or("no details")
+                    );
                     break 'outer;
                 }
                 MessageView::Eos(_) => break 'outer,
@@ -360,12 +372,21 @@ mod tests {
     #[test]
     fn h264_software_chain_includes_parser() {
         let (chain, caps) = software_chain(Codec::H264, 2500);
+        #[cfg(target_os = "linux")]
         assert_eq!(chain, "x264enc tune=zerolatency speed-preset=veryfast key-int-max=60 bitrate=2500 ! h264parse");
-        // Annex-B start codes and the profile the SDP advertises.
-        assert_eq!(
-            caps,
-            "video/x-h264,profile=constrained-baseline,stream-format=byte-stream,alignment=au"
-        );
+        #[cfg(windows)]
+        assert_eq!(chain, "openh264enc bitrate=2500000 ! h264parse");
+        // Annex-B start codes, access-unit alignment, no pinned profile.
+        assert_eq!(caps, H264_SINK_CAPS);
+    }
+
+    #[test]
+    fn mfh264enc_gets_kbps_and_low_latency() {
+        // Regression: mfh264enc takes kbit/s (not bit/s), and low-latency must
+        // be enabled for a live share.
+        let (chain, caps) = hardware_chain("mfh264enc", Codec::H264, 4000);
+        assert_eq!(chain, "mfh264enc bitrate=4000 low-latency=true ! h264parse");
+        assert_eq!(caps, H264_SINK_CAPS);
     }
 
     #[test]
@@ -404,15 +425,22 @@ mod tests {
         pipeline.set_state(gst::State::Null).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn hardware_prefers_first_available_candidate() {
         // Simulate a machine with vah264enc available.
         let (chain, caps) = encoder_chain(Codec::H264, 2500, true, &|n| n == "vah264enc");
         assert_eq!(chain, "vah264enc bitrate=2500 ! h264parse");
-        assert_eq!(
-            caps,
-            "video/x-h264,profile=constrained-baseline,stream-format=byte-stream,alignment=au"
-        );
+        assert_eq!(caps, H264_SINK_CAPS);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hardware_prefers_first_available_candidate() {
+        // Media Foundation is the first H.264 candidate on Windows.
+        let (chain, caps) = encoder_chain(Codec::H264, 2500, true, &|n| n == "mfh264enc");
+        assert_eq!(chain, "mfh264enc bitrate=2500 low-latency=true ! h264parse");
+        assert_eq!(caps, H264_SINK_CAPS);
     }
 
     #[test]

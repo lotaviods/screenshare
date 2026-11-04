@@ -243,6 +243,11 @@ mod tests {
         }
     }
 
+    /// `has_d3d11` probes the element registry, which needs GStreamer up.
+    fn init() {
+        gstreamer::init().unwrap();
+    }
+
     #[test]
     fn invalid_window_handle_is_rejected() {
         assert!(windows_source(&source("window:abc"), CursorMode::Embedded).is_err());
@@ -257,6 +262,7 @@ mod tests {
 
     #[test]
     fn monitor_source_names_the_requested_monitor() {
+        init();
         let src = windows_source(&source("monitor:2"), CursorMode::Hidden).unwrap();
         assert!(src.contains("monitor-index=2") || src.contains("monitor=2"));
         assert!(src.contains("show-cursor=false"));
@@ -264,6 +270,7 @@ mod tests {
 
     #[test]
     fn unknown_source_uses_primary_monitor() {
+        init();
         let src = windows_source(&source("screen"), CursorMode::Embedded).unwrap();
         assert!(src.contains("monitor-index=0") || src.contains("monitor=0"));
         assert!(src.contains("show-cursor=true"));
@@ -272,6 +279,7 @@ mod tests {
     #[test]
     fn window_source_uses_wgc() {
         // Only reachable when d3d11screencapturesrc is installed.
+        init();
         if !has_d3d11() {
             return;
         }

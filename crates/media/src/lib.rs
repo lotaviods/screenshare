@@ -22,6 +22,10 @@ use gstreamer_app;
 use sharescreen_core::Codec;
 use sharescreen_webrtc::{RemoteTrack, RemoteTrackKind};
 
+mod audio_sink;
+
+use audio_sink::AudioSink;
+
 #[derive(Debug, thiserror::Error)]
 pub enum MediaError {
     #[error("gstreamer pipeline failed: {0}")]
@@ -257,15 +261,17 @@ impl RemoteMedia {
 
 /// The audio pipeline: RTP → Opus → PCM → system output.
 ///
-/// `pulsesink sync=false`: the sink must not sync to the pipeline clock. The
+/// `sync=false`: the sink must not sync to the pipeline clock. The
 /// sender's RTP timestamps stop advancing while muted, but the clock does not,
 /// so after an unmute every packet is late and a syncing sink drops them.
 fn audio_pipeline(codec: Codec) -> Result<(String, gst::Caps), MediaError> {
     match codec {
         Codec::Opus => Ok((
-            "appsrc name=src ! rtpopusdepay ! opusdec ! audioconvert ! audioresample ! \
-             audio/x-raw,rate=48000 ! volume name=vol ! pulsesink sync=false buffer-time=60000"
-                .to_string(),
+            format!(
+                "appsrc name=src ! rtpopusdepay ! opusdec ! audioconvert ! audioresample ! \
+                 audio/x-raw,rate=48000 ! volume name=vol ! {}",
+                AudioSink::detect().launch()
+            ),
             rtp_caps("audio", 48_000, "OPUS", 111),
         )),
         other => Err(MediaError::UnsupportedCodec(format!("{other:?}"))),
