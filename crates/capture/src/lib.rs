@@ -15,13 +15,26 @@ mod windows;
 #[cfg(target_os = "linux")]
 mod x11;
 
-#[cfg(target_os = "linux")]
 /// GStreamer elements the app cannot run without. Missing ones mean capture,
 /// audio, or decode will fail, so the app reports them at startup.
+#[cfg(target_os = "linux")]
 pub const REQUIRED_ELEMENTS: &[&str] = &[
     "pipewiresrc",
     "pulsesrc",
     "pulsesink",
+    "videoconvert",
+    "videoscale",
+    "videorate",
+    "jpegenc",
+    "opusenc",
+    "opusdec",
+    "rtph264depay",
+    "avdec_h264",
+];
+
+#[cfg(windows)]
+pub const REQUIRED_ELEMENTS: &[&str] = &[
+    "wasapi2src",
     "videoconvert",
     "videoscale",
     "videorate",
@@ -42,6 +55,7 @@ pub fn missing_elements() -> Vec<&'static str> {
         .collect()
 }
 
+#[cfg(target_os = "linux")]
 pub use wayland::WaylandCapture;
 #[cfg(windows)]
 pub use windows::WindowsCapture;

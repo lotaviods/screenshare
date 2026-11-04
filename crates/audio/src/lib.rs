@@ -15,7 +15,9 @@ mod pulse;
 mod wasapi;
 
 use async_trait::async_trait;
-use sharescreen_core::{AudioCapture, AudioError, Device, DeviceKind, EncodedSample};
+#[cfg(target_os = "linux")]
+use sharescreen_core::DeviceKind;
+use sharescreen_core::{AudioCapture, AudioError, Device, EncodedSample};
 use tokio::sync::mpsc;
 
 use pipeline::Stream;

@@ -39,6 +39,35 @@ make bundle   # production bundle (AppImage on Linux)
 `webkit2gtk-4.1`, `javascriptcoregtk-4.1`, `gtk3`, `libsoup3`, `gdk-pixbuf`.
 On Arch: `pacman -S webkit2gtk-4.1 gtk3 libsoup3`.
 
+### Windows
+
+Prerequisites (PowerShell, no `make` needed):
+
+```powershell
+winget install Rustlang.Rustup Microsoft.VisualStudio.2022.BuildTools  # pick "Desktop development with C++"
+winget install gstreamerproject.gstreamer                              # GStreamer MSVC x86_64
+```
+
+The winget GStreamer package installs per-user and does not set its
+environment variables, so point the build at it once (new terminal after):
+
+```powershell
+$gst = "$env:LOCALAPPDATA\Programs\gstreamer\1.0\msvc_x86_64"
+[Environment]::SetEnvironmentVariable("GSTREAMER_1_0_ROOT_MSVC_X86_64", $gst, "User")
+[Environment]::SetEnvironmentVariable("PKG_CONFIG_PATH", "$gst\lib\pkgconfig", "User")
+[Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$gst\bin", "User")
+```
+
+Then run the app:
+
+```powershell
+pnpm --dir frontend install
+pnpm --dir frontend tauri dev
+```
+
+The app loads the GStreamer DLLs from `%GSTREAMER_1_0_ROOT_MSVC_X86_64%\bin`,
+so the `bin` directory must be on `PATH` when it starts.
+
 Icons are regenerated from `frontend/src-tauri/app-icon.png` via `make icons`.
 
 ## Roadmap

@@ -9,6 +9,7 @@
 //! capture falls back to `gdiscreencapsrc`; window capture is unavailable.
 
 use async_trait::async_trait;
+use gstreamer::prelude::*;
 use tokio::sync::mpsc;
 
 use sharescreen_core::{
@@ -130,7 +131,8 @@ fn parse_handle(text: &str) -> Option<i64> {
 /// Monitors reported by GStreamer's d3d11 capture device provider.
 fn monitors() -> Vec<CaptureSource> {
     gst::ensure_gst_init();
-    let Some(factory) = gst::DeviceProviderFactory::find("d3d11screencapturedeviceprovider") else {
+    let Some(factory) = gstreamer::DeviceProviderFactory::find("d3d11screencapturedeviceprovider")
+    else {
         return Vec::new();
     };
     let Some(provider) = factory.get() else {
@@ -175,7 +177,8 @@ fn list_windows() -> Vec<CaptureSource> {
 
 #[cfg(windows)]
 mod windows {
-    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows_sys::core::BOOL;
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetWindowTextLengthW, GetWindowTextW, IsWindowVisible,
     };
@@ -240,6 +243,10 @@ mod tests {
         }
     }
 
+    fn init() {
+        gstreamer::init().unwrap();
+    }
+
     #[test]
     fn invalid_window_handle_is_rejected() {
         assert!(windows_source(&source("window:abc"), CursorMode::Embedded).is_err());
@@ -254,6 +261,7 @@ mod tests {
 
     #[test]
     fn monitor_source_names_the_requested_monitor() {
+        init();
         let src = windows_source(&source("monitor:2"), CursorMode::Hidden).unwrap();
         assert!(src.contains("monitor-index=2") || src.contains("monitor=2"));
         assert!(src.contains("show-cursor=false"));
@@ -261,6 +269,7 @@ mod tests {
 
     #[test]
     fn unknown_source_uses_primary_monitor() {
+        init();
         let src = windows_source(&source("screen"), CursorMode::Embedded).unwrap();
         assert!(src.contains("monitor-index=0") || src.contains("monitor=0"));
         assert!(src.contains("show-cursor=true"));
@@ -269,6 +278,7 @@ mod tests {
     #[test]
     fn window_source_uses_wgc() {
         // Only reachable when d3d11screencapturesrc is installed.
+        init();
         if !has_d3d11() {
             return;
         }

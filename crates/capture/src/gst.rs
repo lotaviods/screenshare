@@ -61,7 +61,7 @@ pub fn element_exists(name: &str) -> bool {
 
 /// Hardware encoder candidates for a codec, in preference order.
 #[cfg(target_os = "linux")]
-pub fn hw_candidates(codec: Codec) -> &'static [&'static str] {
+pub fn hardware_encoder_candidates(codec: Codec) -> &'static [&'static str] {
     match codec {
         Codec::H264 => &["vah264enc", "vaapih264enc", "nvh264enc", "qsvh264enc"],
         Codec::Vp9 => &["vavp9enc", "vaapivp9enc"],
@@ -71,7 +71,7 @@ pub fn hw_candidates(codec: Codec) -> &'static [&'static str] {
 
 /// Hardware encoder candidates for a codec, in preference order.
 #[cfg(windows)]
-pub fn hw_candidates(codec: Codec) -> &'static [&'static str] {
+pub fn hardware_encoder_candidates(codec: Codec) -> &'static [&'static str] {
     match codec {
         Codec::H264 => &["mfh264enc", "nvh264enc", "qsvh264enc"],
         Codec::Vp9 => &["nvvp9enc"],
@@ -79,38 +79,22 @@ pub fn hw_candidates(codec: Codec) -> &'static [&'static str] {
     }
 }
 
-/// Encoder `bitrate` unit: x264enc and the vpx encoders take kbit/s, Media
-/// Foundation and openh264 take bit/s.
-#[cfg(target_os = "linux")]
-fn bitrate_prop(kbps: u32) -> u32 {
-    kbps
-}
-
-#[cfg(windows)]
-fn bitrate_prop(kbps: u32) -> u32 {
-    kbps * 1000
-}
+const H264_APPSINK_CAPS: &str = "video/x-h264,stream-format=byte-stream,alignment=au";
 
 /// Software encoder chain for a codec. Returns `(encoder elements, appsink caps)`.
-///
-/// The H.264 caps pin the format the WebRTC payloader needs: Annex-B
-/// start codes (`stream-format=byte-stream`) and the constrained-baseline
-/// profile the SDP advertises (`profile-level-id=42e01f`).
-pub fn software_chain(codec: Codec, bitrate_kbps: u32) -> (String, &'static str) {
+pub fn software_encoder_chain(codec: Codec, bitrate_kbps: u32) -> (String, &'static str) {
     match codec {
         #[cfg(target_os = "linux")]
         Codec::H264 => (
             format!(
                 "x264enc tune=zerolatency speed-preset=veryfast key-int-max=60 bitrate={bitrate_kbps} ! h264parse"
             ),
-            "video/x-h264,profile=constrained-baseline,stream-format=byte-stream,alignment=au",
+            H264_APPSINK_CAPS,
         ),
-        // openh264enc is the always-available H.264 encoder in the Windows
-        // GStreamer distribution.
         #[cfg(windows)]
         Codec::H264 => (
-            format!("openh264enc bitrate={} ! h264parse", bitrate_prop(bitrate_kbps)),
-            "video/x-h264,profile=constrained-baseline,stream-format=byte-stream,alignment=au",
+            format!("openh264enc bitrate={} ! h264parse", bitrate_kbps * 1000),
+            H264_APPSINK_CAPS,
         ),
         Codec::Vp9 => (
             format!(
@@ -129,42 +113,45 @@ pub fn software_chain(codec: Codec, bitrate_kbps: u32) -> (String, &'static str)
     }
 }
 
+fn hardware_encoder_chain(
+    encoder_factory: &str,
+    codec: Codec,
+    bitrate_kbps: u32,
+) -> (String, &'static str) {
+    let encoder = if encoder_factory == "mfh264enc" {
+        format!("mfh264enc bitrate={bitrate_kbps} low-latency=true")
+    } else {
+        format!("{encoder_factory} bitrate={bitrate_kbps}")
+    };
+    match codec {
+        Codec::H264 => (format!("{encoder} ! h264parse"), H264_APPSINK_CAPS),
+        Codec::Vp9 => (encoder, "video/x-vp9"),
+        _ => (encoder, "video/x-vp8"),
+    }
+}
+
 /// Pick the encoder chain for a codec. When `hardware` is true, prefer the first
 /// available hardware encoder (per `exists`); otherwise fall back to software.
-pub fn encoder_chain(
+pub fn select_encoder_chain(
     codec: Codec,
     bitrate_kbps: u32,
     hardware: bool,
     exists: &dyn Fn(&str) -> bool,
 ) -> (String, &'static str) {
     if hardware {
-        for enc in hw_candidates(codec) {
-            if exists(enc) {
-                let chain = format!("{enc} bitrate={}", bitrate_prop(bitrate_kbps));
-                return match codec {
-                    Codec::H264 => (
-                        format!("{chain} ! h264parse"),
-                        "video/x-h264,profile=constrained-baseline,stream-format=byte-stream,alignment=au",
-                    ),
-                    _ => (
-                        chain,
-                        if codec == Codec::Vp9 {
-                            "video/x-vp9"
-                        } else {
-                            "video/x-vp8"
-                        },
-                    ),
-                };
+        for encoder_factory in hardware_encoder_candidates(codec) {
+            if exists(encoder_factory) {
+                return hardware_encoder_chain(encoder_factory, codec, bitrate_kbps);
             }
         }
     }
-    software_chain(codec, bitrate_kbps)
+    software_encoder_chain(codec, bitrate_kbps)
 }
 
 /// Build a full capture pipeline: `source` → scale → rate → tee, where one
 /// branch encodes for the call and the other produces JPEG self-view frames.
 pub fn build_launch(source: &str, opts: &CaptureOptions) -> String {
-    let (enc, caps) = encoder_chain(
+    let (enc, caps) = select_encoder_chain(
         opts.codec,
         opts.bitrate_kbps,
         opts.hardware_encoding,
@@ -301,7 +288,15 @@ fn run_pipeline(
             use gst::MessageView;
             match msg.view() {
                 MessageView::Error(err) => {
-                    tracing::error!("capture pipeline error: {}", err.error());
+                    let source = err
+                        .src()
+                        .map(|src| src.path_string().to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    tracing::error!(
+                        "capture pipeline error from {source}: {} (debug: {})",
+                        err.error(),
+                        err.debug().as_deref().unwrap_or("no details")
+                    );
                     break 'outer;
                 }
                 MessageView::Eos(_) => break 'outer,
@@ -349,7 +344,7 @@ mod tests {
 
     #[test]
     fn vp8_software_chain() {
-        let (chain, caps) = software_chain(Codec::Vp8, 2500);
+        let (chain, caps) = software_encoder_chain(Codec::Vp8, 2500);
         assert_eq!(
             chain,
             "vp8enc deadline=1 cpu-used=6 keyframe-max-dist=60 target-bitrate=2500000"
@@ -359,13 +354,19 @@ mod tests {
 
     #[test]
     fn h264_software_chain_includes_parser() {
-        let (chain, caps) = software_chain(Codec::H264, 2500);
+        let (chain, caps) = software_encoder_chain(Codec::H264, 2500);
+        #[cfg(target_os = "linux")]
         assert_eq!(chain, "x264enc tune=zerolatency speed-preset=veryfast key-int-max=60 bitrate=2500 ! h264parse");
-        // Annex-B start codes and the profile the SDP advertises.
-        assert_eq!(
-            caps,
-            "video/x-h264,profile=constrained-baseline,stream-format=byte-stream,alignment=au"
-        );
+        #[cfg(windows)]
+        assert_eq!(chain, "openh264enc bitrate=2500000 ! h264parse");
+        assert_eq!(caps, H264_APPSINK_CAPS);
+    }
+
+    #[test]
+    fn mfh264enc_gets_kbps_and_low_latency() {
+        let (chain, caps) = hardware_encoder_chain("mfh264enc", Codec::H264, 4000);
+        assert_eq!(chain, "mfh264enc bitrate=4000 low-latency=true ! h264parse");
+        assert_eq!(caps, H264_APPSINK_CAPS);
     }
 
     #[test]
@@ -373,7 +374,7 @@ mod tests {
         // The WebRTC H.264 payloader splits frames on Annex-B start codes, so
         // the encoder must produce them.
         gst::init().unwrap();
-        let (chain, caps) = software_chain(Codec::H264, 500);
+        let (chain, caps) = software_encoder_chain(Codec::H264, 500);
         let launch = format!(
             "videotestsrc num-buffers=1 ! video/x-raw,width=320,height=240 ! \
              {chain} ! {caps} ! appsink name=sink"
@@ -404,20 +405,26 @@ mod tests {
         pipeline.set_state(gst::State::Null).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn hardware_prefers_first_available_candidate() {
         // Simulate a machine with vah264enc available.
-        let (chain, caps) = encoder_chain(Codec::H264, 2500, true, &|n| n == "vah264enc");
+        let (chain, caps) = select_encoder_chain(Codec::H264, 2500, true, &|n| n == "vah264enc");
         assert_eq!(chain, "vah264enc bitrate=2500 ! h264parse");
-        assert_eq!(
-            caps,
-            "video/x-h264,profile=constrained-baseline,stream-format=byte-stream,alignment=au"
-        );
+        assert_eq!(caps, H264_APPSINK_CAPS);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hardware_prefers_first_available_candidate() {
+        let (chain, caps) = select_encoder_chain(Codec::H264, 2500, true, &|n| n == "mfh264enc");
+        assert_eq!(chain, "mfh264enc bitrate=2500 low-latency=true ! h264parse");
+        assert_eq!(caps, H264_APPSINK_CAPS);
     }
 
     #[test]
     fn hardware_falls_back_when_none_available() {
-        let (chain, caps) = encoder_chain(Codec::Vp8, 2500, true, &|_| false);
+        let (chain, caps) = select_encoder_chain(Codec::Vp8, 2500, true, &|_| false);
         assert_eq!(
             chain,
             "vp8enc deadline=1 cpu-used=6 keyframe-max-dist=60 target-bitrate=2500000"
