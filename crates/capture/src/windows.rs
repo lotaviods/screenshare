@@ -9,6 +9,7 @@
 //! capture falls back to `gdiscreencapsrc`; window capture is unavailable.
 
 use async_trait::async_trait;
+use gstreamer::prelude::*;
 use tokio::sync::mpsc;
 
 use sharescreen_core::{
@@ -130,7 +131,8 @@ fn parse_handle(text: &str) -> Option<i64> {
 /// Monitors reported by GStreamer's d3d11 capture device provider.
 fn monitors() -> Vec<CaptureSource> {
     gst::ensure_gst_init();
-    let Some(factory) = gst::DeviceProviderFactory::find("d3d11screencapturedeviceprovider") else {
+    let Some(factory) = gstreamer::DeviceProviderFactory::find("d3d11screencapturedeviceprovider")
+    else {
         return Vec::new();
     };
     let Some(provider) = factory.get() else {
@@ -175,7 +177,8 @@ fn list_windows() -> Vec<CaptureSource> {
 
 #[cfg(windows)]
 mod windows {
-    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows_sys::core::BOOL;
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetWindowTextLengthW, GetWindowTextW, IsWindowVisible,
     };

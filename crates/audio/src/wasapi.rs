@@ -4,6 +4,7 @@
 //! [`crate::pipeline`] with `wasapi2src` as the source element.
 
 use gst::prelude::*;
+use gstreamer as gst;
 
 use sharescreen_core::{Device, DeviceKind};
 
