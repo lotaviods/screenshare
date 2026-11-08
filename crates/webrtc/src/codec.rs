@@ -25,7 +25,6 @@ pub fn register_default_codecs(media_engine: &mut MediaEngine, video: Codec) -> 
                 rtcp_feedback: vec![],
             },
             payload_type: 111,
-            ..Default::default()
         },
         RtpCodecKind::Audio,
     )?;
@@ -52,7 +51,6 @@ pub fn register_default_codecs(media_engine: &mut MediaEngine, video: Codec) -> 
                 rtcp_feedback: vec![],
             },
             payload_type: pt,
-            ..Default::default()
         },
         RtpCodecKind::Video,
     )?;

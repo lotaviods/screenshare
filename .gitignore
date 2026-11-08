@@ -4,19 +4,7 @@
 *.rs.bk
 *.pdb
 
-# --- Node / frontend ----------------------------------------------------
-node_modules/
-dist/
-.pnpm-store/
-.vite/
-*.tsbuildinfo
-pnpm-debug.log*
-npm-debug.log*
-yarn-error.log*
-
-# --- Tauri --------------------------------------------------------------
-frontend/src-tauri/gen/
-frontend/src-tauri/target/
+# --- Bundles ------------------------------------------------------------
 *.dmg
 *.AppImage
 *.msi

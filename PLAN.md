@@ -1,6 +1,6 @@
 # Plan — Gap Analysis
 
-What exists, and what is missing, in backend and frontend. Tracks the full
+What exists, and what is missing, in backend and UI. Tracks the full
 spec against the current code. Checkboxes are off until implemented.
 
 ## Status snapshot
@@ -9,8 +9,7 @@ spec against the current code. Checkboxes are off until implemented.
 | --- | --- |
 | `sharescreen-core` — domain model + `ScreenCapture`/`AudioCapture` traits | done (first-cut) |
 | `sharescreen-config` — config, persistence, validation, tests | done |
-| `sharescreen-tauri` — Tauri shell | done (commands, events, app state) |
-| `frontend` — React + TS + Vite | done (screens, bridge, media rendering) |
+| `sharescreen-ui` — GPUI desktop UI + backend actor | done (screens, commands/events, media rendering) |
 | capture / audio / webrtc / signaling / server / deploy | core path works; Windows packaging, reconnection, room auth remain |
 
 ---
@@ -139,23 +138,22 @@ spec against the current code. Checkboxes are off until implemented.
 - [ ] Mesh vs SFU connection-mode plumbing (SFU stub for now).
 - Note: `platform` crate still deferred (session detection is thin).
 
-### `frontend/src-tauri` — commands + events (real app logic)
-- [x] Tauri commands: config get/update, list devices/sources, start/stop share,
-      mic mute+volume, system volume.
+### `crates/ui` — GPUI desktop UI + backend actor
+- [x] Backend actor on a dedicated Tokio thread: config get/update, list
+      devices/sources, start/stop share, mic volume, system volume.
 - [x] Call commands: connect/disconnect server, create/join/leave room.
-- [x] `CallEvent` → Tauri event bridge (`call-event`).
-- [x] `is_connected` command + `connect_server` idempotent (returns `Ok(())`
-      when already connected). Frontend checks `is_connected` on mount to
-      restore state after hot reload.
-- [x] PiP window: `open_pip_window` / `close_pip_window` / `pip_frame`
-      commands. OS-level always-on-top webview window with no decorations,
-      running `index.html?pip=1` which loads the Pip.tsx screen.
+- [x] `CallEvent` → `UiEvent` bridge over an mpsc channel.
+- [x] Connect is idempotent and reports current state, so the UI can restore
+      state without reconnecting.
+- [x] PiP window: GPUI `PopUp` window with a dedicated entity that receives
+      decoded preview frames.
 - [x] Local media routed into the call session when connected, discarded otherwise.
-- [x] App state: `tokio::sync::Mutex` engines + sync config store.
+- [x] App state: backend actor owns capture/audio/call engines; config store is
+      shared behind a mutex.
 - [x] Wired `core`/`config`/`capture`/`audio`/`call`/`network` crates into state.
 - [x] Local mic/screen state reported to the call session so peers learn it.
 - [x] Disconnect tears down peer connections and decoders.
-- [ ] Tauri events for capture/audio state changes (pending).
+- [x] UI state events for capture/audio changes (`UiEvent`).
 
 ### Tests
 - [x] Signaling integration (two clients, one server).
@@ -177,18 +175,18 @@ spec against the current code. Checkboxes are off until implemented.
 
 ---
 
-## Frontend
+## UI
 
-- [x] **Tauri bridge layer** — typed `invoke`/`listen` wrappers (`lib/bridge.ts`)
-      + TS mirrors of the Rust types (`lib/types.ts`).
-- [x] **State management** — React state for config, participants, room,
+- [x] **Backend bridge layer** — `Command`/`UiEvent` channels between the GPUI
+      thread and the backend actor.
+- [x] **State management** — GPUI entities for config, participants, room,
       connection status; no extra dependency.
 - [x] **Home screen** — server status, host/port/WS toggle, join room, create
       room, recent rooms, participant list.
 - [x] **Call screen** — participant list with connection state, mic toggle +
       volume, system-audio toggle, share start/stop, leave, settings.
-      PiP is a Firefox-style overlay button on the remote video that opens
-      an OS-level always-on-top window (`?pip=1`).
+      PiP is a Firefox-style overlay button on the remote video that opens a
+      GPUI pop-up window.
 - [x] **Screen-sharing dialog** — source picker, resolution, fps (15–120),
       bitrate, hardware-encode toggle, system-audio toggle. The codec is shown
       read-only: it is fixed per call (negotiated with the peer connection) and
@@ -196,25 +194,24 @@ spec against the current code. Checkboxes are off until implemented.
 - [x] **Settings screen** — identity, network (host/port/secure, STUN/TURN),
       audio devices + volumes, video quality, capture backend.
 - [x] **Error / permission UX** — error banner, portal permission denials
-      surfaced as command errors.
+      surfaced as backend errors.
 - [x] **Remote media rendering** — remote video is decoded to JPEG in Rust and
-      polled by the UI onto a `<canvas>`; remote audio plays through the system
+      polled by the UI into a GPUI image; remote audio plays through the system
       output. Per-participant volume slider.
-- Note: recent rooms are recorded by the Tauri layer when a room is joined.
+- Note: recent rooms are recorded by the backend actor when a room is joined.
 
 ---
 
 ## Open decisions / risks
 
 1. **Media-to-UI path — resolved.** WebRTC is owned by Rust (`webrtc` crate),
-   so the WebView does not use browser `getDisplayMedia`/`RTCPeerConnection`.
+   so the UI does not use browser `getDisplayMedia`/`RTCPeerConnection`.
    Remote tracks arrive as raw RTP (`TrackRemoteStaticRTP`); Rust repackages
-   them, decodes with GStreamer, and hands JPEG frames to the UI over IPC
-   (`remote_frame`), which the frontend paints onto a `<canvas>`. Audio is
-   decoded and played directly by GStreamer.
-   - Cost: one JPEG encode/decode per frame and an IPC hop per frame.
-   - Alternative if this becomes a bottleneck: a native video surface via a
-     Tauri plugin (`gtk4paintablesink`-style), which removes the JPEG step.
+   them, decodes with GStreamer, and hands JPEG frames to the UI, which decodes
+   them into GPUI images. Audio is decoded and played directly by GStreamer.
+   - Cost: one JPEG encode/decode per frame and a channel hop per frame.
+   - Alternative if this becomes a bottleneck: a native video surface, which
+     removes the JPEG step.
 
 2. **Encoding**: GStreamer is the assumed capture+encode layer (HW-accelerated,
    cross-platform). Confirmed only at the design level; not yet proven on Hyprland
@@ -234,8 +231,8 @@ spec against the current code. Checkboxes are off until implemented.
 2. `audio` — mic + system loopback (Linux first).
 3. `webrtc` — mesh peer connections + track wiring + renegotiation.
 4. `signaling` client + `server` (axum).
-5. `tauri` commands/events + `network`/`platform` glue.
-6. Frontend screens + bridge + media rendering (resolve decision #1).
+5. `ui` backend actor + `network`/`platform` glue.
+6. GPUI screens + commands/events + media rendering (resolve decision #1).
 7. Windows capture/audio.
 8. `deploy/` compose + Dockerfiles.
 9. Tests + manual matrix.

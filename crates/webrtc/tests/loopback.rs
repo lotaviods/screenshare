@@ -222,14 +222,11 @@ async fn audio_resumes_after_a_pause() {
     let mut total = 0usize;
     let started = tokio::time::Instant::now();
     while started.elapsed() < Duration::from_secs(4) {
-        match timeout(Duration::from_millis(500), remote.next_packet()).await {
-            Ok(Some(_)) => {
-                total += 1;
-                if started.elapsed() > Duration::from_millis(2_100) {
-                    packets_after_pause += 1;
-                }
+        if let Ok(Some(_)) = timeout(Duration::from_millis(500), remote.next_packet()).await {
+            total += 1;
+            if started.elapsed() > Duration::from_millis(2_100) {
+                packets_after_pause += 1;
             }
-            _ => {}
         }
     }
     sender.await.unwrap();

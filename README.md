@@ -1,16 +1,27 @@
 # Sharescreen
 
 Discord-like voice calls and high-quality screen sharing with system audio, in
-Rust + Tauri. Linux (Wayland and X11) and Windows.
+Rust with a native [GPUI](https://gpui.rs/) desktop UI. Linux (Wayland and X11)
+and Windows.
 
-Status: **early foundation**. The workspace compiles; `core` and `config` are
-implemented and tested. Capture, audio, WebRTC, signaling, Tauri UI, and
-infrastructure are the next increments.
+Status: **early foundation**. The workspace compiles. Domain model, config,
+capture, audio, WebRTC, signaling, call orchestration, remote media decode, and
+the GPUI desktop UI are implemented. Windows packaging, reconnection, and room
+auth remain.
 
 ## Layout
 
-- `crates/core` — domain model + trait boundaries (no OS/Tauri/GStreamer deps).
+- `crates/core` — domain model + trait boundaries (no OS/GStreamer deps).
 - `crates/config` — configuration + persistent preferences + validation.
+- `crates/capture` — screen capture backends.
+- `crates/audio` — microphone + system loopback capture.
+- `crates/webrtc` — peer connections and track wiring.
+- `crates/call` — call session (signaling + WebRTC mesh).
+- `crates/media` — remote media decode and playback.
+- `crates/signaling` — client-side WebSocket signaling.
+- `crates/network` — ICE / STUN / TURN configuration.
+- `crates/ui` — GPUI desktop UI (binary `sharescreen`).
+- `server/` — axum signaling server.
 - `ARCHITECTURE.md` — full design decisions and roadmap.
 
 ## Build and test
@@ -20,24 +31,19 @@ cargo build
 cargo test
 ```
 
-## Develop and bundle (Tauri)
-
-First run:
+## Develop
 
 ```sh
-make setup    # pnpm install (frontend deps + Tauri CLI)
+make run      # build and run the desktop app (needs a Wayland/X11 session)
+make build    # release build
 ```
 
-Then:
+`make help` lists all targets.
 
-```sh
-make dev      # Tauri dev with hot reload (needs a Wayland/X11 session)
-make bundle   # production bundle (AppImage on Linux)
-```
-
-`make help` lists all targets. Linux needs the Tauri system deps:
-`webkit2gtk-4.1`, `javascriptcoregtk-4.1`, `gtk3`, `libsoup3`, `gdk-pixbuf`.
-On Arch: `pacman -S webkit2gtk-4.1 gtk3 libsoup3`.
+Linux needs the GPUI and GStreamer system dependencies: a Vulkan driver,
+Wayland or X11 client libraries, `xkbcommon`, `fontconfig`, `clang`, `cmake`,
+and GStreamer 1.22+ with the base, good, bad, and ugly plugin sets.
+On Arch: `pacman -S vulkan-icd-loader wayland libxkbcommon fontconfig clang cmake gstreamer gst-plugins-{base,good,bad,ugly}`.
 
 ### Windows
 
@@ -61,23 +67,17 @@ $gst = "$env:LOCALAPPDATA\Programs\gstreamer\1.0\msvc_x86_64"
 Then run the app:
 
 ```powershell
-pnpm --dir frontend install
-pnpm --dir frontend tauri dev
+cargo run -p sharescreen-ui
 ```
 
 The app loads the GStreamer DLLs from `%GSTREAMER_1_0_ROOT_MSVC_X86_64%\bin`,
 so the `bin` directory must be on `PATH` when it starts.
 
-Icons are regenerated from `frontend/src-tauri/app-icon.png` via `make icons`.
-
 ## Roadmap
 
 See `ARCHITECTURE.md` for the full plan. Next steps, in order:
 
-1. Linux Wayland capture (XDG Desktop Portal + PipeWire + GStreamer).
-2. Windows capture (Windows.Graphics.Capture / DXGI).
-3. Microphone + system audio capture.
-4. WebRTC media transport (mesh).
-5. Signaling server (axum) + client.
-6. Tauri commands/events + React/TypeScript frontend.
-7. Docker Compose infrastructure.
+1. Windows packaging and installer.
+2. Signaling reconnection and optional room auth.
+3. SFU support behind the mesh-first signaling layer.
+4. Docker Compose infrastructure.

@@ -10,24 +10,20 @@ members = [
     "crates/call",
     "crates/media",
     "crates/network",
+    "crates/ui",
     "server",
-    "frontend/src-tauri",
-    # Added incrementally:
-    # "crates/capture",
-    # "crates/audio",
-    # "crates/webrtc",
-    # "crates/signaling",
-    # "crates/network",
-    # "crates/platform",
-    # "crates/tauri",
-    # "server",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-rust-version = "1.80"
+rust-version = "1.90"
+
+# `gpui` pulls in `zed-async-tar` → `xattr 0.2`, which still references the
+# macOS-only `ENOATTR` constant on Linux. The vendored copy uses `ENODATA` there.
+[patch.crates-io]
+xattr = { path = "vendor/xattr" }
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

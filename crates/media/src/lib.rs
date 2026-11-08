@@ -8,7 +8,7 @@
 //! - video → codec → RGB → JPEG, kept as the latest frame for the UI.
 //!
 //! The video path deliberately stops at JPEG: the frames are small enough to
-//! hand to the WebView, and a native video surface would need a Tauri plugin.
+//! hand to the GPUI renderer.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -18,7 +18,6 @@ use std::time::Duration;
 
 use gst::prelude::*;
 use gstreamer as gst;
-use gstreamer_app;
 use sharescreen_core::Codec;
 use sharescreen_webrtc::{RemoteTrack, RemoteTrackKind};
 
@@ -153,9 +152,11 @@ impl Decoder {
 /// Decodes remote tracks and exposes the results to the UI.
 pub struct RemoteMedia {
     tracks: RwLock<HashMap<String, TrackHandle>>,
-    frames: RwLock<HashMap<String, Arc<Mutex<Option<Vec<u8>>>>>>,
+    frames: RwLock<HashMap<String, SharedFrame>>,
     counter: AtomicU64,
 }
+
+type SharedFrame = Arc<Mutex<Option<Vec<u8>>>>;
 
 struct TrackHandle {
     peer_id: String,
@@ -418,11 +419,8 @@ fn report_bus_errors(bus: &Option<gst::Bus>) {
     use gst::MessageView;
     let Some(bus) = bus else { return };
     while let Some(msg) = bus.pop() {
-        match msg.view() {
-            MessageView::Error(err) => {
-                tracing::error!("remote media pipeline error: {}", err.error());
-            }
-            _ => {}
+        if let MessageView::Error(err) = msg.view() {
+            tracing::error!("remote media pipeline error: {}", err.error());
         }
     }
 }
@@ -479,7 +477,7 @@ async fn feed(
         }
         last_arrival = Some(now);
         packets += 1;
-        if packets % 500 == 0 {
+        if packets.is_multiple_of(500) {
             tracing::info!("remote track: {packets} RTP packets received");
         }
         let mut buffer = gst::Buffer::from_mut_slice(packet.to_bytes());

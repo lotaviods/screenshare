@@ -22,6 +22,7 @@ use crate::gst;
 
 /// Wayland/portal capture backend. `start` blocks (async) on the compositor's
 /// source-selection dialog, then streams encoded video on a background thread.
+#[derive(Default)]
 pub struct WaylandCapture {
     active: Option<ActiveCapture>,
 }
@@ -30,12 +31,6 @@ struct ActiveCapture {
     /// Keeps the portal session alive for the lifetime of the capture.
     session: Session<Screencast>,
     stream: gst::Stream,
-}
-
-impl Default for WaylandCapture {
-    fn default() -> Self {
-        Self { active: None }
-    }
 }
 
 impl WaylandCapture {

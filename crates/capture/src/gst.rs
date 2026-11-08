@@ -12,7 +12,6 @@ use std::os::fd::OwnedFd;
 
 use gst::prelude::*;
 use gstreamer as gst;
-use gstreamer_app;
 use tokio::sync::mpsc;
 
 use sharescreen_core::{CaptureError, CaptureOptions, Codec, EncodedSample, MediaKind};

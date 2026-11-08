@@ -118,6 +118,6 @@ mod tests {
         c.secret = "secret".to_string();
         c.urls.clear();
         assert!(!c.is_enabled());
-        assert!(c.is_enabled() == false || c.urls.is_empty());
+        assert!(!c.is_enabled() || c.urls.is_empty());
     }
 }

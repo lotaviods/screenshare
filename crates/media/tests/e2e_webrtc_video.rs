@@ -26,9 +26,7 @@ async fn wait_for_gathering(rx: &mut mpsc::UnboundedReceiver<PeerEvent>) {
 async fn wait_for_connected(rx: &mut mpsc::UnboundedReceiver<PeerEvent>) {
     loop {
         match timeout(Duration::from_secs(20), rx.recv()).await {
-            Ok(Some(PeerEvent::ConnectionState(s)))
-                if s == sharescreen_core::ConnectionState::Connected =>
-            {
+            Ok(Some(PeerEvent::ConnectionState(sharescreen_core::ConnectionState::Connected))) => {
                 return
             }
             Ok(Some(_)) => continue,

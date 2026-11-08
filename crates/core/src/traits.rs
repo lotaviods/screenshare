@@ -40,8 +40,8 @@ pub struct CaptureOptions {
 /// `sharescreen-capture` and are selected at runtime by [`crate::CaptureBackend`].
 ///
 /// The backend owns the capture + encode pipeline and pushes [`EncodedSample`]
-/// frames into `sink`. No raw frame buffer crosses the Tauri IPC boundary; the
-/// frontend only ever receives encoded media or metadata.
+/// frames into `sink`. No raw frame buffer crosses the UI boundary; the
+/// UI only ever receives encoded media or metadata.
 #[async_trait]
 pub trait ScreenCapture: Send + Sync {
     /// List shareable sources (monitors, windows, or the whole desktop).

@@ -153,6 +153,6 @@ mod tests {
         })
         .unwrap();
         assert!(json.contains("\"type\":\"peer_joined\""));
-        assert!(json.contains("\"kind\":\"ice_candidate\"") == false);
+        assert!(!json.contains("\"kind\":\"ice_candidate\""));
     }
 }

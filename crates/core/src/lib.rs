@@ -2,7 +2,7 @@
 //! boundaries between platform-specific capture/audio backends and the
 //! WebRTC layer.
 //!
-//! This crate depends on nothing OS-specific, no Tauri, no GStreamer, and no
+//! This crate depends on nothing OS-specific, no GPUI, no GStreamer, and no
 //! WebRTC implementation. Platform backends (`sharescreen-capture`,
 //! `sharescreen-audio`) implement the traits here; `sharescreen-webrtc`
 //! consumes the [`EncodedSample`] values those backends produce. Swapping a

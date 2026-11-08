@@ -1,3 +1,0 @@
-# pnpm settings (pnpm 11+ reads build approvals here, not package.json#pnpm)
-allowBuilds:
-  esbuild: true

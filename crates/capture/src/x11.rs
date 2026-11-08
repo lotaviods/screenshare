@@ -17,14 +17,9 @@ use sharescreen_core::{
 use crate::gst;
 
 /// Native X11 capture backend.
+#[derive(Default)]
 pub struct X11Capture {
     stream: Option<gst::Stream>,
-}
-
-impl Default for X11Capture {
-    fn default() -> Self {
-        Self { stream: None }
-    }
 }
 
 impl X11Capture {

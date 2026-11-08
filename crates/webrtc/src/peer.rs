@@ -351,11 +351,11 @@ impl WebRtcPeer {
     }
 
     pub async fn create_offer(&self) -> Result<SessionDescription> {
-        Ok(to_session_description(self.pc.create_offer(None).await?)?)
+        to_session_description(self.pc.create_offer(None).await?)
     }
 
     pub async fn create_answer(&self) -> Result<SessionDescription> {
-        Ok(to_session_description(self.pc.create_answer(None).await?)?)
+        to_session_description(self.pc.create_answer(None).await?)
     }
 
     pub async fn set_local_description(&self, desc: &SessionDescription) -> Result<()> {

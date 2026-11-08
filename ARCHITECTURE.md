@@ -1,8 +1,8 @@
 # Sharescreen Architecture
 
 Discord-like voice + screen sharing desktop application. Rust owns the native
-functionality and the media pipeline; Tauri provides the shell and UI; WebRTC
-carries real-time media.
+functionality, the media pipeline, and the GPUI desktop UI; WebRTC carries
+real-time media.
 
 ## Goals
 
@@ -20,16 +20,16 @@ carries real-time media.
 ## High-level architecture
 
 ```
-┌────────────────────────────── Desktop app (Tauri) ─────────────────────────────┐
+┌────────────────────────────── Desktop app (GPUI) ──────────────────────────────┐
 │                                                                                │
-│  React/TS UI  ── commands/events ──►  tauri crate (commands, state)            │
-│                                          │                                     │
-│              ┌───────────────────────────┼───────────────────────────┐          │
-│              ▼                           ▼                           ▼          │
-│        capture crate               audio crate                webrtc crate      │
+│  GPUI UI (crates/ui)  ── commands/events ──►  backend actor (Tokio thread)      │
+│                                                  │                             │
+│              ┌───────────────────────────┼───────────────────────────┐         │
+│              ▼                           ▼                           ▼         │
+│        capture crate               audio crate                webrtc crate     │
 │   (portal/PipeWire, X11, WGC)  (mic + system loopback)   (peer connections)    │
-│              │                           │                           │          │
-│              └───────────────►  GStreamer encode  ◄──────────────────┘          │
+│              │                           │                           │         │
+│              └───────────────►  GStreamer encode  ◄──────────────────┘         │
 │                                          │                                     │
 │                                    signaling crate                             │
 │                              (WebSocket client to server)                      │
@@ -96,7 +96,7 @@ X11 uses a separate backend (XCB + GStreamer `ximagesrc`, or `x11grab`).
 
 The `ScreenCapture` / `AudioCapture` traits hide all of this behind one
 interface per platform; nothing platform-specific leaks into `core`, `webrtc`,
-or the frontend.
+or the UI.
 
 ### Audio
 
@@ -136,29 +136,35 @@ is reserved for server-side room metadata only if in-memory proves insufficient
 ```
 sharescreen/
 ├── crates/
-│   ├── core/        # domain model + traits (no OS/Tauri/GStreamer deps)
+│   ├── core/        # domain model + traits (no OS/GStreamer deps)
 │   ├── config/      # config + preferences persistence + validation
 │   ├── capture/     # ScreenCapture trait impls (portal/PipeWire, X11, WGC)
 │   ├── audio/       # AudioCapture trait impls (mic + system loopback)
 │   ├── webrtc/      # peer connection wrapper, track wiring, renegotiation
 │   ├── signaling/   # client-side WebSocket signaling
+│   ├── call/        # call session: signaling + WebRTC mesh orchestration
+│   ├── media/       # remote track decode and playback
 │   ├── network/     # ICE/STUN/TURN config, candidate handling
-│   ├── platform/    # OS detection, device enumeration, permissions
-│   └── tauri/       # Tauri commands, events, app state, lifecycle
+│   └── ui/          # GPUI desktop UI + backend actor
 ├── server/          # axum signaling server (independent of the app)
-├── frontend/        # React + TypeScript UI
 ├── deploy/          # Docker Compose, Dockerfiles, .env.example
+├── vendor/          # patched crates (xattr ENOATTR fix for GPUI)
 └── Cargo.toml       # workspace
 ```
 
 Dependency direction is one-way: `core` is the lowest layer; `config` depends on
-`core`; capture/audio/webrtc depend on `core`; `tauri` composes everything. No
-crate named `core` collides with the builtin `core` crate because packages are
-`sharescreen-core`, etc.
+`core`; capture/audio/webrtc/media/call depend on `core`; `ui` composes
+everything. No crate named `core` collides with the builtin `core` crate because
+packages are `sharescreen-core`, etc.
+
+The UI runs on the GPUI main thread. All capture, audio, WebRTC, and signaling
+work runs in a backend actor on a dedicated Tokio thread, communicating through
+`Command`/`UiEvent` channels, so the UI never blocks on media or network I/O.
 
 ## Media pipeline
 
-Capture → encode → sample queue → WebRTC track. No raw frames cross Tauri IPC.
+Capture → encode → sample queue → WebRTC track. No raw frames cross the UI
+boundary; only decoded JPEG frames for display.
 
 ```
 portal/pipewire (or WGC/DXGI, X11)  ──►  GStreamer encoder  ──►  appsink
@@ -186,8 +192,8 @@ JSON messages over WebSocket:
 - `server → client`: `room_created`, `joined`, `peer_joined`, `peer_left`,
   `offer`, `answer`, `ice_candidate`, `turn_credentials`, `error`.
 
-The exact schema is implemented with `serde` in `core`/`signaling` and mirrored
-in TypeScript.
+The exact schema is implemented with `serde` in `core`/`signaling` and shared by
+the client and server.
 
 ## Security
 
@@ -224,6 +230,6 @@ simultaneous mic+system-audio calls.
 5. Microphone + system audio capture.
 6. WebRTC media transport (mesh).
 7. Signaling server + client.
-8. Tauri commands/events + React/TS frontend.
+8. GPUI desktop UI + backend actor.
 9. Docker Compose infrastructure.
 10. Automated tests + manual testing matrix.

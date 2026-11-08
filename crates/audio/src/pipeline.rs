@@ -9,7 +9,6 @@ use std::thread::JoinHandle;
 
 use gst::prelude::*;
 use gstreamer as gst;
-use gstreamer_app;
 use tokio::sync::mpsc;
 
 use sharescreen_core::{AudioError, Codec, EncodedSample, MediaKind};
@@ -177,7 +176,7 @@ fn run(
         if let Some(sample) = appsink.try_pull_sample(timeout) {
             if let Some(enc) = sample_to_encoded(&sample) {
                 samples += 1;
-                if samples == 1 || samples % 250 == 0 {
+                if samples == 1 || samples.is_multiple_of(250) {
                     tracing::info!("audio capture: {samples} encoded sample(s)");
                 }
                 if sink.blocking_send(enc).is_err() {

@@ -104,7 +104,7 @@ pub enum MediaKind {
 /// from a capture/encode backend to the WebRTC layer.
 ///
 /// Kept codec-typed and byte-buffer based so no platform frame type or raw
-/// pixel buffer crosses the Tauri IPC boundary; only encoded bytes leave the
+/// pixel buffer crosses the UI boundary; only encoded bytes leave the
 /// backend.
 #[derive(Debug, Clone)]
 pub struct EncodedSample {

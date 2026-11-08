@@ -22,9 +22,9 @@ pub struct Participant {
     pub connection: ConnectionState,
 }
 
-/// Events emitted by the Rust core and forwarded to the frontend over Tauri.
+/// Events emitted by the Rust core and forwarded to the UI.
 ///
-/// The `type` tag lets the frontend discriminate without knowing the payload
+/// The `type` tag lets the UI discriminate without knowing the payload
 /// shape ahead of time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

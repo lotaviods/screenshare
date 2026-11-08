@@ -8,24 +8,13 @@ use sharescreen_core::{CaptureBackend, Codec, ConnectionMode};
 /// never breaks an existing user file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct Config {
     pub network: NetworkConfig,
     pub audio: AudioConfig,
     pub video: VideoConfig,
     pub capture: CaptureConfig,
     pub state: AppState,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            network: NetworkConfig::default(),
-            audio: AudioConfig::default(),
-            video: VideoConfig::default(),
-            capture: CaptureConfig::default(),
-            state: AppState::default(),
-        }
-    }
 }
 
 // --- Network ---------------------------------------------------------------
