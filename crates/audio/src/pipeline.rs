@@ -20,6 +20,36 @@ pub struct Stream {
     control: Arc<Mutex<Option<gst::Element>>>,
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn spawn_system(
+    device: Option<String>,
+    bitrate_kbps: u32,
+    sink: mpsc::Sender<EncodedSample>,
+) -> Result<Stream, AudioError> {
+    let running = Arc::new(AtomicBool::new(true));
+    let control = Arc::new(Mutex::new(None));
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let thread = std::thread::Builder::new()
+        .name("sharescreen-system-audio".into())
+        .spawn({
+            let running = running.clone();
+            let control = control.clone();
+            move || crate::pulse::run_system(device, bitrate_kbps, running, control, sink, ready_tx)
+        })
+        .map_err(|e| AudioError::Failed(format!("failed to spawn system audio: {e}")))?;
+    match ready_rx.recv() {
+        Ok(Ok(())) => Ok(Stream { running, thread, control }),
+        Ok(Err(e)) => {
+            let _ = thread.join();
+            Err(AudioError::Unavailable(e))
+        }
+        Err(_) => {
+            let _ = thread.join();
+            Err(AudioError::Failed("system audio thread exited before starting".into()))
+        }
+    }
+}
+
 impl Stream {
     pub fn stop(self) {
         self.running.store(false, Ordering::SeqCst);
@@ -70,16 +100,6 @@ pub fn mic_launch(device: Option<&str>, bitrate_kbps: u32) -> String {
     encode_chain(&src, bitrate_kbps)
 }
 
-/// System-audio capture: a monitor source, or `@DEFAULT_MONITOR@`.
-#[cfg(target_os = "linux")]
-pub fn system_launch(device: Option<&str>, bitrate_kbps: u32) -> String {
-    let src = match device {
-        Some(id) => format!("pulsesrc device={id}"),
-        None => "pulsesrc device=@DEFAULT_MONITOR@".to_string(),
-    };
-    encode_chain(&src, bitrate_kbps)
-}
-
 /// Microphone capture through WASAPI: the default capture endpoint, or a
 /// named one.
 #[cfg(windows)]
@@ -94,14 +114,17 @@ pub fn mic_launch(device: Option<&str>, bitrate_kbps: u32) -> String {
 /// System-audio capture: WASAPI loopback on a render endpoint.
 #[cfg(windows)]
 pub fn system_launch(device: Option<&str>, bitrate_kbps: u32) -> String {
-    let src = match device {
-        Some(id) => format!("wasapi2src device=\"{id}\" loopback=true"),
-        None => "wasapi2src loopback=true".to_string(),
-    };
+    // Process loopback is not tied to an endpoint. The selected output device
+    // cannot restrict this capture; never fall back to mixed device loopback.
+    let _ = device;
+    let src = format!(
+        "wasapi2src loopback=true loopback-target-pid={} loopback-mode=exclude-process-tree",
+        std::process::id()
+    );
     encode_chain(&src, bitrate_kbps)
 }
 
-fn encode_chain(src: &str, bitrate_kbps: u32) -> String {
+pub(crate) fn encode_chain(src: &str, bitrate_kbps: u32) -> String {
     format!(
         "{src} ! audioconvert ! audioresample ! \
          audio/x-raw,rate=48000,channels=2 ! \
@@ -201,7 +224,7 @@ fn run(
     let _ = pipeline.set_state(gst::State::Null);
 }
 
-fn sample_to_encoded(sample: &gst::Sample) -> Option<EncodedSample> {
+pub(crate) fn sample_to_encoded(sample: &gst::Sample) -> Option<EncodedSample> {
     let buffer = sample.buffer()?;
     let map = buffer.map_readable().ok()?;
     let data = map.as_slice().to_vec();

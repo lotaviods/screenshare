@@ -44,6 +44,24 @@ pub fn outputs() -> Vec<Device> {
     list("Audio/Sink", DeviceKind::AudioOutput)
 }
 
+/// Whether the `wasapi2src` element supports process-loopback exclusion.
+///
+/// Excluding our own process tree is the only safe system-audio capture: the
+/// mixed device loopback would replay remote participants to the call. The
+/// underlying WASAPI API additionally needs Windows 10 build 20348 or later;
+/// an unsupported build fails at stream start rather than falling back.
+pub fn supports_process_loopback() -> bool {
+    if gst::init().is_err() {
+        return false;
+    }
+    gst::ElementFactory::make("wasapi2src")
+        .build()
+        .is_ok_and(|element| {
+            element.has_property("loopback-target-pid")
+                && element.has_property("loopback-mode")
+        })
+}
+
 fn list(class: &str, kind: DeviceKind) -> Vec<Device> {
     devices(class)
         .into_iter()

@@ -1,7 +1,9 @@
 //! `sharescreen-audio`: microphone and system-audio capture.
 //!
-//! Capture is done through GStreamer (`pulsesrc`/`autoaudiosrc` on Linux,
-//! `wasapi2src` on Windows → Opus → appsink). Linux device enumeration uses
+//! Capture is done through GStreamer (`pulsesrc`/`autoaudiosrc` for the mic),
+//! and `wasapi2src` on Windows → Opus → appsink. Linux system audio records
+//! each application playback stream through `libpulse-binding` and mixes them,
+//! so the call's own playback is never captured. Linux device enumeration uses
 //! `libpulse-binding` directly (license-clean), not the GPL-licensed
 //! `pulsectl-rs` fork; Windows enumeration uses GStreamer's WASAPI device
 //! provider.
@@ -150,8 +152,17 @@ impl AudioCapture for AudioEngine {
         sink: mpsc::Sender<EncodedSample>,
     ) -> Result<(), AudioError> {
         self.stop_system().await.ok();
-        let launch = pipeline::system_launch(device_id, self.bitrate_kbps);
-        let stream = pipeline::spawn(launch, sink)?;
+        #[cfg(target_os = "linux")]
+        let stream = pipeline::spawn_system(device_id.map(str::to_owned), self.bitrate_kbps, sink)?;
+        #[cfg(windows)]
+        let stream = {
+            if !wasapi::supports_process_loopback() {
+                return Err(AudioError::Unavailable(
+                    "system audio without call echo requires Windows 10 build 20348 or later".into(),
+                ));
+            }
+            pipeline::spawn(pipeline::system_launch(device_id, self.bitrate_kbps), sink)?
+        };
         self.system = Some(stream);
         Ok(())
     }
@@ -207,9 +218,12 @@ mod tests {
     }
 
     #[test]
-    fn system_launch_defaults_to_default_monitor() {
-        let s = pipeline::system_launch(None, 96);
-        assert!(s.starts_with("pulsesrc device=@DEFAULT_MONITOR@"));
+    fn system_capture_uses_per_stream_monitoring() {
+        // A mixed output monitor would replay remote participants to the call.
+        let self_pid = 42;
+        assert_eq!(super::pulse::capture_policy(Some(42), self_pid), None);
+        assert_eq!(super::pulse::capture_policy(Some(43), self_pid), Some(43));
+        assert_eq!(super::pulse::capture_policy(None, self_pid), None);
     }
 }
 
@@ -228,14 +242,15 @@ mod windows_tests {
     #[test]
     fn system_launch_enables_loopback() {
         let s = pipeline::system_launch(None, 96);
-        assert!(s.starts_with("wasapi2src loopback=true"));
+        assert!(s.contains(&format!("loopback-target-pid={}", std::process::id())));
+        assert!(s.contains("loopback-mode=exclude-process-tree"));
         assert!(s.contains("opusenc bitrate=96000"));
     }
 
     #[test]
-    fn named_devices_are_quoted() {
+    fn process_loopback_does_not_capture_an_endpoint_mix() {
         let s = pipeline::system_launch(Some("Speakers (USB Audio)"), 128);
-        assert!(s.contains("device=\"Speakers (USB Audio)\""));
+        assert!(!s.contains("device="));
         assert!(s.contains("loopback=true"));
     }
 }
