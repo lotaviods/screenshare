@@ -79,6 +79,9 @@ pub fn hardware_encoder_candidates(codec: Codec) -> &'static [&'static str] {
 }
 
 const H264_APPSINK_CAPS: &str = "video/x-h264,stream-format=byte-stream,alignment=au";
+/// Keyframe interval for H.264 encoders. A receiver that loses packets cannot
+/// recover until the next IDR, so keep it to roughly two seconds at 30 fps.
+const H264_GOP: u32 = 60;
 
 /// Software encoder chain for a codec. Returns `(encoder elements, appsink caps)`.
 pub fn software_encoder_chain(codec: Codec, bitrate_kbps: u32) -> (String, &'static str) {
@@ -86,13 +89,16 @@ pub fn software_encoder_chain(codec: Codec, bitrate_kbps: u32) -> (String, &'sta
         #[cfg(target_os = "linux")]
         Codec::H264 => (
             format!(
-                "x264enc tune=zerolatency speed-preset=veryfast key-int-max=60 bitrate={bitrate_kbps} ! h264parse"
+                "x264enc tune=zerolatency speed-preset=veryfast key-int-max={H264_GOP} bitrate={bitrate_kbps} ! h264parse config-interval=-1"
             ),
             H264_APPSINK_CAPS,
         ),
         #[cfg(windows)]
         Codec::H264 => (
-            format!("openh264enc bitrate={} ! h264parse", bitrate_kbps * 1000),
+            format!(
+                "openh264enc bitrate={} gop-size={H264_GOP} ! h264parse config-interval=-1",
+                bitrate_kbps * 1000
+            ),
             H264_APPSINK_CAPS,
         ),
         Codec::Vp9 => (
@@ -118,12 +124,15 @@ fn hardware_encoder_chain(
     bitrate_kbps: u32,
 ) -> (String, &'static str) {
     let encoder = if encoder_factory == "mfh264enc" {
-        format!("mfh264enc bitrate={bitrate_kbps} low-latency=true")
+        format!("mfh264enc bitrate={bitrate_kbps} gop-size={H264_GOP} low-latency=true")
     } else {
         format!("{encoder_factory} bitrate={bitrate_kbps}")
     };
     match codec {
-        Codec::H264 => (format!("{encoder} ! h264parse"), H264_APPSINK_CAPS),
+        Codec::H264 => (
+            format!("{encoder} ! h264parse config-interval=-1"),
+            H264_APPSINK_CAPS,
+        ),
         Codec::Vp9 => (encoder, "video/x-vp9"),
         _ => (encoder, "video/x-vp8"),
     }
@@ -355,16 +364,22 @@ mod tests {
     fn h264_software_chain_includes_parser() {
         let (chain, caps) = software_encoder_chain(Codec::H264, 2500);
         #[cfg(target_os = "linux")]
-        assert_eq!(chain, "x264enc tune=zerolatency speed-preset=veryfast key-int-max=60 bitrate=2500 ! h264parse");
+        assert_eq!(chain, "x264enc tune=zerolatency speed-preset=veryfast key-int-max=60 bitrate=2500 ! h264parse config-interval=-1");
         #[cfg(windows)]
-        assert_eq!(chain, "openh264enc bitrate=2500000 ! h264parse");
+        assert_eq!(
+            chain,
+            "openh264enc bitrate=2500000 gop-size=60 ! h264parse config-interval=-1"
+        );
         assert_eq!(caps, H264_APPSINK_CAPS);
     }
 
     #[test]
-    fn mfh264enc_gets_kbps_and_low_latency() {
+    fn mfh264enc_gets_kbps_keyframes_and_low_latency() {
         let (chain, caps) = hardware_encoder_chain("mfh264enc", Codec::H264, 4000);
-        assert_eq!(chain, "mfh264enc bitrate=4000 low-latency=true ! h264parse");
+        assert_eq!(
+            chain,
+            "mfh264enc bitrate=4000 gop-size=60 low-latency=true ! h264parse config-interval=-1"
+        );
         assert_eq!(caps, H264_APPSINK_CAPS);
     }
 
@@ -409,7 +424,10 @@ mod tests {
     fn hardware_prefers_first_available_candidate() {
         // Simulate a machine with vah264enc available.
         let (chain, caps) = select_encoder_chain(Codec::H264, 2500, true, &|n| n == "vah264enc");
-        assert_eq!(chain, "vah264enc bitrate=2500 ! h264parse");
+        assert_eq!(
+            chain,
+            "vah264enc bitrate=2500 ! h264parse config-interval=-1"
+        );
         assert_eq!(caps, H264_APPSINK_CAPS);
     }
 
@@ -417,7 +435,10 @@ mod tests {
     #[test]
     fn hardware_prefers_first_available_candidate() {
         let (chain, caps) = select_encoder_chain(Codec::H264, 2500, true, &|n| n == "mfh264enc");
-        assert_eq!(chain, "mfh264enc bitrate=2500 low-latency=true ! h264parse");
+        assert_eq!(
+            chain,
+            "mfh264enc bitrate=2500 gop-size=60 low-latency=true ! h264parse config-interval=-1"
+        );
         assert_eq!(caps, H264_APPSINK_CAPS);
     }
 
