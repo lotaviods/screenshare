@@ -1,13 +1,14 @@
 // Port of GPUI's `examples/input.rs` (Apache-2.0), trimmed to a single-line
 // field. GPUI has no reusable text-input widget yet.
 use std::ops::Range;
+use std::time::Duration;
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, LayoutId, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine,
-    SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill, hsla,
-    point, prelude::*, px, relative, rgb, rgba, size,
+    SharedString, Style, Task, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill,
+    hsla, point, prelude::*, px, relative, rgb, rgba, size,
 };
 use unicode_segmentation::*;
 
@@ -41,6 +42,7 @@ pub struct TextInput {
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
+    blink_task: Option<Task<()>>,
 }
 
 impl TextInput {
@@ -60,7 +62,30 @@ impl TextInput {
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
+            blink_task: None,
         }
+    }
+
+    fn start_blink(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let focus = self.focus_handle.clone();
+        let task = cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+                let focused = cx
+                    .update(|window, _| focus.is_focused(window))
+                    .unwrap_or(false);
+                if !focused {
+                    break;
+                }
+                if this.update(cx, |_input, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+            this.update(cx, |input, _cx| input.blink_task = None).ok();
+        });
+        self.blink_task = Some(task);
     }
 
     pub fn value(&self) -> &str {
@@ -516,6 +541,14 @@ impl Element for TextElement {
 
         let cursor_pos = line.x_for_index(cursor);
         let (selection, cursor) = if selected_range.is_empty() {
+            // Smooth blink: alpha follows a squared sine over a 1s cycle.
+            let phase = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f32()
+                % 1.0;
+            let alpha = ((phase * std::f32::consts::TAU).sin() * 0.5 + 0.5).powi(2);
+            let alpha = (alpha * 255.0) as u8;
             (
                 None,
                 Some(fill(
@@ -523,7 +556,7 @@ impl Element for TextElement {
                         point(bounds.left() + cursor_pos, bounds.top()),
                         size(px(2.), bounds.bottom() - bounds.top()),
                     ),
-                    gpui::blue(),
+                    rgba(0x8b8bff00 | alpha as u32),
                 )),
             )
         } else {
@@ -539,7 +572,7 @@ impl Element for TextElement {
                             bounds.bottom(),
                         ),
                     ),
-                    rgba(0x3311ff30),
+                    rgba(0x6c6cf040),
                 )),
                 None,
             )
@@ -588,9 +621,18 @@ impl Element for TextElement {
 }
 
 impl Render for TextInput {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.focus_handle.is_focused(window) {
+            if self.blink_task.is_none() {
+                self.start_blink(window, cx);
+            }
+        } else {
+            self.blink_task = None;
+        }
+
         div()
             .flex()
+            .items_center()
             .key_context("TextInput")
             .track_focus(&self.focus_handle(cx))
             .cursor(CursorStyle::IBeam)
@@ -621,12 +663,7 @@ impl Render for TextInput {
             .line_height(px(22.))
             .text_size(px(15.))
             .text_color(rgb(0xe8e8f0))
-            .child(
-                div()
-                    .h(px(30.))
-                    .w_full()
-                    .child(TextElement { input: cx.entity() }),
-            )
+            .child(div().w_full().child(TextElement { input: cx.entity() }))
     }
 }
 
