@@ -295,11 +295,14 @@ fn video_pipeline(codec: Codec) -> Result<(String, gst::Caps), MediaError> {
             rtp_caps("video", 90_000, "VP9", 98),
         )),
         Codec::H264 => Ok((
-            // The byte-stream output matters: the H.264 depayloader builds its
-            // decoder config from `sprop-parameter-sets`, which WebRTC does
-            // not send — the parameter sets arrive in-band instead. Decoding
-            // the byte-stream directly lets the decoder pick them up.
-            "appsrc name=src ! rtph264depay ! video/x-h264,stream-format=byte-stream,alignment=nal ! \
+            // `h264parse` is required between the depayloader and the decoder:
+            // the depayloader emits individual NAL units, while avdec_h264
+            // needs complete access units. Feeding NALs directly makes it
+            // treat slices from different frames as separate frames and spam
+            // `Frame num change` errors. The parser also repeats the in-band
+            // SPS/PPS on every IDR so a receiver can recover after loss.
+            "appsrc name=src ! rtph264depay ! h264parse config-interval=-1 ! \
+             video/x-h264,stream-format=byte-stream,alignment=au ! \
              avdec_h264 ! videoconvert ! videoscale ! jpegenc ! appsink name=sink sync=false"
                 .to_string(),
             rtp_caps("video", 90_000, "H264", 102),
@@ -552,6 +555,20 @@ mod tests {
                 "caps: {caps}"
             );
         }
+    }
+
+    #[test]
+    fn h264_pipeline_parses_access_units_before_decoding() {
+        gst::init().unwrap();
+        let (launch, _) = video_pipeline(Codec::H264).unwrap();
+        assert!(
+            launch.contains("rtph264depay ! h264parse config-interval=-1"),
+            "H.264 NALs must be aggregated into access units: {launch}"
+        );
+        assert!(
+            launch.contains("alignment=au ! avdec_h264"),
+            "avdec_h264 must receive access-unit aligned input: {launch}"
+        );
     }
 
     #[test]

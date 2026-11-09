@@ -29,6 +29,7 @@ pub const REQUIRED_ELEMENTS: &[&str] = &[
     "opusenc",
     "opusdec",
     "rtph264depay",
+    "h264parse",
     "avdec_h264",
 ];
 
@@ -42,6 +43,7 @@ pub const REQUIRED_ELEMENTS: &[&str] = &[
     "opusenc",
     "opusdec",
     "rtph264depay",
+    "h264parse",
     "avdec_h264",
 ];
 
