@@ -27,8 +27,8 @@ auth remain.
 ## Build and test
 
 ```sh
-cargo build
-cargo test
+cargo build --workspace
+cargo test --workspace
 ```
 
 ## Develop
@@ -67,7 +67,7 @@ $gst = "$env:LOCALAPPDATA\Programs\gstreamer\1.0\msvc_x86_64"
 Then run the app:
 
 ```powershell
-cargo run -p sharescreen-ui
+cargo run
 ```
 
 The app loads the GStreamer DLLs from `%GSTREAMER_1_0_ROOT_MSVC_X86_64%\bin`,

@@ -13,6 +13,7 @@ members = [
     "crates/ui",
     "server",
 ]
+default-members = ["crates/ui"]
 
 [workspace.package]
 version = "0.1.0"
