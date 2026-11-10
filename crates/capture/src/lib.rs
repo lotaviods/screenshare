@@ -9,6 +9,9 @@
 mod gst;
 
 #[cfg(target_os = "linux")]
+mod native;
+
+#[cfg(target_os = "linux")]
 mod wayland;
 #[cfg(windows)]
 mod windows;

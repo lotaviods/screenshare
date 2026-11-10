@@ -19,6 +19,8 @@ use sharescreen_core::{
 };
 
 use crate::gst;
+#[cfg(target_os = "linux")]
+use crate::native;
 
 /// Wayland/portal capture backend. `start` blocks (async) on the compositor's
 /// source-selection dialog, then streams encoded video on a background thread.
@@ -30,7 +32,29 @@ pub struct WaylandCapture {
 struct ActiveCapture {
     /// Keeps the portal session alive for the lifetime of the capture.
     session: Session<Screencast>,
-    stream: gst::Stream,
+    stream: ActiveStream,
+}
+
+/// Either encode pipeline behind one handle.
+enum ActiveStream {
+    Gst(gst::Stream),
+    Native(native::Stream),
+}
+
+impl ActiveStream {
+    fn latest_preview(&self) -> Option<Vec<u8>> {
+        match self {
+            Self::Gst(stream) => stream.latest_preview(),
+            Self::Native(stream) => stream.latest_preview(),
+        }
+    }
+
+    fn stop(self) {
+        match self {
+            Self::Gst(stream) => stream.stop(),
+            Self::Native(stream) => stream.stop(),
+        }
+    }
 }
 
 impl WaylandCapture {
@@ -100,13 +124,20 @@ impl ScreenCapture for WaylandCapture {
             .await
             .map_err(map_ashpd)?;
 
-        gst::ensure_gst_init();
-        let source = format!(
-            "pipewiresrc fd={} path={node_id} do-timestamp=true",
-            fd.as_raw_fd()
-        );
-        let launch = gst::build_launch(&source, &options);
-        let stream = gst::spawn(launch, sink, options.codec, Some(fd))?;
+        let stream = if native::available(options.codec)
+            && std::env::var("SHARESCREEN_MEDIA").is_ok_and(|value| value == "native")
+        {
+            tracing::info!("capture: native DMA-BUF -> VAAPI path");
+            ActiveStream::Native(native::spawn(fd, node_id, &options, sink)?)
+        } else {
+            gst::ensure_gst_init();
+            let source = format!(
+                "pipewiresrc fd={} path={node_id} do-timestamp=true",
+                fd.as_raw_fd()
+            );
+            let launch = gst::build_launch(&source, &options);
+            ActiveStream::Gst(gst::spawn(launch, sink, options.codec, Some(fd))?)
+        };
 
         self.active = Some(ActiveCapture { session, stream });
         Ok(())

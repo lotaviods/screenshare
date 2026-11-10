@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/core",
     "crates/config",
+    "crates/native-media",
     "crates/capture",
     "crates/audio",
     "crates/webrtc",

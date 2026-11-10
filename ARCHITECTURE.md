@@ -80,6 +80,12 @@ GNOME, and Sway all implement via their portal backends.
   then hands encoded frames to `webrtc` tracks through an `appsink`. This gives
   hardware-accelerated encoding without writing encoder code by hand, and the
   same pipeline shape works on Windows.
+- **Native GPU path** (`crates/native-media`, opt-in with
+  `SHARESCREEN_MEDIA=native`): skips GStreamer entirely. The compositor exports
+  DMA-BUFs, FFmpeg imports them into VAAPI surfaces, `scale_vaapi` converts RGB
+  to NV12 on the GPU, and `h264_vaapi` encodes. No pixel touches the CPU.
+  GStreamer stays the default until this path passes A/B on every target; it
+  still lacks the JPEG self-view preview.
 
 The portal permission dialog is handled by the compositor; the app only observes
 the result and surfaces `PermissionDenied` if the user declines.

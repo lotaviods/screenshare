@@ -20,6 +20,13 @@ spec against the current code. Checkboxes are off until implemented.
 - [x] Linux Wayland: XDG Desktop Portal `ScreenCast` via `ashpd`, PipeWire via
       GStreamer `pipewiresrc`, encode (`x264enc`/`vp8enc`/`vp9enc`),
       appsink → `EncodedSample`.
+- [x] Native GPU path (`crates/native-media`, `SHARESCREEN_MEDIA=native`):
+      portal → PipeWire DMA-BUF → VAAPI surface import → `scale_vaapi` RGB→NV12
+      → `h264_vaapi`. Zero CPU copies, validated on Hyprland + AMD (2560x1440).
+      GStreamer stays the default until A/B passes; the native path has no JPEG
+      self-view yet and is H.264 only.
+- [ ] Remove GStreamer: native decode for remote frames, Opus, audio capture,
+      and the preview branch are still GStreamer-only.
 - [x] Hardware-encoder auto-detection (VAAPI/NVENC/QSV candidates → software
       fallback). Untested against real HW (none installed here).
 - [x] Linux X11: native `ximagesrc` backend (whole-screen + `xid:` window).
