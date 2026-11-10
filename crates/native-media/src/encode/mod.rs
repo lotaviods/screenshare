@@ -2,8 +2,10 @@
 
 use crate::frame::DmaBufFrame;
 
+pub mod audio;
 pub mod ffmpeg;
 
+pub use audio::OpusEncoder;
 pub use ffmpeg::FfmpegEncoder;
 
 #[derive(Debug, thiserror::Error)]

@@ -1,16 +1,20 @@
 //! `sharescreen-audio`: microphone and system-audio capture.
 //!
-//! Capture is done through GStreamer (`pulsesrc`/`autoaudiosrc` for the mic),
-//! and `wasapi2src` on Windows → Opus → appsink. Linux system audio records
-//! each application playback stream through `libpulse-binding` and mixes them,
-//! so the call's own playback is never captured. Linux device enumeration uses
-//! `libpulse-binding` directly (license-clean), not the GPL-licensed
-//! `pulsectl-rs` fork; Windows enumeration uses GStreamer's WASAPI device
-//! provider.
+//! Capture is done through GStreamer by default (`pulsesrc`/`autoaudiosrc` for
+//! the mic, `wasapi2src` on Windows) → Opus → appsink. With
+//! `SHARESCREEN_MEDIA=native` on Linux, PulseAudio records the source directly
+//! and FFmpeg's libopus encoder produces the packets instead, skipping
+//! GStreamer entirely. Linux system audio records each application playback
+//! stream through `libpulse-binding` and mixes them, so the call's own playback
+//! is never captured. Linux device enumeration uses `libpulse-binding` directly
+//! (license-clean), not the GPL-licensed `pulsectl-rs` fork; Windows enumeration
+//! uses GStreamer's WASAPI device provider.
 #![cfg(any(target_os = "linux", windows))]
 
 mod pipeline;
 
+#[cfg(target_os = "linux")]
+mod native;
 #[cfg(target_os = "linux")]
 mod pulse;
 #[cfg(windows)]
@@ -22,7 +26,97 @@ use sharescreen_core::DeviceKind;
 use sharescreen_core::{AudioCapture, AudioError, Device, EncodedSample};
 use tokio::sync::mpsc;
 
-use pipeline::Stream;
+/// Either encode pipeline behind one handle.
+enum ActiveStream {
+    Gst(pipeline::Stream),
+    #[cfg(target_os = "linux")]
+    Native(native::Stream),
+}
+
+impl ActiveStream {
+    fn stop(self) {
+        match self {
+            Self::Gst(stream) => stream.stop(),
+            #[cfg(target_os = "linux")]
+            Self::Native(stream) => stream.stop(),
+        }
+    }
+
+    fn set_volume(&self, volume: f64) {
+        match self {
+            Self::Gst(stream) => stream.set_volume(volume),
+            #[cfg(target_os = "linux")]
+            Self::Native(stream) => stream.set_volume(volume),
+        }
+    }
+
+    fn set_muted(&self, muted: bool) {
+        match self {
+            Self::Gst(stream) => stream.set_muted(muted),
+            #[cfg(target_os = "linux")]
+            Self::Native(stream) => stream.set_muted(muted),
+        }
+    }
+}
+
+/// Microphone capture: native when opted in and usable, GStreamer otherwise.
+fn mic_stream(
+    device: Option<&str>,
+    bitrate_kbps: u32,
+    sink: mpsc::Sender<EncodedSample>,
+) -> Result<ActiveStream, AudioError> {
+    #[cfg(target_os = "linux")]
+    if native::available() {
+        tracing::info!("audio: native PulseAudio -> Opus path");
+        return Ok(ActiveStream::Native(native::spawn_mic(
+            device.map(str::to_owned),
+            bitrate_kbps,
+            sink,
+        )?));
+    }
+    Ok(ActiveStream::Gst(pipeline::spawn(
+        pipeline::mic_launch(device, bitrate_kbps),
+        sink,
+    )?))
+}
+
+#[cfg(target_os = "linux")]
+fn system_stream(
+    device: Option<&str>,
+    bitrate_kbps: u32,
+    sink: mpsc::Sender<EncodedSample>,
+) -> Result<ActiveStream, AudioError> {
+    if native::available() {
+        tracing::info!("audio: native PulseAudio -> Opus path");
+        return Ok(ActiveStream::Native(native::spawn_system(
+            device.map(str::to_owned),
+            bitrate_kbps,
+            sink,
+        )?));
+    }
+    Ok(ActiveStream::Gst(pipeline::spawn_system(
+        device.map(str::to_owned),
+        bitrate_kbps,
+        sink,
+    )?))
+}
+
+#[cfg(windows)]
+fn system_stream(
+    _device: Option<&str>,
+    bitrate_kbps: u32,
+    sink: mpsc::Sender<EncodedSample>,
+) -> Result<ActiveStream, AudioError> {
+    if !wasapi::supports_process_loopback() {
+        return Err(AudioError::Unavailable(
+            "system audio without call echo requires Windows 10 build 20348 or later".into(),
+        ));
+    }
+    Ok(ActiveStream::Gst(pipeline::spawn(
+        pipeline::system_launch(None, bitrate_kbps),
+        sink,
+    )?))
+}
 
 /// Microphones as shown in the device picker.
 #[cfg(target_os = "linux")]
@@ -92,8 +186,8 @@ fn system_monitors() -> Vec<Device> {
 /// independent: separate GStreamer pipelines, threads, and volume controls.
 pub struct AudioEngine {
     bitrate_kbps: u32,
-    mic: Option<Stream>,
-    system: Option<Stream>,
+    mic: Option<ActiveStream>,
+    system: Option<ActiveStream>,
 }
 
 impl Default for AudioEngine {
@@ -133,9 +227,7 @@ impl AudioCapture for AudioEngine {
         sink: mpsc::Sender<EncodedSample>,
     ) -> Result<(), AudioError> {
         self.stop_mic().await.ok();
-        let launch = pipeline::mic_launch(device_id, self.bitrate_kbps);
-        let stream = pipeline::spawn(launch, sink)?;
-        self.mic = Some(stream);
+        self.mic = Some(mic_stream(device_id, self.bitrate_kbps, sink)?);
         Ok(())
     }
 
@@ -152,18 +244,7 @@ impl AudioCapture for AudioEngine {
         sink: mpsc::Sender<EncodedSample>,
     ) -> Result<(), AudioError> {
         self.stop_system().await.ok();
-        #[cfg(target_os = "linux")]
-        let stream = pipeline::spawn_system(device_id.map(str::to_owned), self.bitrate_kbps, sink)?;
-        #[cfg(windows)]
-        let stream = {
-            if !wasapi::supports_process_loopback() {
-                return Err(AudioError::Unavailable(
-                    "system audio without call echo requires Windows 10 build 20348 or later".into(),
-                ));
-            }
-            pipeline::spawn(pipeline::system_launch(device_id, self.bitrate_kbps), sink)?
-        };
-        self.system = Some(stream);
+        self.system = Some(system_stream(device_id, self.bitrate_kbps, sink)?);
         Ok(())
     }
 

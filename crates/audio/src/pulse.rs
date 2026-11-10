@@ -211,13 +211,16 @@ const RATE: u32 = 48_000;
 const FRAMES_PER_CHUNK: usize = 960;
 const SAMPLES_PER_CHUNK: usize = FRAMES_PER_CHUNK * CHANNELS as usize;
 
-fn attach_input(context: &mut Context, monitor: &str, index: u32) -> Result<Input, String> {
+/// Record one input stream as 48 kHz stereo S16LE. `monitor` selects a single
+/// sink input (application playback) instead of the input itself; `device`
+/// picks the source and defaults to the server's default source.
+fn record(context: &mut Context, device: Option<&str>, monitor: Option<u32>) -> Result<Input, String> {
     let spec = Spec { format: Format::S16le, channels: CHANNELS, rate: RATE };
     let mut map = pulse::channelmap::Map::default();
     map.init_stereo();
     let stream = Rc::new(RefCell::new(
-        PulseStream::new(context, "sharescreen application audio", &spec, Some(&map))
-            .ok_or("failed to create application monitor")?,
+        PulseStream::new(context, "sharescreen audio capture", &spec, Some(&map))
+            .ok_or("failed to create audio capture stream")?,
     ));
 
     let pending: Rc<RefCell<Vec<i16>>> = Rc::new(RefCell::new(Vec::new()));
@@ -251,8 +254,10 @@ fn attach_input(context: &mut Context, monitor: &str, index: u32) -> Result<Inpu
 
     {
         let mut stream = stream.borrow_mut();
-        if let Err(e) = stream.set_monitor_stream(index) {
-            return Err(format!("monitor stream rejected: {e:?}"));
+        if let Some(index) = monitor {
+            if let Err(e) = stream.set_monitor_stream(index) {
+                return Err(format!("monitor stream rejected: {e:?}"));
+            }
         }
         let attr = pulse::def::BufferAttr {
             maxlength: u32::MAX,
@@ -261,10 +266,166 @@ fn attach_input(context: &mut Context, monitor: &str, index: u32) -> Result<Inpu
             minreq: u32::MAX,
             fragsize: 3840, // ~20ms of 48kHz stereo S16LE
         };
-        stream.connect_record(Some(monitor), Some(&attr), StreamFlags::ADJUST_LATENCY)
-            .map_err(|e| format!("failed to monitor playback stream {index}: {e}"))?;
+        stream.connect_record(device, Some(&attr), StreamFlags::ADJUST_LATENCY)
+            .map_err(|e| format!("failed to record input: {e}"))?;
     }
     Ok(Input { stream, pending })
+}
+
+/// A recording stream owned by one capture thread.
+pub(crate) struct Recorder {
+    mainloop: Mainloop,
+    context: Context,
+    input: Input,
+}
+
+impl Recorder {
+    /// Connect to PulseAudio and record `device` (or the default source).
+    pub(crate) fn open(device: Option<String>) -> Result<Self, String> {
+        let mut mainloop = Mainloop::new().ok_or("failed to create PulseAudio mainloop")?;
+        let mut context = Context::new(&mainloop, "sharescreen-microphone")
+            .ok_or("failed to create PulseAudio context")?;
+        if let Err(e) = context.connect(None, FlagSet::NOFLAGS, None) {
+            return Err(format!("PulseAudio connect failed: {e:?}"));
+        }
+        wait_ready(&mut mainloop, &context)?;
+        let input = record(&mut context, device.as_deref(), None)?;
+        Ok(Self { mainloop, context, input })
+    }
+
+    /// Drain the mainloop so read callbacks fire.
+    pub(crate) fn pump(&mut self) {
+        self.mainloop.iterate(false);
+    }
+
+    /// Take every pending interleaved stereo sample.
+    pub(crate) fn take(&self) -> Vec<i16> {
+        let mut pending = self.input.pending.borrow_mut();
+        std::mem::take(&mut *pending)
+    }
+}
+
+impl Drop for Recorder {
+    fn drop(&mut self) {
+        let _ = self.input.stream.borrow_mut().disconnect();
+        self.context.disconnect();
+    }
+}
+
+/// A live mix of every non-call playback stream on one monitor sink. The
+/// GStreamer path pushes its chunks into `appsrc`; the native path encodes them.
+pub(crate) struct Mixer {
+    mainloop: Mainloop,
+    context: Context,
+    monitor: String,
+    sink_index: u32,
+    inputs: HashMap<u32, Input>,
+    last_refresh: Instant,
+    last_mix: Instant,
+}
+
+impl Mixer {
+    /// Connect to PulseAudio and resolve the monitor for `device`, or the
+    /// default output's monitor when `None`.
+    pub(crate) fn open(device: Option<String>) -> Result<Self, String> {
+        let (sources, _) = enumerate()?;
+
+        let mut mainloop = Mainloop::new().ok_or("failed to create PulseAudio mainloop")?;
+        let mut context = Context::new(&mainloop, "sharescreen-system-audio")
+            .ok_or("failed to create PulseAudio context")?;
+        if let Err(e) = context.connect(None, FlagSet::NOFLAGS, None) {
+            return Err(format!("PulseAudio connect failed: {e:?}"));
+        }
+        wait_ready(&mut mainloop, &context)?;
+
+        // Without an explicit device, follow the default output like the old
+        // `@DEFAULT_MONITOR@` source did.
+        let wanted = device.or_else(|| {
+            default_sink_name(&mut mainloop, &mut context).map(|name| format!("{name}.monitor"))
+        });
+        let monitor = sources.into_iter()
+            .filter(|source| source.monitor_of_sink.is_some())
+            .find(|source| wanted.as_deref().is_none_or(|id| id == source.name))
+            .ok_or("system audio monitor not found")?;
+        let sink_index = monitor.monitor_of_sink.unwrap();
+
+        Ok(Self {
+            mainloop,
+            context,
+            monitor: monitor.name,
+            sink_index,
+            inputs: HashMap::new(),
+            last_refresh: Instant::now() - Duration::from_secs(1),
+            last_mix: Instant::now(),
+        })
+    }
+
+    /// Pump the mainloop and track playback streams as they come and go.
+    pub(crate) fn pump(&mut self) {
+        if self.last_refresh.elapsed() >= Duration::from_millis(500) {
+            let current = playback_inputs(&mut self.mainloop, &mut self.context, self.sink_index);
+            let ids: std::collections::HashSet<u32> = current.iter().map(|i| i.index).collect();
+            for index in self.inputs.keys().copied().filter(|index| !ids.contains(index)).collect::<Vec<_>>() {
+                if let Some(input) = self.inputs.remove(&index) {
+                    let _ = input.stream.borrow_mut().disconnect();
+                }
+            }
+            for item in current {
+                if let std::collections::hash_map::Entry::Vacant(slot) = self.inputs.entry(item.index) {
+                    match attach_input(&mut self.context, &self.monitor, item.index) {
+                        Ok(input) => { slot.insert(input); }
+                        Err(e) => tracing::warn!("failed to capture playback stream {} on sink {}: {e}", item.index, item.sink),
+                    }
+                }
+            }
+            self.last_refresh = Instant::now();
+        }
+        self.mainloop.iterate(false);
+    }
+
+    /// One 20 ms stereo chunk of the sum of every captured stream, when due.
+    pub(crate) fn chunk(&mut self) -> Option<Vec<i16>> {
+        if self.last_mix.elapsed() < Duration::from_millis(20) {
+            return None;
+        }
+        self.last_mix = Instant::now();
+
+        let mut mixed = vec![0i32; SAMPLES_PER_CHUNK];
+        let mut any = false;
+        for input in self.inputs.values() {
+            let mut pending = input.pending.borrow_mut();
+            let n = pending.len().min(SAMPLES_PER_CHUNK);
+            if n > 0 {
+                any = true;
+                for (i, sample) in pending.iter().take(n).enumerate() {
+                    mixed[i] += *sample as i32;
+                }
+            }
+            pending.drain(..n);
+        }
+        if !any {
+            return None;
+        }
+
+        let mut out = Vec::with_capacity(SAMPLES_PER_CHUNK);
+        for sample in mixed {
+            out.push(sample.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
+        }
+        Some(out)
+    }
+}
+
+impl Drop for Mixer {
+    fn drop(&mut self) {
+        for (_, input) in self.inputs.drain() {
+            let _ = input.stream.borrow_mut().disconnect();
+        }
+        self.context.disconnect();
+    }
+}
+
+fn attach_input(context: &mut Context, monitor: &str, index: u32) -> Result<Input, String> {
+    record(context, Some(monitor), Some(index))
 }
 
 pub(crate) fn run_system(
@@ -284,26 +445,7 @@ fn run_system_inner(
     ready: std::sync::mpsc::SyncSender<Result<(), String>>,
 ) -> Result<(), String> {
     gst::init().map_err(|e| e.to_string())?;
-    let (sources, _) = enumerate()?;
-
-    let mut mainloop = Mainloop::new().ok_or("failed to create PulseAudio mainloop")?;
-    let mut context = Context::new(&mainloop, "sharescreen-system-audio")
-        .ok_or("failed to create PulseAudio context")?;
-    if let Err(e) = context.connect(None, FlagSet::NOFLAGS, None) {
-        return Err(format!("PulseAudio connect failed: {e:?}"));
-    }
-    wait_ready(&mut mainloop, &context)?;
-
-    // Without an explicit device, follow the default output like the old
-    // `@DEFAULT_MONITOR@` source did.
-    let wanted = device.or_else(|| {
-        default_sink_name(&mut mainloop, &mut context).map(|name| format!("{name}.monitor"))
-    });
-    let monitor = sources.into_iter()
-        .filter(|source| source.monitor_of_sink.is_some())
-        .find(|source| wanted.as_deref().is_none_or(|id| id == source.name))
-        .ok_or("system audio monitor not found")?;
-    let sink_index = monitor.monitor_of_sink.unwrap();
+    let mut mixer = Mixer::open(device)?;
 
     let launch = crate::pipeline::encode_chain("appsrc name=src", bitrate_kbps);
     let pipeline = gst::parse::launch(&launch).map_err(|e| e.to_string())?
@@ -321,59 +463,21 @@ fn run_system_inner(
     pipeline.set_state(gst::State::Playing).map_err(|e| e.to_string())?;
     let _ = ready.send(Ok(()));
 
-    let mut inputs: HashMap<u32, Input> = HashMap::new();
-    let mut last_refresh = Instant::now() - Duration::from_secs(1);
-    let mut last_mix = Instant::now();
     let mut pts_ns: u64 = 0;
     while running.load(Ordering::SeqCst) {
-        if last_refresh.elapsed() >= Duration::from_millis(500) {
-            let current = playback_inputs(&mut mainloop, &mut context, sink_index);
-            let ids: std::collections::HashSet<u32> = current.iter().map(|i| i.index).collect();
-            for index in inputs.keys().copied().filter(|index| !ids.contains(index)).collect::<Vec<_>>() {
-                if let Some(input) = inputs.remove(&index) {
-                    let _ = input.stream.borrow_mut().disconnect();
-                }
-            }
-            for item in current {
-                if let std::collections::hash_map::Entry::Vacant(slot) = inputs.entry(item.index) {
-                    match attach_input(&mut context, &monitor.name, item.index) {
-                        Ok(input) => { slot.insert(input); }
-                        Err(e) => tracing::warn!("failed to capture playback stream {} on sink {}: {e}", item.index, item.sink),
-                    }
-                }
-            }
-            last_refresh = Instant::now();
-        }
-        mainloop.iterate(false);
+        mixer.pump();
 
-        if last_mix.elapsed() >= Duration::from_millis(20) {
-            last_mix = Instant::now();
-            let mut mixed = vec![0i32; SAMPLES_PER_CHUNK];
-            let mut any = false;
-            for input in inputs.values() {
-                let mut pending = input.pending.borrow_mut();
-                let n = pending.len().min(SAMPLES_PER_CHUNK);
-                if n > 0 {
-                    any = true;
-                    for (i, sample) in pending.iter().take(n).enumerate() {
-                        mixed[i] += *sample as i32;
-                    }
-                }
-                pending.drain(..n);
+        if let Some(mixed) = mixer.chunk() {
+            let mut out = Vec::with_capacity(SAMPLES_PER_CHUNK * 2);
+            for sample in mixed {
+                out.extend_from_slice(&sample.to_le_bytes());
             }
-            if any {
-                let mut out = Vec::with_capacity(SAMPLES_PER_CHUNK * 2);
-                for sample in mixed {
-                    let clamped = sample.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-                    out.extend_from_slice(&clamped.to_le_bytes());
-                }
-                let mut buffer = gst::Buffer::from_mut_slice(out);
-                if let Some(raw) = buffer.get_mut() {
-                    raw.set_pts(gst::ClockTime::from_nseconds(pts_ns));
-                }
-                pts_ns += FRAMES_PER_CHUNK as u64 * 1_000_000_000 / RATE as u64;
-                let _ = source.push_buffer(buffer);
+            let mut buffer = gst::Buffer::from_mut_slice(out);
+            if let Some(raw) = buffer.get_mut() {
+                raw.set_pts(gst::ClockTime::from_nseconds(pts_ns));
             }
+            pts_ns += FRAMES_PER_CHUNK as u64 * 1_000_000_000 / RATE as u64;
+            let _ = source.push_buffer(buffer);
         }
 
         if let Some(sample) = appsink.try_pull_sample(gst::ClockTime::from_mseconds(10)) {
@@ -390,11 +494,7 @@ fn run_system_inner(
             }
         }
     }
-    for (_, input) in inputs.drain() {
-        let _ = input.stream.borrow_mut().disconnect();
-    }
     let _ = pipeline.set_state(gst::State::Null);
     *control.lock().unwrap() = None;
-    context.disconnect();
     Ok(())
 }

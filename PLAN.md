@@ -25,8 +25,8 @@ spec against the current code. Checkboxes are off until implemented.
       → `h264_vaapi`. Zero CPU copies, validated on Hyprland + AMD (2560x1440).
       GStreamer stays the default until A/B passes; the native path has no JPEG
       self-view yet and is H.264 only.
-- [ ] Remove GStreamer: native decode for remote frames, Opus, audio capture,
-      and the preview branch are still GStreamer-only.
+- [ ] Remove GStreamer: native decode for remote frames and the preview branch
+      are still GStreamer-only.
 - [x] Hardware-encoder auto-detection (VAAPI/NVENC/QSV candidates → software
       fallback). Untested against real HW (none installed here).
 - [x] Linux X11: native `ximagesrc` backend (whole-screen + `xid:` window).
@@ -60,6 +60,11 @@ spec against the current code. Checkboxes are off until implemented.
 - [x] Opus encode (`opusenc`) into `EncodedSample`.
 - [x] Device enumeration (mic, output, system monitor) via `libpulse-binding` — runtime-verified.
 - [x] Independent mic/system volume + mute (via `volume` element).
+- [x] Native audio path (`SHARESCREEN_MEDIA=native`, Linux): `libpulse-binding`
+      records the mic and mixes per-application playback, FFmpeg's libopus
+      encodes 20 ms packets, volume/mute apply as software gain. Verified live
+      on Hyprland + PipeWire (mic and system audio). GStreamer stays the
+      default until A/B passes.
 - [ ] Echo cancellation; noise suppression (needs `webrtc-audio-processing`).
 - [ ] Device disconnect/reconnect handling without tearing down the call.
 - [ ] Windows WASAPI mic + loopback capture.

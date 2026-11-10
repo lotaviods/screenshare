@@ -112,6 +112,11 @@ Two independent local sources plus remote audio:
 2. System audio — PulseAudio/PipeWire monitor source (Linux), WASAPI loopback
    (Windows).
 
+On Linux, `SHARESCREEN_MEDIA=native` records through `libpulse-binding` and
+encodes with FFmpeg's libopus instead, without a GStreamer pipeline. Volume and
+mute then apply as software gain before encoding. GStreamer stays the default
+until the A/B comparison passes.
+
 Both encode to Opus independently and are sent as separate WebRTC tracks so a
 remote user can mute screen audio without muting the mic. Volume, mute, echo
 cancellation, and noise suppression apply per source. Device disconnection is

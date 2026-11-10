@@ -6014,6 +6014,7 @@ dependencies = [
  "gstreamer-app",
  "libpulse-binding",
  "sharescreen-core",
+ "sharescreen-native-media",
  "tokio",
  "tracing",
 ]
