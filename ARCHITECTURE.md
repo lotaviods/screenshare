@@ -27,7 +27,7 @@ real-time media.
 │              ┌───────────────────────────┼───────────────────────────┐         │
 │              ▼                           ▼                           ▼         │
 │        capture crate               audio crate                webrtc crate     │
-│   (portal/PipeWire, X11, GDI)  (mic + system loopback)   (peer connections)    │
+│   (portal/PipeWire, GDI)  (mic + system loopback)   (peer connections)    │
 │              │                           │                           │         │
 │              └───────────────►  native encode   ◄──────────────────┘         │
 │                                          │                                     │
@@ -65,7 +65,7 @@ ICE, DTLS-SRTP, NACK, TWCC, and bandwidth estimation.
 - Pin the exact 0.21 minor version: the 0.21 line is pre-1.0 and may break API
   on a minor bump.
 
-### Linux capture: XDG Desktop Portal + PipeWire + GStreamer
+### Linux capture: XDG Desktop Portal + PipeWire + native FFmpeg
 
 Wayland capture is not compositor-specific. The standard path is
 `org.freedesktop.portal.ScreenCast` + PipeWire, which Hyprland, KDE Plasma,
@@ -75,22 +75,14 @@ GNOME, and Sway all implement via their portal backends.
   session, lets the user pick monitor/window (compositor-native permission
   dialog), starts the stream, and returns the PipeWire node id + remote fd.
 - `pipewire` crate: consumes the captured frames.
-- **GStreamer** (via `gstreamer` Rust bindings): receives PipeWire frames and
-  encodes them (`vaapih264enc`, `nvh264enc`, `vah264enc`, `vp8enc`, `x264enc`),
-  then hands encoded frames to `webrtc` tracks through an `appsink`. This gives
-  hardware-accelerated encoding without writing encoder code by hand. The
-  Windows path uses GDI + FFmpeg instead.
-- **Native GPU path** (`crates/native-media`, opt-in with
-  `SHARESCREEN_MEDIA=native`): skips GStreamer entirely. The compositor exports
-  DMA-BUFs, FFmpeg imports them into VAAPI surfaces, `scale_vaapi` converts RGB
-  to NV12 on the GPU, and `h264_vaapi` encodes. No pixel touches the CPU.
-  GStreamer stays the default until this path passes A/B on every target; it
-  still lacks the JPEG self-view preview.
+- **Native GPU path** (`crates/native-media`): the compositor exports DMA-BUFs,
+  FFmpeg imports them into VAAPI surfaces, `scale_vaapi` converts RGB to NV12
+  on the GPU, and `h264_vaapi`/`vp8_vaapi`/`vp9_vaapi` encode. No pixel touches
+  the CPU. No GStreamer is involved.
+- The portal also covers X11 sessions, so there is no separate X11 backend.
 
 The portal permission dialog is handled by the compositor; the app only observes
 the result and surfaces `PermissionDenied` if the user declines.
-
-X11 uses a separate backend (XCB + GStreamer `ximagesrc`, or `x11grab`).
 
 ### Windows capture
 
@@ -150,7 +142,7 @@ sharescreen/
 ├── crates/
 │   ├── core/        # domain model + traits (no OS/GStreamer deps)
 │   ├── config/      # config + preferences persistence + validation
-│   ├── capture/     # ScreenCapture trait impls (portal/PipeWire, X11, WGC)
+│   ├── capture/     # ScreenCapture trait impls (portal/PipeWire, WGC)
 │   ├── audio/       # AudioCapture trait impls (mic + system loopback)
 │   ├── webrtc/      # peer connection wrapper, track wiring, renegotiation
 │   ├── signaling/   # client-side WebSocket signaling
@@ -179,7 +171,7 @@ Capture → encode → sample queue → WebRTC track. No raw frames cross the UI
 boundary; only decoded JPEG frames for display.
 
 ```
-portal/pipewire (Linux), GDI (Windows), X11  ──►  native encoder  ──►  EncodedSample
+portal/pipewire (Linux), GDI (Windows)  ──►  native encoder  ──►  EncodedSample
                                                                       │
                                                                       ▼
                                                               mpsc channel (bounded)
@@ -241,7 +233,7 @@ simultaneous mic+system-audio calls.
 
 1. Architecture doc + workspace scaffold (this increment).
 2. `core` domain model + traits, `config` persistence + validation.
-3. Linux Wayland capture (portal + PipeWire + GStreamer).
+3. Linux Wayland capture (portal + PipeWire + native FFmpeg).
 4. Windows capture (GDI + FFmpeg).
 5. Microphone + system audio capture.
 6. WebRTC media transport (mesh).

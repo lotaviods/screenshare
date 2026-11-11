@@ -10,6 +10,7 @@ use std::ffi::CString;
 use std::ptr;
 
 use ffmpeg_sys_next as ffi;
+use sharescreen_core::Codec;
 
 use super::{Backend, EncodeError, EncodedFrame, EncoderConfig, VideoEncoder};
 use crate::frame::{DrmFormat, Frame};
@@ -21,10 +22,33 @@ pub fn enable_debug_logging() {
     unsafe { ffi::av_log_set_level(ffi::AV_LOG_DEBUG) }
 }
 
-/// Probe whether FFmpeg exposes a VAAPI H.264 encoder.
-pub fn vaapi_available() -> bool {
-    let name = CString::new("h264_vaapi").unwrap();
+/// Probe whether FFmpeg exposes a VAAPI encoder for `codec`.
+pub fn vaapi_available(codec: Codec) -> bool {
+    let Some(name) = codec_name(codec) else {
+        return false;
+    };
+    let name = CString::new(name).unwrap();
     unsafe { !ffi::avcodec_find_encoder_by_name(name.as_ptr()).is_null() }
+}
+
+/// VAAPI encoder name for a supported video codec.
+fn codec_name(codec: Codec) -> Option<&'static str> {
+    match codec {
+        Codec::H264 => Some("h264_vaapi"),
+        Codec::Vp8 => Some("vp8_vaapi"),
+        Codec::Vp9 => Some("vp9_vaapi"),
+        _ => None,
+    }
+}
+
+/// FFmpeg codec id for a supported video codec.
+fn codec_id(codec: Codec) -> Option<ffi::AVCodecID> {
+    match codec {
+        Codec::H264 => Some(ffi::AVCodecID::AV_CODEC_ID_H264),
+        Codec::Vp8 => Some(ffi::AVCodecID::AV_CODEC_ID_VP8),
+        Codec::Vp9 => Some(ffi::AVCodecID::AV_CODEC_ID_VP9),
+        _ => None,
+    }
 }
 
 /// VAAPI import format matching each DRM fourcc.
@@ -249,10 +273,13 @@ impl FfmpegEncoder {
     }
 
     unsafe fn new_vaapi(config: EncoderConfig) -> Result<Self, EncodeError> {
-        let name = CString::new("h264_vaapi").unwrap();
+        let name = codec_name(config.codec).ok_or_else(|| {
+            EncodeError::Unavailable(format!("no VAAPI encoder for {:?}", config.codec))
+        })?;
+        let name = CString::new(name).unwrap();
         let codec = ffi::avcodec_find_encoder_by_name(name.as_ptr());
         if codec.is_null() {
-            return Err(EncodeError::Unavailable("h264_vaapi not built in".into()));
+            return Err(EncodeError::Unavailable(format!("{name:?} not built in")));
         }
 
         let mut device: *mut ffi::AVBufferRef = ptr::null_mut();
@@ -298,7 +325,9 @@ impl FfmpegEncoder {
             return Err(EncodeError::Ffmpeg("avcodec_alloc_context3 failed".into()));
         }
 
-        (*ctx).codec_id = ffi::AVCodecID::AV_CODEC_ID_H264;
+        (*ctx).codec_id = codec_id(config.codec).ok_or_else(|| {
+            EncodeError::Unavailable(format!("no VAAPI encoder for {:?}", config.codec))
+        })?;
         (*ctx).width = config.width as i32;
         (*ctx).height = config.height as i32;
         (*ctx).time_base = ffi::AVRational {

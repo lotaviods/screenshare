@@ -1547,19 +1547,6 @@ impl AppView {
                                 )
                                 .child(
                                     chip(
-                                        "backend-x11",
-                                        "X11",
-                                        self.settings.capture.backend == CaptureBackend::X11,
-                                    )
-                                    .on_click(cx.listener(
-                                        |view, _, _, cx| {
-                                            view.settings.capture.backend = CaptureBackend::X11;
-                                            cx.notify();
-                                        },
-                                    )),
-                                )
-                                .child(
-                                    chip(
                                         "backend-windows",
                                         "Windows",
                                         self.settings.capture.backend == CaptureBackend::Windows,

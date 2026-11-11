@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Screen capture backends for Sharescreen (XDG portal + PipeWire + GStreamer on Linux, GDI + FFmpeg on Windows)"
+description = "Screen capture backends for Sharescreen (XDG portal + PipeWire + native FFmpeg on Linux, GDI + FFmpeg on Windows)"
 
 [dependencies]
 sharescreen-core = { path = "../core" }
@@ -13,8 +13,6 @@ async-trait.workspace = true
 tracing.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-gstreamer = "0.25"
-gstreamer-app = "0.25"
 ashpd = { version = "0.13", features = ["screencast"] }
 sharescreen-native-media = { path = "../native-media" }
 

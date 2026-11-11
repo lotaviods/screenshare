@@ -1,10 +1,8 @@
-//! Wayland capture via XDG Desktop Portal `ScreenCast` + PipeWire + GStreamer.
+//! Wayland capture via XDG Desktop Portal `ScreenCast` + PipeWire + native FFmpeg.
 //!
 //! Flow: create a portal session, ask the compositor to show its source picker
 //! (`select_sources` + `start`), receive the PipeWire node id and remote fd,
-//! then hand off to the shared [`crate::gst`] pipeline (`pipewiresrc ! ... ! <encoder> ! appsink`).
-
-use std::os::fd::AsRawFd;
+//! then hand the DMA-BUF frames to the native FFmpeg encoder.
 
 use ashpd::desktop::screencast::{
     CursorMode as AshpdCursorMode, Screencast, SelectSourcesOptions, SourceType,
@@ -18,8 +16,6 @@ use sharescreen_core::{
     SourceKind,
 };
 
-use crate::gst;
-#[cfg(target_os = "linux")]
 use crate::native;
 
 /// Wayland/portal capture backend. `start` blocks (async) on the compositor's
@@ -32,29 +28,7 @@ pub struct WaylandCapture {
 struct ActiveCapture {
     /// Keeps the portal session alive for the lifetime of the capture.
     session: Session<Screencast>,
-    stream: ActiveStream,
-}
-
-/// Either encode pipeline behind one handle.
-enum ActiveStream {
-    Gst(gst::Stream),
-    Native(native::Stream),
-}
-
-impl ActiveStream {
-    fn latest_preview(&self) -> Option<Vec<u8>> {
-        match self {
-            Self::Gst(stream) => stream.latest_preview(),
-            Self::Native(stream) => stream.latest_preview(),
-        }
-    }
-
-    fn stop(self) {
-        match self {
-            Self::Gst(stream) => stream.stop(),
-            Self::Native(stream) => stream.stop(),
-        }
-    }
+    stream: native::Stream,
 }
 
 impl WaylandCapture {
@@ -83,6 +57,13 @@ impl ScreenCapture for WaylandCapture {
         options: CaptureOptions,
         sink: mpsc::Sender<EncodedSample>,
     ) -> Result<(), CaptureError> {
+        if !native::available(options.codec) {
+            return Err(CaptureError::Unavailable(format!(
+                "native capture does not support {:?} on this system",
+                options.codec
+            )));
+        }
+
         // Release any in-flight capture first (session + thread + fd).
         self.stop().await.ok();
 
@@ -124,21 +105,8 @@ impl ScreenCapture for WaylandCapture {
             .await
             .map_err(map_ashpd)?;
 
-        let stream = if native::available(options.codec)
-            && std::env::var("SHARESCREEN_MEDIA").is_ok_and(|value| value == "native")
-        {
-            tracing::info!("capture: native DMA-BUF -> VAAPI path");
-            ActiveStream::Native(native::spawn(fd, node_id, &options, sink)?)
-        } else {
-            gst::ensure_gst_init();
-            let source = format!(
-                "pipewiresrc fd={} path={node_id} do-timestamp=true",
-                fd.as_raw_fd()
-            );
-            let launch = gst::build_launch(&source, &options);
-            ActiveStream::Gst(gst::spawn(launch, sink, options.codec, Some(fd))?)
-        };
-
+        tracing::info!("capture: native DMA-BUF -> VAAPI path");
+        let stream = native::spawn(fd, node_id, &options, sink)?;
         self.active = Some(ActiveCapture { session, stream });
         Ok(())
     }
@@ -148,7 +116,7 @@ impl ScreenCapture for WaylandCapture {
             return Ok(());
         };
         // Close the portal session so the compositor ends the stream, then stop
-        // the GStreamer thread.
+        // the native capture thread.
         let _ = active.session.close().await;
         active.stream.stop();
         Ok(())

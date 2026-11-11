@@ -1,6 +1,5 @@
 //! Regression: `Decoder::new` must construct a native decoder without any
-//! prior initialization. It used to panic while building GStreamer caps before
-//! `gst::init`.
+//! prior initialization.
 
 #[test]
 fn decoder_constructs_without_prior_init() {

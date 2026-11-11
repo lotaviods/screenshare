@@ -1,13 +1,9 @@
 //! `sharescreen-capture`: screen capture backends.
 //!
-//! Linux uses the XDG Desktop Portal + PipeWire + GStreamer (or native X11 via
-//! `ximagesrc`). Windows uses GDI + FFmpeg H.264, with no GStreamer. The
-//! `ScreenCapture` trait in `sharescreen-core` keeps every backend behind one
-//! interface.
+//! Linux uses the XDG Desktop Portal + PipeWire + native FFmpeg encode. Windows
+//! uses GDI + FFmpeg H.264. Neither path uses GStreamer. The `ScreenCapture`
+//! trait in `sharescreen-core` keeps every backend behind one interface.
 #![cfg(any(target_os = "linux", windows))]
-
-#[cfg(target_os = "linux")]
-mod gst;
 
 #[cfg(target_os = "linux")]
 mod native;
@@ -19,50 +15,11 @@ mod native_windows;
 mod wayland;
 #[cfg(windows)]
 mod windows;
-#[cfg(target_os = "linux")]
-mod x11;
-
-/// GStreamer elements the app cannot run without. Missing ones mean capture,
-/// audio, or decode will fail, so the app reports them at startup.
-#[cfg(target_os = "linux")]
-pub const REQUIRED_ELEMENTS: &[&str] = &[
-    "pipewiresrc",
-    "pulsesrc",
-    "pulsesink",
-    "videoconvert",
-    "videoscale",
-    "videorate",
-    "jpegenc",
-    "opusenc",
-    "opusdec",
-    "rtph264depay",
-    "h264parse",
-    "avdec_h264",
-];
-
-/// Required GStreamer elements that are not installed.
-#[cfg(target_os = "linux")]
-pub fn missing_elements() -> Vec<&'static str> {
-    gst::ensure_gst_init();
-    REQUIRED_ELEMENTS
-        .iter()
-        .copied()
-        .filter(|name| !gst::element_exists(name))
-        .collect()
-}
-
-/// The Windows path does not use GStreamer.
-#[cfg(not(target_os = "linux"))]
-pub fn missing_elements() -> Vec<&'static str> {
-    Vec::new()
-}
 
 #[cfg(target_os = "linux")]
 pub use wayland::WaylandCapture;
 #[cfg(windows)]
 pub use windows::WindowsCapture;
-#[cfg(target_os = "linux")]
-pub use x11::X11Capture;
 
 use async_trait::async_trait;
 use sharescreen_core::{
@@ -74,8 +31,6 @@ use tokio::sync::mpsc;
 pub enum CaptureEngine {
     #[cfg(target_os = "linux")]
     Wayland(WaylandCapture),
-    #[cfg(target_os = "linux")]
-    X11(X11Capture),
     #[cfg(windows)]
     Windows(WindowsCapture),
 }
@@ -87,8 +42,6 @@ impl CaptureEngine {
         match self {
             #[cfg(target_os = "linux")]
             Self::Wayland(w) => w.latest_preview(),
-            #[cfg(target_os = "linux")]
-            Self::X11(x) => x.latest_preview(),
             #[cfg(windows)]
             Self::Windows(w) => w.latest_preview(),
         }
@@ -96,8 +49,7 @@ impl CaptureEngine {
 
     /// Build the engine for the requested backend. `Auto` and `Portal` select
     /// the desktop-portal path on Linux (which also covers X11 sessions via the
-    /// portal) and the native GDI path on Windows; `X11` selects the native
-    /// `ximagesrc` backend.
+    /// portal) and the native GDI path on Windows.
     pub fn new(backend: CaptureBackend) -> Result<Self, CaptureError> {
         match backend {
             #[cfg(target_os = "linux")]
@@ -108,8 +60,6 @@ impl CaptureEngine {
             CaptureBackend::Auto | CaptureBackend::Portal => {
                 Ok(CaptureEngine::Windows(WindowsCapture::default()))
             }
-            #[cfg(target_os = "linux")]
-            CaptureBackend::X11 => Ok(CaptureEngine::X11(X11Capture::default())),
             #[cfg(windows)]
             CaptureBackend::Windows => Ok(CaptureEngine::Windows(WindowsCapture::default())),
             other => Err(CaptureError::Unavailable(format!(
@@ -125,8 +75,6 @@ impl ScreenCapture for CaptureEngine {
         match self {
             #[cfg(target_os = "linux")]
             Self::Wayland(w) => w.list_sources(),
-            #[cfg(target_os = "linux")]
-            Self::X11(x) => x.list_sources(),
             #[cfg(windows)]
             Self::Windows(w) => w.list_sources(),
         }
@@ -141,8 +89,6 @@ impl ScreenCapture for CaptureEngine {
         match self {
             #[cfg(target_os = "linux")]
             Self::Wayland(w) => w.start(source, options, sink).await,
-            #[cfg(target_os = "linux")]
-            Self::X11(x) => x.start(source, options, sink).await,
             #[cfg(windows)]
             Self::Windows(w) => w.start(source, options, sink).await,
         }
@@ -152,8 +98,6 @@ impl ScreenCapture for CaptureEngine {
         match self {
             #[cfg(target_os = "linux")]
             Self::Wayland(w) => w.stop().await,
-            #[cfg(target_os = "linux")]
-            Self::X11(x) => x.stop().await,
             #[cfg(windows)]
             Self::Windows(w) => w.stop().await,
         }
@@ -169,12 +113,6 @@ mod tests {
     fn auto_and_portal_select_wayland() {
         assert!(CaptureEngine::new(CaptureBackend::Auto).is_ok());
         assert!(CaptureEngine::new(CaptureBackend::Portal).is_ok());
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn x11_selects_x11_backend() {
-        assert!(CaptureEngine::new(CaptureBackend::X11).is_ok());
     }
 
     #[cfg(target_os = "linux")]

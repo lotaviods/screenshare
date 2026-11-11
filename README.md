@@ -11,7 +11,7 @@ auth remain.
 
 ## Layout
 
-- `crates/core` — domain model + trait boundaries (no OS/GStreamer deps).
+- `crates/core` — domain model + trait boundaries (no OS/FFmpeg deps).
 - `crates/config` — configuration + persistent preferences + validation.
 - `crates/capture` — screen capture backends.
 - `crates/audio` — microphone + system loopback capture.
@@ -40,10 +40,10 @@ make build    # release build
 
 `make help` lists all targets.
 
-Linux needs the GPUI and GStreamer system dependencies: a Vulkan driver,
+Linux needs the GPUI and FFmpeg system dependencies: a Vulkan driver,
 Wayland or X11 client libraries, `xkbcommon`, `fontconfig`, `clang`, `cmake`,
-and GStreamer 1.22+ with the base, good, bad, and ugly plugin sets.
-On Arch: `pacman -S vulkan-icd-loader wayland libxkbcommon fontconfig clang cmake gstreamer gst-plugins-{base,good,bad,ugly}`.
+and FFmpeg with the VAAPI, libvpx, and libopus encoders.
+On Arch: `pacman -S vulkan-icd-loader wayland libxkbcommon fontconfig clang cmake ffmpeg`.
 
 ### Windows
 

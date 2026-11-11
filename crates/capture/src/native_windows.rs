@@ -92,6 +92,7 @@ fn run(
                 height: h,
                 fps,
                 bitrate_kbps,
+                codec: Codec::H264,
             };
             match H264Encoder::new(config) {
                 Ok(created) => encoder = Some(created),

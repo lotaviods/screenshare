@@ -75,8 +75,6 @@ pub enum CaptureBackend {
     Auto,
     /// XDG Desktop Portal + PipeWire (Wayland and X11 portal).
     Portal,
-    /// Native X11 capture.
-    X11,
     /// Windows.Graphics.Capture / DXGI.
     Windows,
 }

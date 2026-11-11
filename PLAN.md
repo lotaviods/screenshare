@@ -18,22 +18,19 @@ spec against the current code. Checkboxes are off until implemented.
 
 ### `crates/capture` — screen capture
 - [x] Linux Wayland: XDG Desktop Portal `ScreenCast` via `ashpd`, PipeWire via
-      GStreamer `pipewiresrc`, encode (`x264enc`/`vp8enc`/`vp9enc`),
-      appsink → `EncodedSample`.
-- [x] Native GPU path (`crates/native-media`, `SHARESCREEN_MEDIA=native`):
-      portal → PipeWire DMA-BUF → VAAPI surface import → `scale_vaapi` RGB→NV12
-      → `h264_vaapi`. Zero CPU copies, validated on Hyprland + AMD (2560x1440).
-      GStreamer stays the default until A/B passes; the native path has no JPEG
-      self-view yet and is H.264 only.
-- [x] Remove GStreamer from `crates/media` and `crates/call`: native RTP
-      depacketization, FFmpeg decode, JPEG encode, and native audio playback.
-      `crates/capture` still uses GStreamer on Linux for the preview and X11
-      path; Windows capture is native.
+      `crates/native-media`, FFmpeg encode (`h264_vaapi`/`vp8_vaapi`/`vp9_vaapi`),
+      `EncodedSample` → `webrtc`.
+- [x] Native GPU path: portal → PipeWire DMA-BUF → VAAPI surface import →
+      `scale_vaapi` RGB→NV12 → `h264_vaapi`/`vp8_vaapi`/`vp9_vaapi`. Zero CPU
+      copies, validated on Hyprland + AMD (2560x1440). No JPEG self-view yet.
+- [x] Remove GStreamer from `crates/media`, `crates/call`, and `crates/capture`:
+      native RTP depacketization, FFmpeg decode, JPEG encode, and native audio
+      playback. Windows capture is native too.
 - [x] Hardware-encoder auto-detection (VAAPI/NVENC/QSV candidates → software
       fallback). Untested against real HW (none installed here).
-- [x] Linux X11: native `ximagesrc` backend (whole-screen + `xid:` window).
-- [ ] X11 per-monitor/per-window enumeration (needs XCB) — source list is
-      whole-screen only; the portal path already offers a picker on X11.
+- [x] Linux X11: the portal path covers X11 sessions; no separate X11 backend.
+- [ ] Per-monitor/per-window enumeration (needs XCB) — the portal path offers a
+      picker on both Wayland and X11.
 - [x] Windows: native GDI capture — `BitBlt` for monitors/desktop,
       `PrintWindow` for windows, monitor enumeration via `EnumDisplayMonitors`,
       window list via `EnumWindows`. Frames encode through FFmpeg H.264. No
@@ -177,7 +174,7 @@ spec against the current code. Checkboxes are off until implemented.
       offer/answer/ICE, H.264 frames reach the viewer (call crate).
 - [x] WebRTC audio receives packets after a 2 s mute-like pause (loopback test).
 - [ ] Device enumeration (list mic/output/monitor on each platform).
-- [x] Capture start/stop + resource-cleanup test (GStreamer stream joins on stop).
+- [x] Capture start/stop + resource-cleanup test (native capture thread joins on stop).
 - [ ] Reconnection test.
 - [ ] Manual matrix (Hyprland/KDE/GNOME/Sway/X11/Win10/Win11; mic-only,
       screen-only, screen+system-audio, mic+system-audio).
@@ -222,9 +219,9 @@ spec against the current code. Checkboxes are off until implemented.
    - Alternative if this becomes a bottleneck: a native video surface, which
      removes the JPEG step.
 
-2. **Encoding**: Linux Wayland uses GStreamer by default and the native
-   VAAPI path as an opt-in. Windows uses native GDI + FFmpeg H.264. The
-   PipeWire + encoder path is proven on Hyprland + AMD; Windows is not yet.
+2. **Encoding**: Linux Wayland uses the native VAAPI path. Windows uses native
+   GDI + FFmpeg H.264. The PipeWire + encoder path is proven on Hyprland + AMD;
+   Windows is not yet.
 
 3. **SFU** is a stub in the mesh-first design; keep signaling/media decoupled so
    `str0m`/`rheomesh`/LiveKit can replace the mesh without touching capture/audio.
@@ -236,7 +233,7 @@ spec against the current code. Checkboxes are off until implemented.
 
 ## Suggested build order
 
-1. `capture` — Linux Wayland (portal + PipeWire + GStreamer); prove encoder path.
+1. `capture` — Linux Wayland (portal + PipeWire + native FFmpeg); prove encoder path.
 2. `audio` — mic + system loopback (Linux first).
 3. `webrtc` — mesh peer connections + track wiring + renegotiation.
 4. `signaling` client + `server` (axum).

@@ -12,6 +12,8 @@ pub use ffmpeg::FfmpegEncoder;
 #[cfg(windows)]
 pub use windows::H264Encoder;
 
+use sharescreen_core::Codec;
+
 use crate::frame::Frame;
 
 #[derive(Debug, thiserror::Error)]
@@ -48,6 +50,7 @@ pub struct EncoderConfig {
     pub height: u32,
     pub fps: u32,
     pub bitrate_kbps: u32,
+    pub codec: Codec,
 }
 
 /// Encode captured frames. Implementations run on a dedicated thread.
