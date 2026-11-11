@@ -100,7 +100,7 @@ impl VideoDecoder {
                         width as i32,
                         height as i32,
                         ffi::AVPixelFormat::AV_PIX_FMT_RGB24,
-                        ffi::SwsFlags::SWS_BILINEAR as i32,
+                        ffi::SWS_BILINEAR,
                         ptr::null_mut(),
                         ptr::null_mut(),
                         ptr::null_mut(),
