@@ -3,13 +3,16 @@
 pub mod audio;
 #[cfg(target_os = "linux")]
 pub mod ffmpeg;
+#[cfg(windows)]
+pub mod windows;
 
 pub use audio::OpusEncoder;
 #[cfg(target_os = "linux")]
 pub use ffmpeg::FfmpegEncoder;
+#[cfg(windows)]
+pub use windows::H264Encoder;
 
-#[cfg(target_os = "linux")]
-use crate::frame::DmaBufFrame;
+use crate::frame::Frame;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EncodeError {
@@ -31,15 +34,14 @@ pub struct EncodedFrame {
     pub duration_micros: u64,
 }
 
-#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
+    #[cfg(target_os = "linux")]
     Vaapi,
     Nvenc,
     Software,
 }
 
-#[cfg(target_os = "linux")]
 #[derive(Debug, Clone)]
 pub struct EncoderConfig {
     pub width: u32,
@@ -49,12 +51,11 @@ pub struct EncoderConfig {
 }
 
 /// Encode captured frames. Implementations run on a dedicated thread.
-#[cfg(target_os = "linux")]
 pub trait VideoEncoder: Send {
     fn backend(&self) -> Backend;
     fn encode(
         &mut self,
-        frame: &DmaBufFrame,
+        frame: &Frame,
         force_keyframe: bool,
     ) -> Result<Vec<EncodedFrame>, EncodeError>;
     fn request_keyframe(&mut self);

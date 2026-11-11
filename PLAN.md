@@ -26,17 +26,17 @@ spec against the current code. Checkboxes are off until implemented.
       GStreamer stays the default until A/B passes; the native path has no JPEG
       self-view yet and is H.264 only.
 - [ ] Remove GStreamer: native decode for remote frames and the preview branch
-      are still GStreamer-only. The audio crate no longer uses GStreamer.
+      are still GStreamer-only. The audio crate and Windows capture no longer
+      use GStreamer.
 - [x] Hardware-encoder auto-detection (VAAPI/NVENC/QSV candidates → software
       fallback). Untested against real HW (none installed here).
 - [x] Linux X11: native `ximagesrc` backend (whole-screen + `xid:` window).
 - [ ] X11 per-monitor/per-window enumeration (needs XCB) — source list is
       whole-screen only; the portal path already offers a picker on X11.
-- [x] Windows: `d3d11screencapturesrc` — DXGI monitors and WGC windows,
-      monitor enumeration via `d3d11screencapturedeviceprovider`, window list
-      via `EnumWindows`; `gdiscreencapsrc` fallback for monitors when the
-      d3d11 element is absent. Encoders `mfh264enc`/`openh264enc`.
-      **Untested** — needs a Windows host with GStreamer 1.22+.
+- [x] Windows: native GDI capture — `BitBlt` for monitors/desktop,
+      `PrintWindow` for windows, monitor enumeration via `EnumDisplayMonitors`,
+      window list via `EnumWindows`. Frames encode through FFmpeg H.264. No
+      GStreamer. **Untested** — needs a Windows host.
 - [x] Windows audio: native WASAPI mic capture + process-loopback system audio,
       enumeration via WASAPI endpoints. **Untested** (same reason).
 - [x] Source enumeration — Wayland delegates to the portal picker.
@@ -222,17 +222,16 @@ spec against the current code. Checkboxes are off until implemented.
    - Alternative if this becomes a bottleneck: a native video surface, which
      removes the JPEG step.
 
-2. **Encoding**: GStreamer is the assumed capture+encode layer (HW-accelerated,
-   cross-platform). Confirmed only at the design level; not yet proven on Hyprland
-   or Windows. First capture increment should validate the PipeWire + encoder path
-   end-to-end.
+2. **Encoding**: Linux Wayland uses GStreamer by default and the native
+   VAAPI path as an opt-in. Windows uses native GDI + FFmpeg H.264. The
+   PipeWire + encoder path is proven on Hyprland + AMD; Windows is not yet.
 
 3. **SFU** is a stub in the mesh-first design; keep signaling/media decoupled so
    `str0m`/`rheomesh`/LiveKit can replace the mesh without touching capture/audio.
 
 4. **Windows** requires a Windows host to build/test; Linux-side code must not
    assume it compiles unverified.
-   The Windows installer still needs its matching GStreamer runtime and plugins.
+   The Windows installer needs the FFmpeg DLLs, not GStreamer.
 
 ## Suggested build order
 

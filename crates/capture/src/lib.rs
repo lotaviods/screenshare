@@ -1,15 +1,19 @@
 //! `sharescreen-capture`: screen capture backends.
 //!
 //! Linux uses the XDG Desktop Portal + PipeWire + GStreamer (or native X11 via
-//! `ximagesrc`). Windows uses GStreamer's `gdiscreencapsrc`. Both feed the same
-//! GStreamer encode pipeline, so the `ScreenCapture` trait in
-//! `sharescreen-core` keeps every backend behind one interface.
+//! `ximagesrc`). Windows uses GDI + FFmpeg H.264, with no GStreamer. The
+//! `ScreenCapture` trait in `sharescreen-core` keeps every backend behind one
+//! interface.
 #![cfg(any(target_os = "linux", windows))]
 
+#[cfg(target_os = "linux")]
 mod gst;
 
 #[cfg(target_os = "linux")]
 mod native;
+
+#[cfg(windows)]
+mod native_windows;
 
 #[cfg(target_os = "linux")]
 mod wayland;
@@ -36,21 +40,8 @@ pub const REQUIRED_ELEMENTS: &[&str] = &[
     "avdec_h264",
 ];
 
-#[cfg(windows)]
-pub const REQUIRED_ELEMENTS: &[&str] = &[
-    "wasapi2src",
-    "videoconvert",
-    "videoscale",
-    "videorate",
-    "jpegenc",
-    "opusenc",
-    "opusdec",
-    "rtph264depay",
-    "h264parse",
-    "avdec_h264",
-];
-
 /// Required GStreamer elements that are not installed.
+#[cfg(target_os = "linux")]
 pub fn missing_elements() -> Vec<&'static str> {
     gst::ensure_gst_init();
     REQUIRED_ELEMENTS
@@ -58,6 +49,12 @@ pub fn missing_elements() -> Vec<&'static str> {
         .copied()
         .filter(|name| !gst::element_exists(name))
         .collect()
+}
+
+/// The Windows path does not use GStreamer.
+#[cfg(not(target_os = "linux"))]
+pub fn missing_elements() -> Vec<&'static str> {
+    Vec::new()
 }
 
 #[cfg(target_os = "linux")]
@@ -99,7 +96,7 @@ impl CaptureEngine {
 
     /// Build the engine for the requested backend. `Auto` and `Portal` select
     /// the desktop-portal path on Linux (which also covers X11 sessions via the
-    /// portal) and `gdiscreencapsrc` on Windows; `X11` selects the native
+    /// portal) and the native GDI path on Windows; `X11` selects the native
     /// `ximagesrc` backend.
     pub fn new(backend: CaptureBackend) -> Result<Self, CaptureError> {
         match backend {

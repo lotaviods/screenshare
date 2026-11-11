@@ -27,9 +27,9 @@ real-time media.
 │              ┌───────────────────────────┼───────────────────────────┐         │
 │              ▼                           ▼                           ▼         │
 │        capture crate               audio crate                webrtc crate     │
-│   (portal/PipeWire, X11, WGC)  (mic + system loopback)   (peer connections)    │
+│   (portal/PipeWire, X11, GDI)  (mic + system loopback)   (peer connections)    │
 │              │                           │                           │         │
-│              └───────────────►  GStreamer encode  ◄──────────────────┘         │
+│              └───────────────►  native encode   ◄──────────────────┘         │
 │                                          │                                     │
 │                                    signaling crate                             │
 │                              (WebSocket client to server)                      │
@@ -94,11 +94,14 @@ X11 uses a separate backend (XCB + GStreamer `ximagesrc`, or `x11grab`).
 
 ### Windows capture
 
-- `Windows.Graphics.Capture` (WGC) for screen/window capture (Win10 1803+).
-- Desktop Duplication API (DXGI) as a fallback where WGC is unsuitable.
+- GDI capture: `BitBlt` for monitors and the whole desktop, `PrintWindow` for
+  windows. Monitor enumeration via `EnumDisplayMonitors`, window list via
+  `EnumWindows`.
+- Frames are copied to a BGRA DIB and encoded by FFmpeg's H.264 encoder. No
+  GStreamer is involved.
+- WGC/DXGI and hardware Media Foundation encode are future upgrades; the GDI
+  path is the first native Windows implementation.
 - WASAPI for microphone capture; WASAPI loopback for system audio.
-- Hardware encode via Media Foundation / DXVA, or GStreamer with `d3d11h264enc`
-  / `nvh264enc`.
 
 The `ScreenCapture` / `AudioCapture` traits hide all of this behind one
 interface per platform; nothing platform-specific leaks into `core`, `webrtc`,
@@ -176,7 +179,7 @@ Capture → encode → sample queue → WebRTC track. No raw frames cross the UI
 boundary; only decoded JPEG frames for display.
 
 ```
-portal/pipewire (or WGC/DXGI, X11)  ──►  GStreamer encoder  ──►  appsink
+portal/pipewire (Linux), GDI (Windows), X11  ──►  native encoder  ──►  appsink
                                                                    │ EncodedSample
                                                                    ▼
                                                         mpsc channel (bounded)
@@ -235,7 +238,7 @@ simultaneous mic+system-audio calls.
 1. Architecture doc + workspace scaffold (this increment).
 2. `core` domain model + traits, `config` persistence + validation.
 3. Linux Wayland capture (portal + PipeWire + GStreamer).
-4. Windows capture (WGC/DXGI).
+4. Windows capture (GDI + FFmpeg).
 5. Microphone + system audio capture.
 6. WebRTC media transport (mesh).
 7. Signaling server + client.

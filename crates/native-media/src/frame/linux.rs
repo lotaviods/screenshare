@@ -105,6 +105,9 @@ impl DmaBufFrame {
     }
 }
 
+/// The frame type used by the platform encoder.
+pub type Frame = DmaBufFrame;
+
 #[cfg(test)]
 mod tests {
     use super::*;

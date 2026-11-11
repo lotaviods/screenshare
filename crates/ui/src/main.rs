@@ -24,14 +24,17 @@ fn main() {
         .with_target(true)
         .try_init();
 
-    let missing = sharescreen_capture::missing_elements();
-    if missing.is_empty() {
-        tracing::info!("GStreamer runtime complete");
-    } else {
-        tracing::error!(
-            "GStreamer is missing required elements, capture/audio/decode will fail: {}",
-            missing.join(", ")
-        );
+    #[cfg(target_os = "linux")]
+    {
+        let missing = sharescreen_capture::missing_elements();
+        if missing.is_empty() {
+            tracing::info!("GStreamer runtime complete");
+        } else {
+            tracing::error!(
+                "GStreamer is missing required elements, capture/audio/decode will fail: {}",
+                missing.join(", ")
+            );
+        }
     }
 
     let store = ConfigStore::load_or_default().unwrap_or_else(|error| {

@@ -11,8 +11,8 @@ use std::ptr;
 
 use ffmpeg_sys_next as ffi;
 
-use super::{Backend, EncodeError, EncoderConfig, EncodedFrame, VideoEncoder};
-use crate::frame::{DmaBufFrame, DrmFormat};
+use super::{Backend, EncodeError, EncodedFrame, EncoderConfig, VideoEncoder};
+use crate::frame::{DrmFormat, Frame};
 
 const AV_HWFRAME_MAP_READ: i32 = 1;
 
@@ -345,7 +345,7 @@ impl FfmpegEncoder {
     unsafe fn import_drm(
         &self,
         frames: *mut ffi::AVBufferRef,
-        frame: &DmaBufFrame,
+        frame: &Frame,
     ) -> Result<*mut ffi::AVFrame, EncodeError> {
         if frame.width != self.config.width || frame.height != self.config.height {
             return Err(EncodeError::Ffmpeg(format!(
@@ -367,7 +367,9 @@ impl FfmpegEncoder {
         let desc_size = std::mem::size_of::<ffi::AVDRMFrameDescriptor>();
         let desc_ptr = ffi::av_mallocz(desc_size) as *mut ffi::AVDRMFrameDescriptor;
         if desc_ptr.is_null() {
-            return Err(EncodeError::Ffmpeg("av_mallocz(drm descriptor) failed".into()));
+            return Err(EncodeError::Ffmpeg(
+                "av_mallocz(drm descriptor) failed".into(),
+            ));
         }
         let desc = &mut *desc_ptr;
         desc.nb_objects = frame.objects.len() as i32;
@@ -452,7 +454,7 @@ impl FfmpegEncoder {
     /// Run RGB through VAAPI VPP so the encoder gets NV12 surfaces.
     fn encode_rgb(
         &mut self,
-        frame: &DmaBufFrame,
+        frame: &Frame,
         format: DrmFormat,
         force_keyframe: bool,
     ) -> Result<Vec<EncodedFrame>, EncodeError> {
@@ -461,9 +463,7 @@ impl FfmpegEncoder {
         };
 
         if self.converter.as_ref().map(|c| c.sw_format) != Some(sw_format as i32) {
-            self.converter = Some(unsafe {
-                Converter::new(self.device, &self.config, sw_format)?
-            });
+            self.converter = Some(unsafe { Converter::new(self.device, &self.config, sw_format)? });
         }
         let converter = self.converter.as_ref().expect("converter created above");
         let (src, sink, input_frames) = (converter.src, converter.sink, converter.input_frames);
@@ -495,7 +495,7 @@ impl FfmpegEncoder {
 
     fn encode_nv12(
         &mut self,
-        frame: &DmaBufFrame,
+        frame: &Frame,
         force_keyframe: bool,
     ) -> Result<Vec<EncodedFrame>, EncodeError> {
         if !frame.is_nv12() {
@@ -517,7 +517,10 @@ impl FfmpegEncoder {
         self.receive(frame)
     }
 
-    unsafe fn receive(&mut self, frame: *mut ffi::AVFrame) -> Result<Vec<EncodedFrame>, EncodeError> {
+    unsafe fn receive(
+        &mut self,
+        frame: *mut ffi::AVFrame,
+    ) -> Result<Vec<EncodedFrame>, EncodeError> {
         let ret = ffi::avcodec_send_frame(self.ctx, frame);
         ffi::av_frame_free(&mut { frame });
         if ret < 0 {
@@ -563,7 +566,7 @@ impl VideoEncoder for FfmpegEncoder {
 
     fn encode(
         &mut self,
-        frame: &DmaBufFrame,
+        frame: &Frame,
         force_keyframe: bool,
     ) -> Result<Vec<EncodedFrame>, EncodeError> {
         match frame.format() {

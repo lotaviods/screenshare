@@ -122,7 +122,7 @@ impl Recorder {
                 let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
                 if silent || data.is_null() {
                     self.pending
-                        .extend(std::iter::repeat(0i16).take(frames as usize * 2));
+                        .extend(std::iter::repeat_n(0i16, frames as usize * 2));
                 } else {
                     let samples =
                         std::slice::from_raw_parts(data as *const i16, frames as usize * 2);
