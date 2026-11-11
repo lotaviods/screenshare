@@ -13,9 +13,10 @@ $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
 $dist = Join-Path $repo "dist"
 $stage = Join-Path $dist "sharescreen-windows"
-$ffmpegDir = Join-Path $env:TEMP "ffmpeg-win64-shared"
-$ffmpegZip = Join-Path $env:TEMP "ffmpeg-win64-shared.zip"
-$ffmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl-shared.zip"
+$ffmpegVersion = "autobuild-2026-11-11-12-39"
+$ffmpegDir = Join-Path $env:TEMP "ffmpeg-win64-shared-$ffmpegVersion"
+$ffmpegZip = Join-Path $env:TEMP "ffmpeg-win64-shared-$ffmpegVersion.zip"
+$ffmpegUrl = "https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/$ffmpegVersion/ffmpeg-N-128790-g9bee1e603c-win64-lgpl-shared.zip"
 
 if (-not (Test-Path $ffmpegDir)) {
     Write-Host "Downloading FFmpeg shared build..."

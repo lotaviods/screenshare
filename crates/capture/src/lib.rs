@@ -1,8 +1,9 @@
 //! `sharescreen-capture`: screen capture backends.
 //!
 //! Linux uses the XDG Desktop Portal + PipeWire + native FFmpeg encode. Windows
-//! uses GDI + FFmpeg H.264. Neither path uses GStreamer. The `ScreenCapture`
-//! trait in `sharescreen-core` keeps every backend behind one interface.
+//! uses GDI + FFmpeg H.264/VP8/VP9. Neither path uses GStreamer. The
+//! `ScreenCapture` trait in `sharescreen-core` keeps every backend behind one
+//! interface.
 #![cfg(any(target_os = "linux", windows))]
 
 #[cfg(target_os = "linux")]
@@ -53,7 +54,7 @@ impl CaptureEngine {
     pub fn new(backend: CaptureBackend) -> Result<Self, CaptureError> {
         match backend {
             #[cfg(target_os = "linux")]
-            CaptureBackend::Auto | CaptureBackend::Portal => {
+            CaptureBackend::Auto | CaptureBackend::Portal | CaptureBackend::X11 => {
                 Ok(CaptureEngine::Wayland(WaylandCapture::default()))
             }
             #[cfg(windows)]
@@ -113,6 +114,12 @@ mod tests {
     fn auto_and_portal_select_wayland() {
         assert!(CaptureEngine::new(CaptureBackend::Auto).is_ok());
         assert!(CaptureEngine::new(CaptureBackend::Portal).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn x11_selects_portal() {
+        assert!(CaptureEngine::new(CaptureBackend::X11).is_ok());
     }
 
     #[cfg(target_os = "linux")]

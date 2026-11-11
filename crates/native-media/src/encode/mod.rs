@@ -10,7 +10,7 @@ pub use audio::OpusEncoder;
 #[cfg(target_os = "linux")]
 pub use ffmpeg::FfmpegEncoder;
 #[cfg(windows)]
-pub use windows::H264Encoder;
+pub use windows::FfmpegEncoder;
 
 use sharescreen_core::Codec;
 

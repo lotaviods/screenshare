@@ -263,6 +263,9 @@ pub struct FfmpegEncoder {
     converter: Option<Converter>,
     config: EncoderConfig,
     force_keyframe: bool,
+    preview_sws: *mut ffi::SwsContext,
+    preview_sw_format: ffi::AVPixelFormat,
+    jpeg: Option<crate::decode::JpegEncoder>,
 }
 
 unsafe impl Send for FfmpegEncoder {}
@@ -367,6 +370,9 @@ impl FfmpegEncoder {
             converter: None,
             config,
             force_keyframe: true,
+            preview_sws: ptr::null_mut(),
+            preview_sw_format: ffi::AVPixelFormat::AV_PIX_FMT_NONE,
+            jpeg: Some(crate::decode::JpegEncoder::new().map_err(EncodeError::Ffmpeg)?),
         })
     }
 
@@ -534,6 +540,110 @@ impl FfmpegEncoder {
         unsafe { self.receive_with_keyframe(hw, force_keyframe) }
     }
 
+    /// Encode one frame as a JPEG preview for the local self-view.
+    pub fn preview(&mut self, frame: &Frame) -> Result<Vec<u8>, EncodeError> {
+        let format = frame.format().ok_or(EncodeError::UnsupportedFormat(None))?;
+        let (sw_format, input_frames) = if format.is_nv12() {
+            (ffi::AVPixelFormat::AV_PIX_FMT_NV12, self.frames)
+        } else {
+            let sw = vaapi_sw_format(format).ok_or(EncodeError::UnsupportedFormat(Some(format)))?;
+            if self.converter.as_ref().map(|c| c.sw_format) != Some(sw as i32) {
+                self.converter = Some(unsafe { Converter::new(self.device, &self.config, sw)? });
+            }
+            (
+                sw,
+                self.converter
+                    .as_ref()
+                    .expect("converter created above")
+                    .input_frames,
+            )
+        };
+
+        unsafe {
+            let hw = self.import_drm(input_frames, frame)?;
+            let mut cpu = ffi::av_frame_alloc();
+            if cpu.is_null() {
+                ffi::av_frame_free(&mut { hw });
+                return Err(EncodeError::Ffmpeg("av_frame_alloc failed".into()));
+            }
+            let ret = ffi::av_hwframe_transfer_data(cpu, hw, 0);
+            ffi::av_frame_free(&mut { hw });
+            if ret < 0 {
+                ffi::av_frame_free(&mut cpu);
+                return Err(EncodeError::Ffmpeg(format!(
+                    "av_hwframe_transfer_data failed: {ret}"
+                )));
+            }
+
+            if self.preview_sws.is_null() || self.preview_sw_format != sw_format {
+                if !self.preview_sws.is_null() {
+                    ffi::sws_freeContext(self.preview_sws);
+                }
+                self.preview_sws = ffi::sws_getContext(
+                    self.config.width as i32,
+                    self.config.height as i32,
+                    sw_format,
+                    self.config.width as i32,
+                    self.config.height as i32,
+                    ffi::AVPixelFormat::AV_PIX_FMT_RGB24,
+                    ffi::SwsFlags::SWS_BILINEAR as i32,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                );
+                if self.preview_sws.is_null() {
+                    ffi::av_frame_free(&mut cpu);
+                    return Err(EncodeError::Ffmpeg(
+                        "sws_getContext(preview) failed".into(),
+                    ));
+                }
+                self.preview_sw_format = sw_format;
+            }
+
+            let mut rgb = vec![0u8; self.config.width as usize * self.config.height as usize * 3];
+            let src_data = [
+                (*cpu).data[0],
+                (*cpu).data[1],
+                (*cpu).data[2],
+                (*cpu).data[3],
+            ];
+            let src_stride = [
+                (*cpu).linesize[0],
+                (*cpu).linesize[1],
+                (*cpu).linesize[2],
+                (*cpu).linesize[3],
+            ];
+            let dst_data = [
+                rgb.as_mut_ptr(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            ];
+            let dst_stride = [self.config.width as i32 * 3, 0, 0, 0];
+            let ret = ffi::sws_scale(
+                self.preview_sws,
+                src_data.as_ptr() as *const *const u8,
+                src_stride.as_ptr(),
+                0,
+                self.config.height as i32,
+                dst_data.as_ptr(),
+                dst_stride.as_ptr(),
+            );
+            ffi::av_frame_free(&mut cpu);
+            if ret < 0 {
+                return Err(EncodeError::Ffmpeg(format!(
+                    "sws_scale(preview) failed: {ret}"
+                )));
+            }
+            let jpeg = self
+                .jpeg
+                .as_mut()
+                .ok_or_else(|| EncodeError::Ffmpeg("no JPEG encoder".into()))?;
+            jpeg.encode(&rgb, self.config.width, self.config.height)
+                .map_err(EncodeError::Ffmpeg)
+        }
+    }
+
     unsafe fn receive_with_keyframe(
         &mut self,
         frame: *mut ffi::AVFrame,
@@ -622,6 +732,10 @@ impl VideoEncoder for FfmpegEncoder {
 impl Drop for FfmpegEncoder {
     fn drop(&mut self) {
         unsafe {
+            if !self.preview_sws.is_null() {
+                ffi::sws_freeContext(self.preview_sws);
+            }
+            self.jpeg = None;
             self.converter = None;
             ffi::avcodec_free_context(&mut self.ctx);
             ffi::av_buffer_unref(&mut self.frames);

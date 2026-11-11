@@ -1,14 +1,12 @@
-//! Native GPU capture: PipeWire DMA-BUF straight into VAAPI H.264.
+//! Native GPU capture: PipeWire DMA-BUF straight into VAAPI H.264/VP8/VP9.
 //!
 //! Frames never touch the CPU: the compositor exports DMA-BUFs, VAAPI imports
 //! them, `scale_vaapi` converts RGB to NV12 on the GPU when needed, and
-//! `h264_vaapi` encodes.
-//!
-//! `shortcut: no JPEG self-view on this path yet; add one before it is needed.`
+//! `h264_vaapi`/`vp8_vaapi`/`vp9_vaapi` encodes.
 
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use sharescreen_core::{CaptureError, CaptureOptions, Codec, EncodedSample, MediaKind};
@@ -25,6 +23,7 @@ pub fn available(codec: Codec) -> bool {
 pub struct Stream {
     running: Arc<AtomicUsize>,
     thread: JoinHandle<()>,
+    preview: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 impl Stream {
@@ -33,9 +32,9 @@ impl Stream {
         let _ = self.thread.join();
     }
 
-    /// No preview on the native path yet; the UI falls back to no self-view.
+    /// Latest JPEG self-view frame of the running capture.
     pub fn latest_preview(&self) -> Option<Vec<u8>> {
-        None
+        self.preview.lock().unwrap().clone()
     }
 }
 
@@ -50,6 +49,9 @@ pub fn spawn(
     let codec = options.codec;
     let running = Arc::new(AtomicUsize::new(1));
     let flag = running.clone();
+    let preview = Arc::new(Mutex::new(None));
+    let preview_sink = preview.clone();
+    let preview_every = fps.max(10) / 10;
 
     let thread = std::thread::Builder::new()
         .name("sharescreen-native".into())
@@ -58,6 +60,7 @@ pub fn spawn(
             let _keep_alive = fd;
             let mut encoder: Option<FfmpegEncoder> = None;
             let mut failed = false;
+            let mut frame_count = 0u64;
 
             let result = pipewire::run(raw, node_id, Memory::DmaBuf, None, flag, move |frame| {
                 if failed || frame.format().is_none() {
@@ -98,6 +101,12 @@ pub fn spawn(
                                 return;
                             }
                         }
+                        if frame_count.is_multiple_of(preview_every as u64) {
+                            if let Ok(jpeg) = encoder.preview(&frame) {
+                                *preview_sink.lock().unwrap() = Some(jpeg);
+                            }
+                        }
+                        frame_count = frame_count.wrapping_add(1);
                     }
                     Err(err) => {
                         tracing::warn!("native encode failed: {err}");
@@ -112,5 +121,9 @@ pub fn spawn(
         })
         .map_err(|e| CaptureError::Failed(format!("failed to spawn native capture thread: {e}")))?;
 
-    Ok(Stream { running, thread })
+    Ok(Stream {
+        running,
+        thread,
+        preview,
+    })
 }

@@ -89,8 +89,8 @@ the result and surfaces `PermissionDenied` if the user declines.
 - GDI capture: `BitBlt` for monitors and the whole desktop, `PrintWindow` for
   windows. Monitor enumeration via `EnumDisplayMonitors`, window list via
   `EnumWindows`.
-- Frames are copied to a BGRA DIB and encoded by FFmpeg's H.264 encoder. No
-  GStreamer is involved.
+- Frames are copied to a BGRA DIB and encoded by FFmpeg's H.264/VP8/VP9
+  encoder. No GStreamer is involved.
 - WGC/DXGI and hardware Media Foundation encode are future upgrades; the GDI
   path is the first native Windows implementation.
 - WASAPI for microphone capture; WASAPI loopback for system audio.

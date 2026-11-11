@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
+use sharescreen_core::CaptureBackend;
 use tracing::{info, warn};
 
 use crate::error::Result;
@@ -36,7 +37,12 @@ impl ConfigStore {
     pub fn load_from_path(path: PathBuf) -> Result<Self> {
         if path.exists() {
             let text = std::fs::read_to_string(&path)?;
-            let config: Config = toml::from_str(&text)?;
+            let mut config: Config = toml::from_str(&text)?;
+            // The removed X11 backend is now a portal alias; rewrite old configs
+            // so the next save does not keep the deprecated value.
+            if config.capture.backend == CaptureBackend::X11 {
+                config.capture.backend = CaptureBackend::Portal;
+            }
             config.validate()?;
             info!(path = %path.display(), "loaded configuration");
             Ok(Self { path, config })
@@ -120,6 +126,15 @@ mod tests {
             reloaded.config().state.last_room.as_deref(),
             Some("persisted-room")
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn x11_backend_migrates_to_portal() {
+        let path = temp_path("x11");
+        std::fs::write(&path, "[capture]\nbackend = \"x11\"\n").unwrap();
+        let store = ConfigStore::load_from_path(path.clone()).unwrap();
+        assert_eq!(store.config().capture.backend, CaptureBackend::Portal);
         let _ = std::fs::remove_file(&path);
     }
 

@@ -1,27 +1,29 @@
-//! Native Windows capture: GDI desktop/window capture -> H.264.
+//! Native Windows capture: GDI desktop/window capture -> FFmpeg.
 //!
 //! Uses `BitBlt` for monitors and `PrintWindow` for windows. Frames are copied
-//! to a BGRA DIB and encoded by FFmpeg's H.264 encoder. No GStreamer is involved.
+//! to a BGRA DIB and encoded by FFmpeg's H.264/VP8/VP9 encoder. No GStreamer is
+//! involved.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use sharescreen_core::{
     CaptureError, CaptureOptions, CaptureSource, Codec, EncodedSample, MediaKind, SourceKind,
 };
-use sharescreen_native_media::encode::{EncoderConfig, H264Encoder, VideoEncoder};
+use sharescreen_native_media::encode::{EncoderConfig, FfmpegEncoder, VideoEncoder};
 
 /// Whether the native path can encode this request.
 pub fn available(codec: Codec) -> bool {
-    codec == Codec::H264 && H264Encoder::available()
+    matches!(codec, Codec::H264 | Codec::Vp8 | Codec::Vp9) && FfmpegEncoder::available(codec)
 }
 
 /// A running native capture: a GDI thread pushing encoded samples.
 pub struct Stream {
     running: Arc<AtomicBool>,
     thread: JoinHandle<()>,
+    preview: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 impl Stream {
@@ -30,9 +32,9 @@ impl Stream {
         let _ = self.thread.join();
     }
 
-    /// No JPEG preview on this path yet; the UI falls back to the decoded frame.
+    /// Latest JPEG self-view frame of the running capture.
     pub fn latest_preview(&self) -> Option<Vec<u8>> {
-        None
+        self.preview.lock().unwrap().clone()
     }
 }
 
@@ -44,15 +46,22 @@ pub fn spawn(
     let options = options.clone();
     let running = Arc::new(AtomicBool::new(true));
     let flag = running.clone();
+    let preview = Arc::new(Mutex::new(None));
+    let preview_sink = preview.clone();
+    let preview_every = options.fps.max(10) / 10;
 
     let thread = std::thread::Builder::new()
         .name("sharescreen-native-windows".into())
         .spawn(move || {
-            run(source, options, flag, sink);
+            run(source, options, flag, sink, preview_sink, preview_every);
         })
         .map_err(|e| CaptureError::Failed(format!("failed to spawn native capture thread: {e}")))?;
 
-    Ok(Stream { running, thread })
+    Ok(Stream {
+        running,
+        thread,
+        preview,
+    })
 }
 
 fn run(
@@ -60,6 +69,8 @@ fn run(
     options: CaptureOptions,
     running: Arc<AtomicBool>,
     sink: tokio::sync::mpsc::Sender<EncodedSample>,
+    preview_sink: Arc<Mutex<Option<Vec<u8>>>>,
+    preview_every: u32,
 ) {
     let fps = options.fps.max(1);
     let bitrate_kbps = options.bitrate_kbps.max(1000);
@@ -73,10 +84,11 @@ fn run(
             return;
         }
     };
-    let mut encoder: Option<H264Encoder> = None;
+    let mut encoder: Option<FfmpegEncoder> = None;
     let frame_duration = Duration::from_secs_f64(1.0 / fps as f64);
     let mut next = Instant::now();
     let mut index: u64 = 0;
+    let mut frame_count: u64 = 0;
 
     while running.load(Ordering::SeqCst) {
         let Some(frame) = target.capture(cursor, index, fps) else {
@@ -92,9 +104,9 @@ fn run(
                 height: h,
                 fps,
                 bitrate_kbps,
-                codec: Codec::H264,
+                codec: options.codec,
             };
-            match H264Encoder::new(config) {
+            match FfmpegEncoder::new(config) {
                 Ok(created) => encoder = Some(created),
                 Err(err) => {
                     tracing::error!("native Windows encoder unavailable: {err}");
@@ -110,7 +122,7 @@ fn run(
                 for frame in frames {
                     let sample = EncodedSample {
                         kind: MediaKind::Video,
-                        codec: Codec::H264,
+                        codec: options.codec,
                         data: frame.data,
                         timestamp_micros: frame.pts_micros,
                         duration_micros: frame.duration_micros,
@@ -120,6 +132,12 @@ fn run(
                         return;
                     }
                 }
+                if frame_count.is_multiple_of(preview_every as u64) {
+                    if let Ok(jpeg) = encoder.preview(&frame) {
+                        *preview_sink.lock().unwrap() = Some(jpeg);
+                    }
+                }
+                frame_count = frame_count.wrapping_add(1);
             }
             Err(err) => {
                 tracing::warn!("native Windows encode failed: {err}");

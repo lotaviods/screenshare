@@ -8,7 +8,8 @@
 //! crate uses this path exclusively on Linux.
 //!
 //! The Opus encoder is also used on Windows by the native audio path. The
-//! Windows capture path uses a raw BGRA frame and a software H.264 encoder.
+//! Windows capture path uses a raw BGRA frame and a software H.264/VP8/VP9
+//! encoder.
 
 #![cfg(any(target_os = "linux", windows))]
 
@@ -19,10 +20,7 @@ pub mod frame;
 #[cfg(target_os = "linux")]
 pub mod capture;
 
-#[cfg(target_os = "linux")]
 pub use encode::FfmpegEncoder;
-#[cfg(windows)]
-pub use encode::H264Encoder;
 pub use encode::{Backend, EncoderConfig, OpusEncoder, VideoEncoder};
 
 pub use frame::Frame;

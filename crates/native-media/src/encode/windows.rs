@@ -1,27 +1,35 @@
-//! FFmpeg-backed H.264 encoder for Windows raw frames.
+//! FFmpeg-backed software encoder for Windows raw frames.
 //!
-//! FFmpeg is used as a codec layer only: libx264 (or the first available
-//! H.264 encoder) converts the BGRA capture frame to YUV420P with `swscale`
-//! and emits Annex-B H.264. No GStreamer is involved.
+//! FFmpeg is used as a codec layer only: libx264/libvpx converts the BGRA
+//! capture frame to YUV420P with `swscale` and emits Annex-B H.264 or VP8/VP9.
+//! No GStreamer is involved.
 
 use std::ffi::CString;
 use std::ptr;
 
 use ffmpeg_sys_next as ffi;
+use sharescreen_core::Codec;
 
 use super::{Backend, EncodeError, EncodedFrame, EncoderConfig, VideoEncoder};
 use crate::frame::Frame;
 
-/// Whether FFmpeg exposes an H.264 encoder.
-pub fn h264_available() -> bool {
-    find_codec().is_some()
+/// Whether FFmpeg exposes an encoder for `codec`.
+pub fn codec_available(codec: Codec) -> bool {
+    find_codec(codec).is_some()
 }
 
-/// Find the first usable H.264 encoder. libx264 is preferred because it
-/// repeats SPS/PPS in-band for RTP; the Media Foundation encoder is a fallback.
-fn find_codec() -> Option<*const ffi::AVCodec> {
-    for name in ["libx264", "h264_mf", "h264"] {
-        let name = CString::new(name).ok()?;
+/// Find the first usable encoder for `codec`. libx264 is preferred for H.264
+/// because it repeats SPS/PPS in-band for RTP; the Media Foundation encoder is
+/// a fallback. libvpx is preferred for VP8/VP9.
+fn find_codec(codec: Codec) -> Option<*const ffi::AVCodec> {
+    let names: &[&str] = match codec {
+        Codec::H264 => &["libx264", "h264_mf", "h264"],
+        Codec::Vp8 => &["libvpx", "libvpx-vp8", "vp8_mf"],
+        Codec::Vp9 => &["libvpx-vp9", "vp9_mf"],
+        _ => return None,
+    };
+    for name in names {
+        let name = CString::new(*name).ok()?;
         let codec = unsafe { ffi::avcodec_find_encoder_by_name(name.as_ptr()) };
         if !codec.is_null() {
             return Some(codec);
@@ -30,8 +38,8 @@ fn find_codec() -> Option<*const ffi::AVCodec> {
     None
 }
 
-/// A software H.264 encoder over BGRA CPU frames.
-pub struct H264Encoder {
+/// A software encoder over BGRA CPU frames.
+pub struct FfmpegEncoder {
     ctx: *mut ffi::AVCodecContext,
     frame: *mut ffi::AVFrame,
     sws: *mut ffi::SwsContext,
@@ -39,22 +47,24 @@ pub struct H264Encoder {
     src_h: u32,
     config: EncoderConfig,
     force_keyframe: bool,
+    jpeg: Option<crate::decode::JpegEncoder>,
 }
 
 // The context is only touched from the owning capture thread.
-unsafe impl Send for H264Encoder {}
+unsafe impl Send for FfmpegEncoder {}
 
-impl H264Encoder {
-    /// Whether FFmpeg exposes an H.264 encoder.
-    pub fn available() -> bool {
-        h264_available()
+impl FfmpegEncoder {
+    /// Whether FFmpeg exposes an encoder for `codec`.
+    pub fn available(codec: Codec) -> bool {
+        codec_available(codec)
     }
 
     pub fn new(config: EncoderConfig) -> Result<Self, EncodeError> {
-        let Some(codec) = find_codec() else {
-            return Err(EncodeError::Unavailable(
-                "no H.264 encoder in FFmpeg".into(),
-            ));
+        let Some(codec) = find_codec(config.codec) else {
+            return Err(EncodeError::Unavailable(format!(
+                "no {:?} encoder in FFmpeg",
+                config.codec
+            )));
         };
         let width = config.width.max(1);
         let height = config.height.max(1);
@@ -82,7 +92,7 @@ impl H264Encoder {
 
             // Repeat SPS/PPS in-band so the RTP payloader can decode without
             // out-of-band extradata.
-            if !(*ctx).priv_data.is_null() {
+            if config.codec == Codec::H264 && !(*ctx).priv_data.is_null() {
                 let key = CString::new("x264-params").unwrap();
                 let value = CString::new("repeat-headers=1").unwrap();
                 let _ = ffi::av_opt_set((*ctx).priv_data, key.as_ptr(), value.as_ptr(), 0);
@@ -92,7 +102,8 @@ impl H264Encoder {
             if ret < 0 {
                 ffi::avcodec_free_context(&mut { ctx });
                 return Err(EncodeError::Ffmpeg(format!(
-                    "avcodec_open2(h264) failed: {ret}"
+                    "avcodec_open2({:?}) failed: {ret}",
+                    config.codec
                 )));
             }
 
@@ -109,9 +120,19 @@ impl H264Encoder {
                 ffi::av_frame_free(&mut { frame });
                 ffi::avcodec_free_context(&mut { ctx });
                 return Err(EncodeError::Ffmpeg(format!(
-                    "h264 frame buffer failed: {ret}"
+                    "{:?} frame buffer failed: {ret}",
+                    config.codec
                 )));
             }
+
+            let jpeg = match crate::decode::JpegEncoder::new() {
+                Ok(jpeg) => Some(jpeg),
+                Err(err) => {
+                    ffi::av_frame_free(&mut { frame });
+                    ffi::avcodec_free_context(&mut { ctx });
+                    return Err(EncodeError::Ffmpeg(err));
+                }
+            };
 
             Ok(Self {
                 ctx,
@@ -121,6 +142,7 @@ impl H264Encoder {
                 src_h: height,
                 config,
                 force_keyframe: false,
+                jpeg,
             })
         }
     }
@@ -219,7 +241,8 @@ impl H264Encoder {
             let ret = ffi::avcodec_send_frame(self.ctx, self.frame);
             if ret < 0 && ret != ffi::AVERROR(ffi::EAGAIN) {
                 return Err(EncodeError::Ffmpeg(format!(
-                    "avcodec_send_frame(h264) failed: {ret}"
+                    "avcodec_send_frame({:?}) failed: {ret}",
+                    self.config.codec
                 )));
             }
 
@@ -237,7 +260,8 @@ impl H264Encoder {
                 if ret < 0 {
                     ffi::av_packet_free(&mut packet);
                     return Err(EncodeError::Ffmpeg(format!(
-                        "avcodec_receive_packet(h264) failed: {ret}"
+                        "avcodec_receive_packet({:?}) failed: {ret}",
+                        self.config.codec
                     )));
                 }
 
@@ -266,9 +290,19 @@ impl H264Encoder {
             Ok(out)
         }
     }
+
+    /// Encode one frame as a JPEG preview for the local self-view.
+    pub fn preview(&mut self, frame: &Frame) -> Result<Vec<u8>, EncodeError> {
+        let jpeg = self
+            .jpeg
+            .as_mut()
+            .ok_or_else(|| EncodeError::Ffmpeg("no JPEG encoder".into()))?;
+        jpeg.encode_bgra(&frame.data, frame.width, frame.height)
+            .map_err(EncodeError::Ffmpeg)
+    }
 }
 
-impl VideoEncoder for H264Encoder {
+impl VideoEncoder for FfmpegEncoder {
     fn backend(&self) -> Backend {
         Backend::Software
     }
@@ -294,7 +328,7 @@ impl VideoEncoder for H264Encoder {
     }
 }
 
-impl Drop for H264Encoder {
+impl Drop for FfmpegEncoder {
     fn drop(&mut self) {
         unsafe {
             if !self.sws.is_null() {

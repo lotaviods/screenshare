@@ -1,4 +1,4 @@
-//! Windows capture via GDI + FFmpeg H.264.
+//! Windows capture via GDI + FFmpeg H.264/VP8/VP9.
 //!
 //! `BitBlt` captures monitors and the whole desktop; `PrintWindow` captures a
 //! single window. Frames are copied to a BGRA DIB and encoded by the native
@@ -39,9 +39,10 @@ impl ScreenCapture for WindowsCapture {
         self.stop().await.ok();
 
         if !native_windows::available(options.codec) {
-            return Err(CaptureError::Unavailable(
-                "native Windows capture needs an H.264 encoder in FFmpeg".into(),
-            ));
+            return Err(CaptureError::Unavailable(format!(
+                "native Windows capture has no FFmpeg encoder for {:?}",
+                options.codec
+            )));
         }
 
         let stream = native_windows::spawn(source, &options, sink)?;

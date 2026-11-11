@@ -11,6 +11,7 @@ pub struct JpegEncoder {
     ctx: *mut ffi::AVCodecContext,
     frame: *mut ffi::AVFrame,
     sws: *mut ffi::SwsContext,
+    sws_bgra: *mut ffi::SwsContext,
     width: u32,
     height: u32,
 }
@@ -34,6 +35,7 @@ impl JpegEncoder {
                 ctx: ptr::null_mut(),
                 frame,
                 sws: ptr::null_mut(),
+                sws_bgra: ptr::null_mut(),
                 width: 0,
                 height: 0,
             })
@@ -75,6 +77,21 @@ impl JpegEncoder {
             if self.sws.is_null() {
                 return Err("sws_getContext failed".into());
             }
+            self.sws_bgra = ffi::sws_getContext(
+                width as i32,
+                height as i32,
+                ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
+                width as i32,
+                height as i32,
+                ffi::AVPixelFormat::AV_PIX_FMT_YUVJ420P,
+                ffi::SwsFlags::SWS_BILINEAR as i32,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            if self.sws_bgra.is_null() {
+                return Err("sws_getContext(BGRA) failed".into());
+            }
             (*self.frame).width = width as i32;
             (*self.frame).height = height as i32;
             (*self.frame).format = ffi::AVPixelFormat::AV_PIX_FMT_YUVJ420P as i32;
@@ -91,6 +108,10 @@ impl JpegEncoder {
             if !self.sws.is_null() {
                 ffi::sws_freeContext(self.sws);
                 self.sws = ptr::null_mut();
+            }
+            if !self.sws_bgra.is_null() {
+                ffi::sws_freeContext(self.sws_bgra);
+                self.sws_bgra = ptr::null_mut();
             }
             if !self.ctx.is_null() {
                 ffi::avcodec_free_context(&mut self.ctx);
@@ -136,6 +157,70 @@ impl JpegEncoder {
             );
             if ret < 0 {
                 return Err(format!("sws_scale failed: {ret}"));
+            }
+
+            let ret = ffi::avcodec_send_frame(self.ctx, self.frame);
+            if ret < 0 && ret != ffi::AVERROR(ffi::EAGAIN) {
+                return Err(format!("avcodec_send_frame failed: {ret}"));
+            }
+            let mut packet = ffi::av_packet_alloc();
+            if packet.is_null() {
+                return Err("av_packet_alloc failed".into());
+            }
+            let ret = ffi::avcodec_receive_packet(self.ctx, packet);
+            if ret < 0 && ret != ffi::AVERROR(ffi::EAGAIN) && ret != ffi::AVERROR_EOF {
+                ffi::av_packet_free(&mut packet);
+                return Err(format!("avcodec_receive_packet failed: {ret}"));
+            }
+            let bytes = if ret >= 0 {
+                let data = std::slice::from_raw_parts((*packet).data, (*packet).size as usize);
+                data.to_vec()
+            } else {
+                Vec::new()
+            };
+            ffi::av_packet_free(&mut packet);
+            Ok(bytes)
+        }
+    }
+
+    /// Encode one BGRA frame. Returns a JPEG byte stream.
+    pub fn encode_bgra(&mut self, bgra: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
+        if width == 0 || height == 0 || bgra.len() < width as usize * height as usize * 4 {
+            return Err("empty BGRA frame".into());
+        }
+        if width != self.width || height != self.height || self.ctx.is_null() {
+            self.open(width, height)?;
+        }
+        unsafe {
+            let ret = ffi::av_frame_make_writable(self.frame);
+            if ret < 0 {
+                return Err(format!("av_frame_make_writable failed: {ret}"));
+            }
+            let src_data = [bgra.as_ptr(), ptr::null(), ptr::null(), ptr::null()];
+            let src_stride = [width as i32 * 4, 0, 0, 0];
+            let dst_data = [
+                (*self.frame).data[0],
+                (*self.frame).data[1],
+                (*self.frame).data[2],
+                (*self.frame).data[3],
+            ];
+            let dst_stride = [
+                (*self.frame).linesize[0],
+                (*self.frame).linesize[1],
+                (*self.frame).linesize[2],
+                (*self.frame).linesize[3],
+            ];
+            let ret = ffi::sws_scale(
+                self.sws_bgra,
+                src_data.as_ptr(),
+                src_stride.as_ptr(),
+                0,
+                height as i32,
+                dst_data.as_ptr(),
+                dst_stride.as_ptr(),
+            );
+            if ret < 0 {
+                return Err(format!("sws_scale(BGRA) failed: {ret}"));
             }
 
             let ret = ffi::avcodec_send_frame(self.ctx, self.frame);
