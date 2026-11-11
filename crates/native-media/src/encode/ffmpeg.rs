@@ -593,9 +593,7 @@ impl FfmpegEncoder {
                 );
                 if self.preview_sws.is_null() {
                     ffi::av_frame_free(&mut cpu);
-                    return Err(EncodeError::Ffmpeg(
-                        "sws_getContext(preview) failed".into(),
-                    ));
+                    return Err(EncodeError::Ffmpeg("sws_getContext(preview) failed".into()));
                 }
                 self.preview_sw_format = sw_format;
             }

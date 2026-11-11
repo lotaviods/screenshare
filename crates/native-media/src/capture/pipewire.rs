@@ -118,8 +118,8 @@ where
 {
     pw::init();
 
-    let mainloop = pw::main_loop::MainLoopRc::new(None)
-        .map_err(|e| CaptureError::Pipewire(e.to_string()))?;
+    let mainloop =
+        pw::main_loop::MainLoopRc::new(None).map_err(|e| CaptureError::Pipewire(e.to_string()))?;
     let context = pw::context::ContextRc::new(&mainloop, None)
         .map_err(|e| CaptureError::Pipewire(e.to_string()))?;
     // Keep ownership of the caller's portal fd; PipeWire takes the dup.
@@ -162,11 +162,10 @@ where
                 return;
             }
             let Some(param) = param else { return };
-            let (media_type, media_subtype) =
-                match spa::param::format_utils::parse_format(param) {
-                    Ok(v) => v,
-                    Err(_) => return,
-                };
+            let (media_type, media_subtype) = match spa::param::format_utils::parse_format(param) {
+                Ok(v) => v,
+                Err(_) => return,
+            };
             if media_type != spa::param::format::MediaType::Video
                 || media_subtype != spa::param::format::MediaSubtype::Raw
             {
@@ -273,8 +272,7 @@ where
                 // from stride and plane height instead.
                 let rows = plane_rows(layer_format, plane_index, current.height) as u64;
                 let extent = pitch * rows;
-                let end =
-                    chunk.offset() as u64 + u64::from(chunk.size()).max(extent);
+                let end = chunk.offset() as u64 + u64::from(chunk.size()).max(extent);
                 object_sizes[object_index] = object_sizes[object_index].max(end);
                 planes.push(DmaBufPlane {
                     object_index: object_index as u8,
@@ -397,11 +395,15 @@ fn video_params(width: u32, height: u32, memory: Memory) -> Vec<u8> {
     let mut properties = vec![
         existing(
             spa::param::format::FormatProperties::MediaType.as_raw(),
-            Value::Id(spa::utils::Id(spa::param::format::MediaType::Video.as_raw())),
+            Value::Id(spa::utils::Id(
+                spa::param::format::MediaType::Video.as_raw(),
+            )),
         ),
         existing(
             spa::param::format::FormatProperties::MediaSubtype.as_raw(),
-            Value::Id(spa::utils::Id(spa::param::format::MediaSubtype::Raw.as_raw())),
+            Value::Id(spa::utils::Id(
+                spa::param::format::MediaSubtype::Raw.as_raw(),
+            )),
         ),
         Property {
             key: spa::param::format::FormatProperties::VideoFormat.as_raw(),
@@ -427,7 +429,10 @@ fn video_params(width: u32, height: u32, memory: Memory) -> Vec<u8> {
                 ChoiceFlags::empty(),
                 ChoiceEnum::Range {
                     default: spa::utils::Rectangle { width, height },
-                    min: spa::utils::Rectangle { width: 1, height: 1 },
+                    min: spa::utils::Rectangle {
+                        width: 1,
+                        height: 1,
+                    },
                     max: spa::utils::Rectangle {
                         width: 7680,
                         height: 4320,
@@ -443,10 +448,7 @@ fn video_params(width: u32, height: u32, memory: Memory) -> Vec<u8> {
                 ChoiceEnum::Range {
                     default: spa::utils::Fraction { num: 30, denom: 1 },
                     min: spa::utils::Fraction { num: 0, denom: 1 },
-                    max: spa::utils::Fraction {
-                        num: 120,
-                        denom: 1,
-                    },
+                    max: spa::utils::Fraction { num: 120, denom: 1 },
                 },
             ))),
         },
@@ -523,11 +525,17 @@ mod tests {
     fn buffer_mask_matches_memory() {
         assert_eq!(
             Memory::DmaBuf.mask(),
-            (1 << spa::sys::SPA_DATA_DmaBuf, vec![1 << spa::sys::SPA_DATA_DmaBuf])
+            (
+                1 << spa::sys::SPA_DATA_DmaBuf,
+                vec![1 << spa::sys::SPA_DATA_DmaBuf]
+            )
         );
         assert_eq!(
             Memory::MemFd.mask(),
-            (1 << spa::sys::SPA_DATA_MemFd, vec![1 << spa::sys::SPA_DATA_MemFd])
+            (
+                1 << spa::sys::SPA_DATA_MemFd,
+                vec![1 << spa::sys::SPA_DATA_MemFd]
+            )
         );
         let (_, allowed) = Memory::Both.mask();
         assert_eq!(allowed.len(), 2);

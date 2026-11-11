@@ -52,9 +52,11 @@ impl Sink {
                     );
                     self.encoder = Some(enc);
                     self.out = Some(BufWriter::new(
-                        File::create(std::env::args().nth(1).unwrap_or_else(|| {
-                            "/tmp/sharescreen-probe.h264".to_string()
-                        }))
+                        File::create(
+                            std::env::args()
+                                .nth(1)
+                                .unwrap_or_else(|| "/tmp/sharescreen-probe.h264".to_string()),
+                        )
                         .expect("create output file"),
                     ));
                 }

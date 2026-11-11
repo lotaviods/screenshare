@@ -16,7 +16,7 @@ mod store;
 mod types;
 
 pub use error::{ConfigError, Result};
-pub use store::{default_config_path, ConfigStore};
+pub use store::{default_config_path, default_log_path, ConfigStore};
 pub use types::{
     AppState, AudioConfig, CaptureConfig, Config, NetworkConfig, ServerAddress, StunServer,
     TurnServer, VideoConfig,

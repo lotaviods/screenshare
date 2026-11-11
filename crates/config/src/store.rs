@@ -91,6 +91,12 @@ pub fn default_config_path() -> Option<PathBuf> {
         .map(|d| d.config_dir().join("config.toml"))
 }
 
+/// Log file next to `config.toml`. The desktop app has no console on Windows,
+/// so diagnostics must go to a file to be useful.
+pub fn default_log_path() -> Option<PathBuf> {
+    default_config_path().and_then(|path| path.parent().map(|dir| dir.join("sharescreen.log")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

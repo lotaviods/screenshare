@@ -6,9 +6,7 @@
 
 use std::os::fd::OwnedFd;
 
-use ashpd::desktop::screencast::{
-    CursorMode, Screencast, SelectSourcesOptions, SourceType,
-};
+use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
 use ashpd::desktop::{PersistMode, ResponseError, Session};
 
 use super::CaptureError;

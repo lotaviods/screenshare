@@ -78,10 +78,7 @@ async fn negotiate_video(
 #[test]
 fn capture_sample_is_annex_b() {
     let sample = H264_SAMPLE;
-    assert!(
-        sample.windows(4).any(|w| w == [0, 0, 0, 1]),
-        "not Annex-B"
-    );
+    assert!(sample.windows(4).any(|w| w == [0, 0, 0, 1]), "not Annex-B");
 }
 
 #[tokio::test]

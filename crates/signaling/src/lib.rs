@@ -13,6 +13,10 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 pub use sharescreen_core::{PeerInfo, PeerPayload, SignalMessage};
 
+/// How long to wait for the WebSocket handshake before reporting an error.
+/// Without this a blocked port hangs the UI with no feedback.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// An event delivered to the caller from the connection.
 #[derive(Debug)]
 pub enum Incoming {
@@ -50,9 +54,14 @@ impl SignalingClient {
     /// Connect to `url` (a `ws://` or `wss://` URL, optionally with query
     /// parameters such as `?id=..&name=..`).
     pub async fn connect(url: &str) -> Result<Self, SignalingError> {
-        let (ws, _) = tokio_tungstenite::connect_async(url)
+        tracing::info!(%url, "connecting to signaling server");
+        let (ws, _) = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(url))
             .await
+            .map_err(|_| {
+                SignalingError::Connect(format!("timed out after {}s", CONNECT_TIMEOUT.as_secs()))
+            })?
             .map_err(|e| SignalingError::Connect(e.to_string()))?;
+        tracing::info!(%url, "signaling WebSocket connected");
         let (mut ws_sink, mut ws_stream) = ws.split();
 
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SignalMessage>();

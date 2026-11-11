@@ -74,7 +74,9 @@ impl OpusEncoder {
             let ret = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
             if ret < 0 {
                 ffi::avcodec_free_context(&mut { ctx });
-                return Err(EncodeError::Ffmpeg(format!("avcodec_open2(opus) failed: {ret}")));
+                return Err(EncodeError::Ffmpeg(format!(
+                    "avcodec_open2(opus) failed: {ret}"
+                )));
             }
 
             let frame = ffi::av_frame_alloc();
@@ -91,7 +93,9 @@ impl OpusEncoder {
             if ret < 0 {
                 ffi::av_frame_free(&mut { frame });
                 ffi::avcodec_free_context(&mut { ctx });
-                return Err(EncodeError::Ffmpeg(format!("opus frame buffer failed: {ret}")));
+                return Err(EncodeError::Ffmpeg(format!(
+                    "opus frame buffer failed: {ret}"
+                )));
             }
 
             Ok(Self {
@@ -122,12 +126,12 @@ impl OpusEncoder {
         unsafe {
             let ret = ffi::av_frame_make_writable(self.frame);
             if ret < 0 {
-                return Err(EncodeError::Ffmpeg(format!("av_frame_make_writable failed: {ret}")));
+                return Err(EncodeError::Ffmpeg(format!(
+                    "av_frame_make_writable failed: {ret}"
+                )));
             }
-            let dst = std::slice::from_raw_parts_mut(
-                (*self.frame).data[0] as *mut i16,
-                self.frame_len,
-            );
+            let dst =
+                std::slice::from_raw_parts_mut((*self.frame).data[0] as *mut i16, self.frame_len);
             dst.copy_from_slice(pcm);
             (*self.frame).pts = self.pts;
             let frame_time = self.pts;
@@ -159,8 +163,7 @@ impl OpusEncoder {
                 data,
                 keyframe: false,
                 pts_micros: frame_time as u64 * 1_000_000 / SAMPLE_RATE as u64,
-                duration_micros: (*self.frame).nb_samples as u64 * 1_000_000
-                    / SAMPLE_RATE as u64,
+                duration_micros: (*self.frame).nb_samples as u64 * 1_000_000 / SAMPLE_RATE as u64,
             }))
         }
     }
@@ -200,10 +203,7 @@ mod tests {
         let mut encoder = OpusEncoder::new(96).expect("encoder");
         assert_eq!(encoder.frame_len() % CHANNELS, 0);
         let pcm = vec![0i16; encoder.frame_len()];
-        let packet = encoder
-            .encode(&pcm)
-            .expect("encode")
-            .expect("one packet");
+        let packet = encoder.encode(&pcm).expect("encode").expect("one packet");
         // Every Opus packet starts with a TOC byte whose config is < 32.
         assert!(!packet.data.is_empty());
         assert!(packet.data[0] >> 3 < 32);

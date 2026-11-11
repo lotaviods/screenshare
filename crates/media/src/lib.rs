@@ -18,7 +18,9 @@ use std::time::Duration;
 
 use sharescreen_audio::Output;
 use sharescreen_core::Codec;
-use sharescreen_native_media::decode::{JpegEncoder, OpusDecoder, RtpDepacketizer, RtpKind, VideoDecoder};
+use sharescreen_native_media::decode::{
+    JpegEncoder, OpusDecoder, RtpDepacketizer, RtpKind, VideoDecoder,
+};
 use sharescreen_webrtc::{RemoteTrack, RemoteTrackKind};
 
 #[derive(Debug, thiserror::Error)]
@@ -63,15 +65,7 @@ impl Decoder {
         let thread = std::thread::Builder::new()
             .name("sharescreen-media".into())
             .spawn(move || {
-                run(
-                    kind,
-                    codec,
-                    rtp_kind,
-                    rx,
-                    flag,
-                    volume_slot,
-                    frames_slot,
-                );
+                run(kind, codec, rtp_kind, rx, flag, volume_slot, frames_slot);
             })
             .map_err(|e| MediaError::Pipeline(format!("failed to spawn media thread: {e}")))?;
 
@@ -161,50 +155,48 @@ fn run(
     };
 
     let mut decoded = 0u64;
-    let mut process = |frame: &[u8]| {
-        match kind {
-            RemoteTrackKind::Video => {
-                let (Some(video), Some(jpeg)) = (video.as_mut(), jpeg.as_mut()) else {
-                    return;
-                };
-                match video.decode(frame) {
-                    Ok(rgb_frames) => {
-                        for rgb in rgb_frames {
-                            match jpeg.encode(&rgb, video.width(), video.height()) {
-                                Ok(jpeg) => {
-                                    if decoded == 0 {
-                                        tracing::info!(
-                                            "decoded first video frame ({} bytes)",
-                                            jpeg.len()
-                                        );
-                                    }
-                                    decoded += 1;
-                                    if let Some(slot) = frames.as_ref() {
-                                        *slot.lock().unwrap() = Some(jpeg);
-                                    }
+    let mut process = |frame: &[u8]| match kind {
+        RemoteTrackKind::Video => {
+            let (Some(video), Some(jpeg)) = (video.as_mut(), jpeg.as_mut()) else {
+                return;
+            };
+            match video.decode(frame) {
+                Ok(rgb_frames) => {
+                    for rgb in rgb_frames {
+                        match jpeg.encode(&rgb, video.width(), video.height()) {
+                            Ok(jpeg) => {
+                                if decoded == 0 {
+                                    tracing::info!(
+                                        "decoded first video frame ({} bytes)",
+                                        jpeg.len()
+                                    );
                                 }
-                                Err(e) => tracing::warn!("JPEG encode failed: {e}"),
+                                decoded += 1;
+                                if let Some(slot) = frames.as_ref() {
+                                    *slot.lock().unwrap() = Some(jpeg);
+                                }
                             }
+                            Err(e) => tracing::warn!("JPEG encode failed: {e}"),
                         }
                     }
-                    Err(e) => tracing::warn!("video decode failed: {e}"),
                 }
+                Err(e) => tracing::warn!("video decode failed: {e}"),
             }
-            RemoteTrackKind::Audio => {
-                let (Some(audio), Some(output)) = (audio.as_mut(), output.as_mut()) else {
-                    return;
-                };
-                match audio.decode(frame) {
-                    Ok(pcm) => {
-                        let gain = *volume.lock().unwrap();
-                        let scaled: Vec<i16> = pcm
-                            .iter()
-                            .map(|sample| (*sample as f64 * gain).clamp(-32768.0, 32767.0) as i16)
-                            .collect();
-                        output.play(&scaled);
-                    }
-                    Err(e) => tracing::warn!("Opus decode failed: {e}"),
+        }
+        RemoteTrackKind::Audio => {
+            let (Some(audio), Some(output)) = (audio.as_mut(), output.as_mut()) else {
+                return;
+            };
+            match audio.decode(frame) {
+                Ok(pcm) => {
+                    let gain = *volume.lock().unwrap();
+                    let scaled: Vec<i16> = pcm
+                        .iter()
+                        .map(|sample| (*sample as f64 * gain).clamp(-32768.0, 32767.0) as i16)
+                        .collect();
+                    output.play(&scaled);
                 }
+                Err(e) => tracing::warn!("Opus decode failed: {e}"),
             }
         }
     };
@@ -270,10 +262,7 @@ impl RemoteMedia {
         let kind = track.kind().await;
         let codec = track.codec().await.unwrap_or(Codec::Opus);
         tracing::info!("remote track from {peer_id}: kind={kind:?} codec={codec:?}");
-        let key = format!(
-            "{peer_id}#{}",
-            self.counter.fetch_add(1, Ordering::Relaxed)
-        );
+        let key = format!("{peer_id}#{}", self.counter.fetch_add(1, Ordering::Relaxed));
 
         let decoder = Decoder::new(kind, codec)?;
         if let Some(slot) = decoder.frames.clone() {

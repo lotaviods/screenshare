@@ -355,13 +355,7 @@ impl PlaybackSink {
         let mut stream = PulseStream::new(&mut context, "sharescreen playback", &spec, Some(&map))
             .ok_or("failed to create audio playback stream")?;
         stream
-            .connect_playback(
-                device.as_deref(),
-                None,
-                StreamFlags::empty(),
-                None,
-                None,
-            )
+            .connect_playback(device.as_deref(), None, StreamFlags::empty(), None, None)
             .map_err(|e| format!("failed to connect playback: {e}"))?;
         Ok(Self {
             mainloop,
@@ -377,7 +371,9 @@ impl PlaybackSink {
             .iter()
             .flat_map(|s| s.to_le_bytes())
             .collect::<Vec<u8>>();
-        let _ = self.stream.write_copy(&bytes, 0, pulse::stream::SeekMode::Relative);
+        let _ = self
+            .stream
+            .write_copy(&bytes, 0, pulse::stream::SeekMode::Relative);
         self.mainloop.iterate(false);
     }
 

@@ -167,10 +167,7 @@ mod tests {
         assert!(d.push(&first).is_empty());
         let mut second = rtp(&[0x65, 0x02]);
         second[4..8].copy_from_slice(&2u32.to_be_bytes());
-        assert_eq!(
-            d.push(&second),
-            vec![vec![0, 0, 0, 1, 0x65, 0x01]]
-        );
+        assert_eq!(d.push(&second), vec![vec![0, 0, 0, 1, 0x65, 0x01]]);
         assert_eq!(d.flush(), vec![vec![0, 0, 0, 1, 0x65, 0x02]]);
     }
 

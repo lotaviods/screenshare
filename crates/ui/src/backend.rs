@@ -184,6 +184,7 @@ impl Actor {
     }
 
     async fn handle(&mut self, command: Command) {
+        tracing::debug!(?command, "backend command");
         let result = match command {
             Command::Connect => self.connect().await,
             Command::Disconnect => self.disconnect().await,
@@ -282,9 +283,15 @@ impl Actor {
             }
         });
 
-        let session = CallSession::start(call_config, tx)
-            .await
-            .map_err(|e| e.to_string())?;
+        tracing::info!(
+            url = %call_config.signaling_url,
+            "connecting to signaling server"
+        );
+        let session = CallSession::start(call_config, tx).await.map_err(|e| {
+            tracing::warn!("signaling connect failed: {e}");
+            e.to_string()
+        })?;
+        tracing::info!("connected to signaling server");
         self.call = Some(session);
         self.send(UiEvent::Connected(true));
 
@@ -314,6 +321,7 @@ impl Actor {
             .call
             .as_ref()
             .ok_or("not connected to a signaling server")?;
+        tracing::info!("creating room");
         session.create_room().map_err(|e| e.to_string())
     }
 
@@ -322,6 +330,7 @@ impl Actor {
             .call
             .as_ref()
             .ok_or("not connected to a signaling server")?;
+        tracing::info!(%room_id, "joining room");
         session.join_room(room_id).map_err(|e| e.to_string())
     }
 

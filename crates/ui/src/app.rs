@@ -27,6 +27,7 @@ const MUTED: u32 = 0x9a9aac;
 const ACCENT: u32 = 0x6c6cf0;
 const DANGER: u32 = 0xe05561;
 const OK: u32 = 0x46c18a;
+const AMBER: u32 = 0xd8a24a;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -66,6 +67,7 @@ pub struct AppView {
     backend: Backend,
     screen: Screen,
     connected: bool,
+    connecting: bool,
     room_id: Option<String>,
     participants: Vec<Participant>,
     error: Option<String>,
@@ -117,6 +119,7 @@ impl AppView {
             backend,
             screen: Screen::Home,
             connected: false,
+            connecting: false,
             room_id: None,
             participants: Vec::new(),
             error: None,
@@ -206,9 +209,13 @@ impl AppView {
 
     fn handle_event(&mut self, event: UiEvent, cx: &mut Context<Self>) {
         match event {
-            UiEvent::Error(message) => self.error = Some(message),
+            UiEvent::Error(message) => {
+                self.connecting = false;
+                self.error = Some(message);
+            }
             UiEvent::Config(config) => self.config = config,
             UiEvent::Connected(connected) => {
+                self.connecting = false;
                 self.connected = connected;
                 if !connected {
                     self.screen = Screen::Home;
@@ -313,13 +320,16 @@ impl AppView {
     fn on_connect(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.prepare_home_config(cx).is_some() {
             self.error = None;
+            self.connecting = true;
             self.backend.send(Command::Connect);
+            cx.notify();
         }
     }
 
     fn on_disconnect(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.backend.send(Command::Disconnect);
         self.connected = false;
+        self.connecting = false;
         self.room_id = None;
         self.participants.clear();
         self.remote_frame = None;
@@ -702,10 +712,12 @@ impl AppView {
                 ),
         );
 
-        let status = if self.connected {
-            "Connected"
+        let (status, status_color) = if self.connected {
+            ("Connected", OK)
+        } else if self.connecting {
+            ("Connecting…", AMBER)
         } else {
-            "Not connected"
+            ("Not connected", MUTED)
         };
         page = page.child(
             div()
@@ -731,12 +743,7 @@ impl AppView {
                                     .child("Signaling server"),
                             ),
                         )
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(if self.connected { OK } else { MUTED }))
-                                .child(status),
-                        ),
+                        .child(div().text_sm().text_color(rgb(status_color)).child(status)),
                 )
                 .child(
                     div()
@@ -786,6 +793,8 @@ impl AppView {
                         .child(if self.connected {
                             danger_button("disconnect", "Disconnect")
                                 .on_click(cx.listener(Self::on_disconnect))
+                        } else if self.connecting {
+                            primary_button("connect-pending", "Connecting…")
                         } else {
                             primary_button("connect", "Connect")
                                 .on_click(cx.listener(Self::on_connect))
@@ -798,6 +807,17 @@ impl AppView {
                         .child(if self.connected {
                             format!(
                                 "Connected to {}://{}:{}",
+                                if self.config.network.signaling_secure {
+                                    "wss"
+                                } else {
+                                    "ws"
+                                },
+                                self.config.network.signaling_host,
+                                self.config.network.signaling_port
+                            )
+                        } else if self.connecting {
+                            format!(
+                                "Connecting to {}://{}:{}…",
                                 if self.config.network.signaling_secure {
                                     "wss"
                                 } else {
