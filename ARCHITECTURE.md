@@ -108,14 +108,12 @@ or the UI.
 
 Two independent local sources plus remote audio:
 
-1. Microphone — `pulsesrc`/`autoaudiosrc` (Linux), WASAPI (Windows).
-2. System audio — PulseAudio/PipeWire monitor source (Linux), WASAPI loopback
-   (Windows).
+1. Microphone — `libpulse-binding` (Linux), WASAPI capture endpoint (Windows).
+2. System audio — per-application PulseAudio/PipeWire streams (Linux), WASAPI
+   process loopback excluding the Sharescreen process tree (Windows).
 
-On Linux, `SHARESCREEN_MEDIA=native` records through `libpulse-binding` and
-encodes with FFmpeg's libopus instead, without a GStreamer pipeline. Volume and
-mute then apply as software gain before encoding. GStreamer stays the default
-until the A/B comparison passes.
+Both platforms record directly and encode with FFmpeg's libopus, without a
+GStreamer pipeline. Volume and mute apply as software gain before encoding.
 
 Both encode to Opus independently and are sent as separate WebRTC tracks so a
 remote user can mute screen audio without muting the mic. Volume, mute, echo

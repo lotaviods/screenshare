@@ -1,5 +1,4 @@
-//! Live smoke test. Runs whichever path `SHARESCREEN_MEDIA` selects:
-//! `cargo test -p sharescreen-audio --test native_smoke -- --ignored --nocapture`
+//! Live smoke test: `cargo test -p sharescreen-audio --test native_smoke -- --ignored --nocapture`
 
 use std::time::Duration;
 
@@ -7,12 +6,11 @@ use sharescreen_audio::AudioEngine;
 use sharescreen_core::{AudioCapture, Codec, EncodedSample};
 use tokio::sync::mpsc;
 
-fn log_path() {
-    let native = std::env::var("SHARESCREEN_MEDIA").is_ok_and(|v| v == "native");
-    eprintln!("audio path: {}", if native { "native" } else { "gstreamer" });
-}
-
-fn collect(rx: &mut mpsc::Receiver<EncodedSample>, want: usize, limit: Duration) -> Vec<EncodedSample> {
+fn collect(
+    rx: &mut mpsc::Receiver<EncodedSample>,
+    want: usize,
+    limit: Duration,
+) -> Vec<EncodedSample> {
     let mut out = Vec::new();
     let deadline = std::time::Instant::now() + limit;
     while out.len() < want && std::time::Instant::now() < deadline {
@@ -25,7 +23,11 @@ fn collect(rx: &mut mpsc::Receiver<EncodedSample>, want: usize, limit: Duration)
 }
 
 fn check(samples: &[EncodedSample], label: &str) {
-    assert!(samples.len() >= 10, "{label}: only {} packets", samples.len());
+    assert!(
+        samples.len() >= 10,
+        "{label}: only {} packets",
+        samples.len()
+    );
     for sample in samples {
         assert_eq!(sample.codec, Codec::Opus);
         assert!(sample.duration_micros > 0);
@@ -41,7 +43,6 @@ fn check(samples: &[EncodedSample], label: &str) {
 #[test]
 #[ignore]
 fn mic_produces_opus_packets() {
-    log_path();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut engine = AudioEngine::default();
     let (tx, mut rx) = mpsc::channel(1000);
@@ -54,11 +55,11 @@ fn mic_produces_opus_packets() {
 #[test]
 #[ignore]
 fn system_produces_opus_packets() {
-    log_path();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut engine = AudioEngine::default();
-    let (tx, mut rx) = mpsc::channel(64);
-    rt.block_on(engine.start_system(None, tx)).expect("start system");
+    let (tx, mut rx) = mpsc::channel(1000);
+    rt.block_on(engine.start_system(None, tx))
+        .expect("start system");
     let samples = collect(&mut rx, 20, Duration::from_secs(3));
     rt.block_on(engine.stop_system()).unwrap();
     check(&samples, "system");

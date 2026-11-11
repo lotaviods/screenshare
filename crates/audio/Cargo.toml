@@ -4,17 +4,27 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Microphone and system-audio capture for Sharescreen (GStreamer or native PulseAudio/FFmpeg)"
+description = "Microphone and system-audio capture for Sharescreen (native PulseAudio/WASAPI + FFmpeg)"
 
 [dependencies]
 sharescreen-core = { path = "../core" }
+sharescreen-native-media = { path = "../native-media" }
 
-gstreamer = "0.25"
-gstreamer-app = "0.25"
 tokio.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libpulse-binding = "2.30"
-sharescreen-native-media = { path = "../native-media" }
+
+[target.'cfg(windows)'.dependencies]
+windows-core = "0.62"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_UI_Shell_PropertiesSystem",
+] }

@@ -1,17 +1,21 @@
 //! Video encoders.
 
-use crate::frame::DmaBufFrame;
-
 pub mod audio;
+#[cfg(target_os = "linux")]
 pub mod ffmpeg;
 
 pub use audio::OpusEncoder;
+#[cfg(target_os = "linux")]
 pub use ffmpeg::FfmpegEncoder;
+
+#[cfg(target_os = "linux")]
+use crate::frame::DmaBufFrame;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EncodeError {
     #[error("no usable hardware encoder: {0}")]
     Unavailable(String),
+    #[cfg(target_os = "linux")]
     #[error("unsupported input format: {0:?}")]
     UnsupportedFormat(Option<crate::frame::DrmFormat>),
     #[error("ffmpeg error: {0}")]
@@ -27,6 +31,7 @@ pub struct EncodedFrame {
     pub duration_micros: u64,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     Vaapi,
@@ -34,6 +39,7 @@ pub enum Backend {
     Software,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone)]
 pub struct EncoderConfig {
     pub width: u32,
@@ -43,6 +49,7 @@ pub struct EncoderConfig {
 }
 
 /// Encode captured frames. Implementations run on a dedicated thread.
+#[cfg(target_os = "linux")]
 pub trait VideoEncoder: Send {
     fn backend(&self) -> Backend;
     fn encode(

@@ -1,10 +1,10 @@
-//! Native audio capture: PulseAudio → FFmpeg/Opus, no GStreamer.
+//! Native audio capture: platform capture → FFmpeg/Opus, no GStreamer.
 //!
-//! Opt-in via `SHARESCREEN_MEDIA=native` while the GStreamer pipeline stays the
-//! default, so the two paths can be compared A/B. The microphone records the
-//! selected source; system audio mixes every non-call playback stream, exactly
-//! like the GStreamer path, then encodes straight to Opus packets. Volume and
-//! mute apply as software gain, so no `volume` element is involved.
+//! Linux records the microphone or the application playback streams through
+//! `libpulse-binding`; Windows records the capture endpoint or the process
+//! loopback through WASAPI. Both are converted to 48 kHz stereo S16LE and
+//! encoded straight to Opus packets. Volume and mute apply as software gain, so
+//! no `volume` element is involved.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,13 +15,10 @@ use sharescreen_core::{AudioError, Codec, EncodedSample, MediaKind};
 use sharescreen_native_media::encode::OpusEncoder;
 use tokio::sync::mpsc;
 
+#[cfg(target_os = "linux")]
 use crate::pulse::{Mixer, Recorder};
-
-/// Whether the native audio path is usable.
-pub fn available() -> bool {
-    std::env::var("SHARESCREEN_MEDIA").is_ok_and(|value| value == "native")
-        && sharescreen_native_media::encode::audio::opus_available()
-}
+#[cfg(windows)]
+use crate::wasapi::Recorder;
 
 /// A running native capture: a capture thread pushing Opus samples.
 pub struct Stream {
@@ -137,7 +134,7 @@ pub fn spawn_mic(
     })
 }
 
-/// Start mixing the system output as Opus.
+/// Start capturing system audio as Opus.
 pub fn spawn_system(
     device: Option<String>,
     bitrate_kbps: u32,
@@ -188,6 +185,75 @@ fn spawn(
     }
 }
 
+/// A platform capture that yields interleaved 48 kHz stereo S16LE samples.
+trait Capture {
+    fn pump(&mut self);
+    fn next(&mut self) -> Option<Vec<i16>>;
+}
+
+#[cfg(target_os = "linux")]
+impl Capture for Recorder {
+    fn pump(&mut self) {
+        Recorder::pump(self);
+    }
+
+    fn next(&mut self) -> Option<Vec<i16>> {
+        let pcm = self.take();
+        if pcm.is_empty() {
+            None
+        } else {
+            Some(pcm)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Capture for Mixer {
+    fn pump(&mut self) {
+        Mixer::pump(self);
+    }
+
+    fn next(&mut self) -> Option<Vec<i16>> {
+        self.chunk()
+    }
+}
+
+#[cfg(windows)]
+impl Capture for Recorder {
+    fn pump(&mut self) {
+        Recorder::pump(self);
+    }
+
+    fn next(&mut self) -> Option<Vec<i16>> {
+        let pcm = self.take();
+        if pcm.is_empty() {
+            None
+        } else {
+            Some(pcm)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_mic(device: Option<String>) -> Result<Box<dyn Capture>, String> {
+    Recorder::open(device).map(|recorder| Box::new(recorder) as Box<dyn Capture>)
+}
+
+#[cfg(target_os = "linux")]
+fn open_system(device: Option<String>) -> Result<Box<dyn Capture>, String> {
+    Mixer::open(device).map(|mixer| Box::new(mixer) as Box<dyn Capture>)
+}
+
+#[cfg(windows)]
+fn open_mic(device: Option<String>) -> Result<Box<dyn Capture>, String> {
+    Recorder::open_mic(device).map(|recorder| Box::new(recorder) as Box<dyn Capture>)
+}
+
+#[cfg(windows)]
+fn open_system(device: Option<String>) -> Result<Box<dyn Capture>, String> {
+    Recorder::open_system(device).map(|recorder| Box::new(recorder) as Box<dyn Capture>)
+}
+
 fn run_mic(
     device: Option<String>,
     bitrate_kbps: u32,
@@ -196,8 +262,8 @@ fn run_mic(
     sink: mpsc::Sender<EncodedSample>,
     ready: std::sync::mpsc::SyncSender<Result<(), String>>,
 ) {
-    let mut recorder = match Recorder::open(device) {
-        Ok(recorder) => recorder,
+    let mut capture = match open_mic(device) {
+        Ok(capture) => capture,
         Err(error) => {
             let _ = ready.send(Err(error));
             return;
@@ -215,10 +281,11 @@ fn run_mic(
     let mut framer = Framer::new(gain);
     tracing::info!("native microphone capture started");
     while running.load(Ordering::SeqCst) {
-        recorder.pump();
-        let pcm = recorder.take();
-        if !pcm.is_empty() && !framer.push(&mut encoder, &sink, &pcm) {
-            break;
+        capture.pump();
+        if let Some(pcm) = capture.next() {
+            if !framer.push(&mut encoder, &sink, &pcm) {
+                break;
+            }
         }
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -232,8 +299,8 @@ fn run_system(
     sink: mpsc::Sender<EncodedSample>,
     ready: std::sync::mpsc::SyncSender<Result<(), String>>,
 ) {
-    let mut mixer = match Mixer::open(device) {
-        Ok(mixer) => mixer,
+    let mut capture = match open_system(device) {
+        Ok(capture) => capture,
         Err(error) => {
             let _ = ready.send(Err(error));
             return;
@@ -251,8 +318,8 @@ fn run_system(
     let mut framer = Framer::new(gain);
     tracing::info!("native system audio capture started");
     while running.load(Ordering::SeqCst) {
-        mixer.pump();
-        if let Some(chunk) = mixer.chunk() {
+        capture.pump();
+        if let Some(chunk) = capture.next() {
             if !framer.push(&mut encoder, &sink, &chunk) {
                 break;
             }

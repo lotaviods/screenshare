@@ -26,7 +26,7 @@ spec against the current code. Checkboxes are off until implemented.
       GStreamer stays the default until A/B passes; the native path has no JPEG
       self-view yet and is H.264 only.
 - [ ] Remove GStreamer: native decode for remote frames and the preview branch
-      are still GStreamer-only.
+      are still GStreamer-only. The audio crate no longer uses GStreamer.
 - [x] Hardware-encoder auto-detection (VAAPI/NVENC/QSV candidates → software
       fallback). Untested against real HW (none installed here).
 - [x] Linux X11: native `ximagesrc` backend (whole-screen + `xid:` window).
@@ -37,8 +37,8 @@ spec against the current code. Checkboxes are off until implemented.
       via `EnumWindows`; `gdiscreencapsrc` fallback for monitors when the
       d3d11 element is absent. Encoders `mfh264enc`/`openh264enc`.
       **Untested** — needs a Windows host with GStreamer 1.22+.
-- [x] Windows audio: `wasapi2src` mic + `loopback=true` system audio,
-      enumeration via `wasapi2deviceprovider`. **Untested** (same reason).
+- [x] Windows audio: native WASAPI mic capture + process-loopback system audio,
+      enumeration via WASAPI endpoints. **Untested** (same reason).
 - [x] Source enumeration — Wayland delegates to the portal picker.
 - [x] Cursor mode (hidden / embedded / metadata) mapping.
 - [x] Resolution + frame-rate + bitrate + codec selection.
@@ -55,19 +55,16 @@ spec against the current code. Checkboxes are off until implemented.
       the SDP advertises (`profile-level-id=42e01f`).
 
 ### `crates/audio` — microphone + system audio
-- [x] Mic capture: PulseAudio/PipeWire (`pulsesrc`/`autoaudiosrc`) — runtime-verified.
-- [x] System loopback: monitor source (`pulsesrc device=@DEFAULT_MONITOR@`) — runtime-verified.
-- [x] Opus encode (`opusenc`) into `EncodedSample`.
-- [x] Device enumeration (mic, output, system monitor) via `libpulse-binding` — runtime-verified.
-- [x] Independent mic/system volume + mute (via `volume` element).
-- [x] Native audio path (`SHARESCREEN_MEDIA=native`, Linux): `libpulse-binding`
-      records the mic and mixes per-application playback, FFmpeg's libopus
-      encodes 20 ms packets, volume/mute apply as software gain. Verified live
-      on Hyprland + PipeWire (mic and system audio). GStreamer stays the
-      default until A/B passes.
+- [x] Linux mic capture: `libpulse-binding` records the source — runtime-verified.
+- [x] Linux system audio: records each non-call playback stream and mixes them —
+      runtime-verified. No GStreamer.
+- [x] FFmpeg libopus encodes 20 ms packets; volume/mute apply as software gain.
+- [x] Linux device enumeration (mic, output, system monitor) via
+      `libpulse-binding` — runtime-verified.
+- [x] Windows WASAPI mic capture + process-loopback system audio. **Untested**
+      (needs a Windows host).
 - [ ] Echo cancellation; noise suppression (needs `webrtc-audio-processing`).
 - [ ] Device disconnect/reconnect handling without tearing down the call.
-- [ ] Windows WASAPI mic + loopback capture.
 
 ### `crates/webrtc` — media transport (`webrtc` 0.21)
 - [x] Peer connection lifecycle: `WebRtcPeer` (offer/answer/ICE primitives).
