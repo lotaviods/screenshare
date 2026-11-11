@@ -1,9 +1,9 @@
-//! Regression: `Decoder::new` must work in a process where GStreamer has not
-//! been initialized yet (a viewer that never captures). It used to panic while
-//! building `gst::Caps` before `gst::init`.
+//! Regression: `Decoder::new` must construct a native decoder without any
+//! prior initialization. It used to panic while building GStreamer caps before
+//! `gst::init`.
 
 #[test]
-fn decoder_initializes_gstreamer_without_prior_init() {
+fn decoder_constructs_without_prior_init() {
     let decoder = sharescreen_media::Decoder::new(
         sharescreen_webrtc::RemoteTrackKind::Video,
         sharescreen_core::Codec::H264,

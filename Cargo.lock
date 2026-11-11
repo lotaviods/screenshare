@@ -1989,8 +1989,6 @@ dependencies = [
 [[package]]
 name = "ffmpeg-sys-next"
 version = "9.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6f932d8c1cede016c65d4f1435f323369c99c74df55143b18676aa10e7603f9"
 dependencies = [
  "bindgen 0.73.2",
  "cc",
@@ -6024,8 +6022,6 @@ name = "sharescreen-call"
 version = "0.1.0"
 dependencies = [
  "axum",
- "gstreamer",
- "gstreamer-app",
  "serde_json",
  "sharescreen-core",
  "sharescreen-media",
@@ -6079,9 +6075,9 @@ dependencies = [
 name = "sharescreen-media"
 version = "0.1.0"
 dependencies = [
- "gstreamer",
- "gstreamer-app",
+ "sharescreen-audio",
  "sharescreen-core",
+ "sharescreen-native-media",
  "sharescreen-webrtc",
  "thiserror 2.0.21",
  "tokio",

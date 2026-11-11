@@ -51,27 +51,25 @@ Prerequisites (PowerShell, no `make` needed):
 
 ```powershell
 winget install Rustlang.Rustup Microsoft.VisualStudio.2022.BuildTools  # pick "Desktop development with C++"
-winget install gstreamerproject.gstreamer                              # GStreamer MSVC x86_64
 ```
 
-The winget GStreamer package installs per-user and does not set its
-environment variables, so point the build at it once (new terminal after):
+The build downloads FFmpeg's shared build and links against it. No system
+FFmpeg is needed. Run the portable build script:
 
 ```powershell
-$gst = "$env:LOCALAPPDATA\Programs\gstreamer\1.0\msvc_x86_64"
-[Environment]::SetEnvironmentVariable("GSTREAMER_1_0_ROOT_MSVC_X86_64", $gst, "User")
-[Environment]::SetEnvironmentVariable("PKG_CONFIG_PATH", "$gst\lib\pkgconfig", "User")
-[Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$gst\bin", "User")
+powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1
 ```
 
-Then run the app:
+The script stages the app in `dist\sharescreen-windows` with the FFmpeg DLLs
+beside `sharescreen.exe`. The app needs no FFmpeg on the target machine.
+
+To run the app directly from the source tree, set `FFMPEG_DIR` to the
+extracted FFmpeg root first:
 
 ```powershell
+$env:FFMPEG_DIR = "C:\path\to\ffmpeg-master-latest-win64-lgpl-shared"
 cargo run
 ```
-
-The app loads the GStreamer DLLs from `%GSTREAMER_1_0_ROOT_MSVC_X86_64%\bin`,
-so the `bin` directory must be on `PATH` when it starts.
 
 ## Roadmap
 

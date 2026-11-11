@@ -24,8 +24,13 @@ rust-version = "1.90"
 
 # `gpui` pulls in `zed-async-tar` → `xattr 0.2`, which still references the
 # macOS-only `ENOATTR` constant on Linux. The vendored copy uses `ENODATA` there.
+#
+# `ffmpeg-sys-next` 9.0.1 includes the D3D11 hardware context header, which
+# clang 23 rejects on Windows (`__tile` conflicts with `d3d11.h`). The vendored
+# copy keeps that include out of the bindgen pass.
 [patch.crates-io]
 xattr = { path = "vendor/xattr" }
+ffmpeg-sys-next = { path = "vendor/ffmpeg-sys-next" }
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

@@ -14,6 +14,7 @@
 
 #![cfg(any(target_os = "linux", windows))]
 
+pub mod decode;
 pub mod encode;
 pub mod frame;
 

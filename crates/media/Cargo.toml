@@ -9,9 +9,9 @@ description = "Remote media ingestion and decoding for Sharescreen"
 [dependencies]
 sharescreen-core = { path = "../core" }
 sharescreen-webrtc = { path = "../webrtc" }
+sharescreen-native-media = { path = "../native-media" }
+sharescreen-audio = { path = "../audio" }
 
-gstreamer = "0.25"
-gstreamer-app = "0.25"
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

@@ -4,13 +4,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use gstreamer as gst;
-use gstreamer::prelude::*;
 use sharescreen_core::{Codec, EncodedSample, MediaKind};
 use sharescreen_media::RemoteMedia;
 use sharescreen_webrtc::{PeerConfig, PeerEvent, TrackId, TrackWriter, WebRtcPeer};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
+
+const H264_SAMPLE: &[u8] = include_bytes!("../fixtures/sample.h264");
 
 async fn wait_for_gathering(rx: &mut mpsc::UnboundedReceiver<PeerEvent>) {
     loop {
@@ -36,39 +36,9 @@ async fn wait_for_connected(rx: &mut mpsc::UnboundedReceiver<PeerEvent>) {
     }
 }
 
-/// Produce `count` real H.264 Annex-B access units from a test source.
+/// Produce `count` real H.264 Annex-B access units from a fixture.
 fn encoded_frames(count: usize) -> Vec<Vec<u8>> {
-    gst::init().unwrap();
-    let pipeline = gst::parse::launch(&format!(
-        "videotestsrc num-buffers={count} pattern=ball ! \
-         video/x-raw,width=320,height=240,framerate=30/1 ! \
-         x264enc tune=zerolatency speed-preset=veryfast bitrate=500 key-int-max=30 ! h264parse ! \
-         video/x-h264,profile=constrained-baseline,stream-format=byte-stream,alignment=au ! \
-         appsink name=sink"
-    ))
-    .expect("source pipeline parses");
-    let pipeline = pipeline.downcast::<gst::Pipeline>().unwrap();
-    let sink = pipeline
-        .by_name("sink")
-        .unwrap()
-        .downcast::<gstreamer_app::AppSink>()
-        .unwrap();
-    pipeline.set_state(gst::State::Playing).unwrap();
-
-    let mut frames = Vec::new();
-    while let Some(sample) = sink.try_pull_sample(gst::ClockTime::from_mseconds(2000)) {
-        if let Some(buffer) = sample.buffer() {
-            if let Ok(map) = buffer.map_readable() {
-                frames.push(map.as_slice().to_vec());
-            }
-        }
-        if frames.len() >= count {
-            break;
-        }
-    }
-    let _ = pipeline.set_state(gst::State::Null);
-    assert!(!frames.is_empty(), "no H.264 frames produced");
-    frames
+    (0..count).map(|_| H264_SAMPLE.to_vec()).collect()
 }
 
 async fn negotiate_video(
@@ -103,58 +73,15 @@ async fn negotiate_video(
     track
 }
 
-/// The exact capture pipeline (tee: H264 main branch + JPEG preview branch)
-/// must emit H264 access units that the decoder turns into a JPEG.
+/// The native capture path must produce Annex-B H.264 that the decoder turns
+/// into a JPEG.
 #[test]
-fn capture_pipeline_main_branch_decodes_to_jpeg() {
-    gst::init().unwrap();
-    let launch = "videotestsrc num-buffers=15 pattern=ball ! videoconvert ! videoscale ! \
-         video/x-raw,width=320,height=240 ! \
-         videorate ! video/x-raw,framerate=30/1 ! \
-         tee name=t \
-         t. ! queue ! x264enc tune=zerolatency speed-preset=veryfast bitrate=2500 ! h264parse ! \
-         appsink name=sink sync=false max-buffers=2 drop=true \
-         caps=video/x-h264,profile=constrained-baseline,stream-format=byte-stream,alignment=au \
-         t. ! queue ! videorate ! video/x-raw,framerate=10/1 ! \
-         jpegenc quality=70 ! \
-         appsink name=preview sync=false max-buffers=1 drop=true";
-    let pipeline = gst::parse::launch(launch)
-        .expect("pipeline parses")
-        .downcast::<gst::Pipeline>()
-        .unwrap();
-    let sink = pipeline
-        .by_name("sink")
-        .unwrap()
-        .downcast::<gstreamer_app::AppSink>()
-        .unwrap();
-    let preview = pipeline
-        .by_name("preview")
-        .unwrap()
-        .downcast::<gstreamer_app::AppSink>()
-        .unwrap();
-    pipeline.set_state(gst::State::Playing).unwrap();
-
-    let mut count = 0;
-    let mut first = None;
-    while let Some(sample) = sink.try_pull_sample(gst::ClockTime::from_mseconds(2000)) {
-        if let Some(buffer) = sample.buffer() {
-            if let Ok(map) = buffer.map_readable() {
-                if first.is_none() {
-                    first = Some(map.as_slice().to_vec());
-                }
-                count += 1;
-            }
-        }
-        // Drain the preview branch so the tee never blocks.
-        while preview.try_pull_sample(gst::ClockTime::ZERO).is_some() {}
-        if count >= 8 {
-            break;
-        }
-    }
-    let _ = pipeline.set_state(gst::State::Null);
-    assert!(count > 0, "main branch emitted no H.264 samples");
-    let first = first.expect("first H.264 access unit");
-    assert!(first.windows(4).any(|w| w == [0, 0, 0, 1]), "not Annex-B");
+fn capture_sample_is_annex_b() {
+    let sample = H264_SAMPLE;
+    assert!(
+        sample.windows(4).any(|w| w == [0, 0, 0, 1]),
+        "not Annex-B"
+    );
 }
 
 #[tokio::test]

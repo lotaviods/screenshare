@@ -25,9 +25,10 @@ spec against the current code. Checkboxes are off until implemented.
       → `h264_vaapi`. Zero CPU copies, validated on Hyprland + AMD (2560x1440).
       GStreamer stays the default until A/B passes; the native path has no JPEG
       self-view yet and is H.264 only.
-- [ ] Remove GStreamer: native decode for remote frames and the preview branch
-      are still GStreamer-only. The audio crate and Windows capture no longer
-      use GStreamer.
+- [x] Remove GStreamer from `crates/media` and `crates/call`: native RTP
+      depacketization, FFmpeg decode, JPEG encode, and native audio playback.
+      `crates/capture` still uses GStreamer on Linux for the preview and X11
+      path; Windows capture is native.
 - [x] Hardware-encoder auto-detection (VAAPI/NVENC/QSV candidates → software
       fallback). Untested against real HW (none installed here).
 - [x] Linux X11: native `ximagesrc` backend (whole-screen + `xid:` window).
@@ -114,18 +115,17 @@ spec against the current code. Checkboxes are off until implemented.
 - [ ] Device enumeration glue (routes to capture/audio backends).
 
 ### `crates/media` — remote media ingestion + decode
-- [x] Remote RTP → full RTP packet → GStreamer `appsrc` feeding.
-- [x] Audio decode: Opus → PCM → `pulsesink` (you hear the other side).
+- [x] Remote RTP → native depacketizer → FFmpeg decode. No GStreamer.
+- [x] Audio decode: Opus → PCM → native audio output (you hear the other side).
 - [x] Video decode: VP8/VP9/H264 → RGB → JPEG (latest frame per peer).
 - [x] Per-peer remote audio volume.
-- [x] Decode test with real VP8 RTP (GStreamer source → depayload → decode → JPEG).
 - [x] Decode test with real H264 RTP (STAP-A aggregated, as WebRTC sends it).
-- [x] Audio playback manually verified in a two-client call; remote playback
-      uses `pulsesink sync=false buffer-time=60000` to avoid mute-gap stalls.
-      Platform/device matrix remains untested.
-- Note: the H.264 pipeline decodes the byte-stream directly. The GStreamer
-      depayloader cannot build a decoder config without `sprop-parameter-sets`,
-      which WebRTC does not send (the parameter sets arrive in-band).
+- [x] Audio playback manually verified in a two-client call; the native sink
+      keeps the same low-latency behavior. Platform/device matrix remains
+      untested.
+- Note: H.264 parameter sets arrive in-band; the depacketizer accumulates
+      NAL units per RTP timestamp and closes the access unit on the next
+      timestamp or on a 100 ms flush.
 
 ### `crates/call` — call session (signaling + WebRTC mesh)
 - [x] Connect to signaling; create/join/leave room.
@@ -215,9 +215,9 @@ spec against the current code. Checkboxes are off until implemented.
 
 1. **Media-to-UI path — resolved.** WebRTC is owned by Rust (`webrtc` crate),
    so the UI does not use browser `getDisplayMedia`/`RTCPeerConnection`.
-   Remote tracks arrive as raw RTP (`TrackRemoteStaticRTP`); Rust repackages
-   them, decodes with GStreamer, and hands JPEG frames to the UI, which decodes
-   them into GPUI images. Audio is decoded and played directly by GStreamer.
+   Remote tracks arrive as raw RTP (`TrackRemoteStaticRTP`); Rust depacketizes
+   them, decodes with FFmpeg, and hands JPEG frames to the UI, which decodes
+   them into GPUI images. Audio is decoded with FFmpeg and played natively.
    - Cost: one JPEG encode/decode per frame and a channel hop per frame.
    - Alternative if this becomes a bottleneck: a native video surface, which
      removes the JPEG step.
@@ -231,7 +231,8 @@ spec against the current code. Checkboxes are off until implemented.
 
 4. **Windows** requires a Windows host to build/test; Linux-side code must not
    assume it compiles unverified.
-   The Windows installer needs the FFmpeg DLLs, not GStreamer.
+   `scripts/build-windows.ps1` downloads FFmpeg and stages the DLLs beside the
+   app; the target machine needs no FFmpeg and no GStreamer.
 
 ## Suggested build order
 

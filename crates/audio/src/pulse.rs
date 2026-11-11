@@ -327,6 +327,66 @@ impl Drop for Recorder {
     }
 }
 
+/// Plays remote audio on a PulseAudio output device.
+pub(crate) struct PlaybackSink {
+    mainloop: Mainloop,
+    context: Context,
+    stream: PulseStream,
+}
+
+impl PlaybackSink {
+    /// Open a playback stream on `device` (or the default output).
+    pub(crate) fn open(device: Option<String>) -> Result<Self, String> {
+        let mut mainloop = Mainloop::new().ok_or("failed to create PulseAudio mainloop")?;
+        let mut context = Context::new(&mainloop, "sharescreen-playback")
+            .ok_or("failed to create PulseAudio context")?;
+        if let Err(e) = context.connect(None, FlagSet::NOFLAGS, None) {
+            return Err(format!("PulseAudio connect failed: {e:?}"));
+        }
+        wait_ready(&mut mainloop, &context)?;
+
+        let spec = Spec {
+            format: Format::S16le,
+            channels: CHANNELS,
+            rate: RATE,
+        };
+        let mut map = pulse::channelmap::Map::default();
+        map.init_stereo();
+        let mut stream = PulseStream::new(&mut context, "sharescreen playback", &spec, Some(&map))
+            .ok_or("failed to create audio playback stream")?;
+        stream
+            .connect_playback(
+                device.as_deref(),
+                None,
+                StreamFlags::empty(),
+                None,
+                None,
+            )
+            .map_err(|e| format!("failed to connect playback: {e}"))?;
+        Ok(Self {
+            mainloop,
+            context,
+            stream,
+        })
+    }
+
+    /// Write interleaved 16-bit stereo samples. The stream is drained on the
+    /// next call, so a burst is bounded by the server's buffer.
+    pub(crate) fn play(&mut self, samples: &[i16]) {
+        let bytes = samples
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect::<Vec<u8>>();
+        let _ = self.stream.write_copy(&bytes, 0, pulse::stream::SeekMode::Relative);
+        self.mainloop.iterate(false);
+    }
+
+    pub(crate) fn stop(&mut self) {
+        let _ = self.stream.disconnect();
+        self.context.disconnect();
+    }
+}
+
 /// A live mix of every non-call playback stream on one monitor sink.
 pub(crate) struct Mixer {
     mainloop: Mainloop,

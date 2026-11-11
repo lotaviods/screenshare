@@ -14,10 +14,11 @@ use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Media::Audio::{
     eCapture, eConsole, eRender, ActivateAudioInterfaceAsync, EDataFlow,
     IActivateAudioInterfaceAsyncOperation, IActivateAudioInterfaceCompletionHandler,
-    IActivateAudioInterfaceCompletionHandler_Impl, IAudioCaptureClient, IAudioClient, IMMDevice,
-    IMMDeviceCollection, IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT,
-    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_LOOPBACK,
-    AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, AUDIOCLIENT_ACTIVATION_PARAMS,
+    IActivateAudioInterfaceCompletionHandler_Impl, IAudioCaptureClient, IAudioClient,
+    IAudioRenderClient, IMMDevice, IMMDeviceCollection, IMMDeviceEnumerator, MMDeviceEnumerator,
+    AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+    AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+    AUDIOCLIENT_ACTIVATION_PARAMS,
     AUDIOCLIENT_ACTIVATION_PARAMS_0, AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
     AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS, DEVICE_STATE_ACTIVE,
     PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
@@ -141,6 +142,82 @@ impl Recorder {
 
 impl Drop for Recorder {
     fn drop(&mut self) {
+        unsafe {
+            let _ = self.client.Stop();
+        }
+    }
+}
+
+/// Plays remote audio on a WASAPI render endpoint.
+pub(crate) struct Playback {
+    client: IAudioClient,
+    render: IAudioRenderClient,
+    buffer_size: u32,
+    _com: Com,
+}
+
+impl Playback {
+    /// Open a playback endpoint (default when `device` is `None`).
+    pub(crate) fn open(device: Option<String>) -> Result<Self, String> {
+        let com = Com::init();
+        let device = resolve_device(device)?;
+        let client: IAudioClient =
+            unsafe { device.Activate(CLSCTX_ALL, None) }.map_err(|e| e.to_string())?;
+        let format = WAVEFORMATEX {
+            wFormatTag: WAVE_FORMAT_PCM as u16,
+            nChannels: 2,
+            nSamplesPerSec: 48_000,
+            nAvgBytesPerSec: 48_000 * 2 * 2,
+            nBlockAlign: 2 * 2,
+            wBitsPerSample: 16,
+            cbSize: 0,
+        };
+        unsafe {
+            client
+                .Initialize(
+                    AUDCLNT_SHAREMODE_SHARED,
+                    AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                    0,
+                    0,
+                    &format,
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+            let render: IAudioRenderClient = client.GetService().map_err(|e| e.to_string())?;
+            let buffer_size = client.GetBufferSize().map_err(|e| e.to_string())?;
+            client.Start().map_err(|e| e.to_string())?;
+            Ok(Self {
+                client,
+                render,
+                buffer_size,
+                _com: com,
+            })
+        }
+    }
+
+    /// Write interleaved 16-bit stereo samples. Drops what does not fit.
+    pub(crate) fn play(&mut self, samples: &[i16]) {
+        let bytes = samples
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect::<Vec<u8>>();
+        unsafe {
+            let padding = self.client.GetCurrentPadding().unwrap_or(0);
+            let available = self.buffer_size.saturating_sub(padding);
+            if available == 0 {
+                return;
+            }
+            let Ok(buffer) = self.render.GetBuffer(available) else {
+                return;
+            };
+            let slice = std::slice::from_raw_parts_mut(buffer as *mut u8, available as usize * 4);
+            let len = bytes.len().min(slice.len());
+            slice[..len].copy_from_slice(&bytes[..len]);
+            let _ = self.render.ReleaseBuffer(available, 0);
+        }
+    }
+
+    pub(crate) fn stop(&mut self) {
         unsafe {
             let _ = self.client.Stop();
         }

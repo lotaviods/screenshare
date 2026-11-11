@@ -3,45 +3,15 @@
 
 use std::time::Duration;
 
-use gstreamer as gst;
-use gstreamer::prelude::*;
 use sharescreen_call::{CallConfig, CallSession};
 use sharescreen_core::{Codec, EncodedSample, MediaKind};
 use sharescreen_server::app_with;
 use sharescreen_server::turn::TurnConfig;
 
-fn encoded_frames(count: usize) -> Vec<Vec<u8>> {
-    gst::init().unwrap();
-    let pipeline = gst::parse::launch(&format!(
-        "videotestsrc num-buffers={count} pattern=ball ! \
-         video/x-raw,width=320,height=240,framerate=30/1 ! \
-         x264enc tune=zerolatency speed-preset=veryfast bitrate=500 key-int-max=30 ! h264parse ! \
-         video/x-h264,profile=constrained-baseline,stream-format=byte-stream,alignment=au ! \
-         appsink name=sink"
-    ))
-    .expect("source pipeline parses");
-    let pipeline = pipeline.downcast::<gst::Pipeline>().unwrap();
-    let sink = pipeline
-        .by_name("sink")
-        .unwrap()
-        .downcast::<gstreamer_app::AppSink>()
-        .unwrap();
-    pipeline.set_state(gst::State::Playing).unwrap();
+const H264_SAMPLE: &[u8] = include_bytes!("fixtures/sample.h264");
 
-    let mut frames = Vec::new();
-    while let Some(sample) = sink.try_pull_sample(gst::ClockTime::from_mseconds(2000)) {
-        if let Some(buffer) = sample.buffer() {
-            if let Ok(map) = buffer.map_readable() {
-                frames.push(map.as_slice().to_vec());
-            }
-        }
-        if frames.len() >= count {
-            break;
-        }
-    }
-    let _ = pipeline.set_state(gst::State::Null);
-    assert!(!frames.is_empty(), "no H.264 frames produced");
-    frames
+fn encoded_frames(count: usize) -> Vec<Vec<u8>> {
+    (0..count).map(|_| H264_SAMPLE.to_vec()).collect()
 }
 
 #[tokio::test]

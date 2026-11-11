@@ -78,8 +78,8 @@ GNOME, and Sway all implement via their portal backends.
 - **GStreamer** (via `gstreamer` Rust bindings): receives PipeWire frames and
   encodes them (`vaapih264enc`, `nvh264enc`, `vah264enc`, `vp8enc`, `x264enc`),
   then hands encoded frames to `webrtc` tracks through an `appsink`. This gives
-  hardware-accelerated encoding without writing encoder code by hand, and the
-  same pipeline shape works on Windows.
+  hardware-accelerated encoding without writing encoder code by hand. The
+  Windows path uses GDI + FFmpeg instead.
 - **Native GPU path** (`crates/native-media`, opt-in with
   `SHARESCREEN_MEDIA=native`): skips GStreamer entirely. The compositor exports
   DMA-BUFs, FFmpeg imports them into VAAPI surfaces, `scale_vaapi` converts RGB
@@ -160,7 +160,7 @@ sharescreen/
 │   └── ui/          # GPUI desktop UI + backend actor
 ├── server/          # axum signaling server (independent of the app)
 ├── deploy/          # Docker Compose, Dockerfiles, .env.example
-├── vendor/          # patched crates (xattr ENOATTR fix for GPUI)
+├── vendor/          # patched crates (xattr ENOATTR fix, ffmpeg-sys-next D3D)
 └── Cargo.toml       # workspace
 ```
 
@@ -179,20 +179,24 @@ Capture → encode → sample queue → WebRTC track. No raw frames cross the UI
 boundary; only decoded JPEG frames for display.
 
 ```
-portal/pipewire (Linux), GDI (Windows), X11  ──►  native encoder  ──►  appsink
-                                                                   │ EncodedSample
-                                                                   ▼
-                                                        mpsc channel (bounded)
-                                                                   │
-                                                              webrtc crate
-                                                       TrackLocalStaticSample
-                                                                   │ RTP
-                                                                   ▼
-                                                              UDP sockets
+portal/pipewire (Linux), GDI (Windows), X11  ──►  native encoder  ──►  EncodedSample
+                                                                      │
+                                                                      ▼
+                                                              mpsc channel (bounded)
+                                                                      │
+                                                                  webrtc crate
+                                                           TrackLocalStaticSample
+                                                                      │ RTP
+                                                                      ▼
+                                                                  UDP sockets
 ```
 
 `EncodedSample { kind, codec, data, timestamp_micros, keyframe }` is the shared
 unit between capture/audio backends and the WebRTC layer, defined in `core`.
+
+Remote tracks are the mirror image: RTP packets → native depacketizer →
+FFmpeg decode → RGB → JPEG for the UI, or Opus → PCM → native audio output.
+No GStreamer is involved in `crates/media` or `crates/call`.
 
 ## Signaling protocol (draft)
 

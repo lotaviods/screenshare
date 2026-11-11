@@ -19,6 +19,9 @@ mod pulse;
 #[cfg(windows)]
 mod wasapi;
 
+pub mod playback;
+pub use playback::Output;
+
 use async_trait::async_trait;
 #[cfg(target_os = "linux")]
 use sharescreen_core::DeviceKind;
