@@ -100,6 +100,7 @@ pub struct AppView {
     monitors: Vec<Device>,
 
     remote_frame: Option<Arc<RenderImage>>,
+    local_frame: Option<Arc<RenderImage>>,
     pip_window: Option<WindowHandle<PipView>>,
     pip_entity: Option<Entity<PipView>>,
 }
@@ -146,6 +147,7 @@ impl AppView {
             outputs: Vec::new(),
             monitors: Vec::new(),
             remote_frame: None,
+            local_frame: None,
             pip_window: None,
             pip_entity: None,
         };
@@ -198,12 +200,14 @@ impl AppView {
         } else {
             None
         };
-        if peer.is_none() && self.pip_window.is_none() {
+        let local = self.screen == Screen::Call && self.sharing;
+        if peer.is_none() && self.pip_window.is_none() && !local {
             return None;
         }
         Some(FrameRequest {
             peer,
             pip: self.pip_window.is_some(),
+            local,
         })
     }
 
@@ -224,6 +228,7 @@ impl AppView {
                     self.room_id = None;
                     self.participants.clear();
                     self.remote_frame = None;
+                    self.local_frame = None;
                 }
             }
             UiEvent::Call(event) => self.handle_call_event(event),
@@ -244,9 +249,15 @@ impl AppView {
             }
             UiEvent::Mic(on) => self.mic_on = on,
             UiEvent::System(on) => self.system_on = on,
-            UiEvent::Sharing(on) => self.sharing = on,
+            UiEvent::Sharing(on) => {
+                self.sharing = on;
+                if !on {
+                    self.local_frame = None;
+                }
+            }
             UiEvent::Frame { kind, jpeg } => match kind {
                 FrameKind::Remote => self.remote_frame = decode_frame(jpeg),
+                FrameKind::Local => self.local_frame = decode_frame(jpeg),
                 FrameKind::Pip => {
                     let frame = decode_frame(jpeg);
                     if let Some(pip) = &self.pip_entity {
@@ -271,6 +282,7 @@ impl AppView {
                 self.room_id = None;
                 self.participants.clear();
                 self.remote_frame = None;
+                self.local_frame = None;
                 self.screen = Screen::Home;
             }
             CallEvent::ParticipantJoined { participant }
@@ -336,6 +348,7 @@ impl AppView {
         self.room_id = None;
         self.participants.clear();
         self.remote_frame = None;
+        self.local_frame = None;
         self.screen = Screen::Home;
         cx.notify();
     }
@@ -510,6 +523,7 @@ impl AppView {
         self.room_id = None;
         self.participants.clear();
         self.remote_frame = None;
+        self.local_frame = None;
         self.screen = Screen::Home;
         cx.notify();
     }
@@ -519,6 +533,7 @@ impl AppView {
         self.room_id = None;
         self.participants.clear();
         self.remote_frame = None;
+        self.local_frame = None;
         self.screen = Screen::Home;
         cx.notify();
     }
@@ -1076,8 +1091,8 @@ impl AppView {
             .participants
             .iter()
             .find(|participant| participant.screen_on);
-        let stage = match (&self.remote_frame, sharer) {
-            (Some(frame), Some(participant)) => div()
+        let stage = if let (Some(frame), Some(participant)) = (&self.remote_frame, sharer) {
+            div()
                 .relative()
                 .size_full()
                 .flex()
@@ -1106,8 +1121,42 @@ impl AppView {
                                 .child(SharedString::from(participant.name.clone())),
                         )
                         .child(button("open-pip", "PiP").on_click(cx.listener(Self::open_pip))),
-                ),
-            _ => div()
+                )
+        } else if let (true, Some(frame)) = (self.sharing, &self.local_frame) {
+            // While this peer is sharing, show its own capture as the main
+            // stage self-view so the user can see what others receive.
+            div()
+                .relative()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    img(frame.clone())
+                        .object_fit(ObjectFit::Contain)
+                        .size_full(),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top_2()
+                        .right_2()
+                        .flex()
+                        .flex_row()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0xffffff))
+                                .bg(rgb(0x000000))
+                                .px_2()
+                                .rounded_md()
+                                .child("You"),
+                        )
+                        .child(button("open-pip", "PiP").on_click(cx.listener(Self::open_pip))),
+                )
+        } else {
+            div()
                 .size_full()
                 .flex()
                 .items_center()
@@ -1117,7 +1166,7 @@ impl AppView {
                     "You are sharing your screen."
                 } else {
                     "No one is sharing a screen."
-                }),
+                })
         };
 
         div().flex().flex_row().size_full().child(sidebar).child(

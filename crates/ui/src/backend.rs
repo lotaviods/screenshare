@@ -21,6 +21,7 @@ use tokio::sync::mpsc;
 pub enum FrameKind {
     Remote,
     Pip,
+    Local,
 }
 
 impl FrameKind {
@@ -28,6 +29,7 @@ impl FrameKind {
         match self {
             Self::Remote => 0,
             Self::Pip => 1,
+            Self::Local => 2,
         }
     }
 }
@@ -39,6 +41,8 @@ pub struct FrameRequest {
     pub peer: Option<String>,
     /// Fetch the best frame for the picture-in-picture window.
     pub pip: bool,
+    /// Fetch this peer's own self-view frame for the main stage while sharing.
+    pub local: bool,
 }
 
 #[derive(Debug)]
@@ -146,7 +150,7 @@ struct Actor {
     share: Option<ShareTarget>,
     mic_running: bool,
     /// Last hash sent per frame stream. `None` means nothing sent yet.
-    frames: [Option<Option<u64>>; 2],
+    frames: [Option<Option<u64>>; 3],
     last_hotplug_check: std::time::Instant,
 }
 
@@ -166,7 +170,7 @@ impl Actor {
             call: None,
             share: None,
             mic_running: false,
-            frames: [None; 2],
+            frames: [None; 3],
             last_hotplug_check: std::time::Instant::now(),
         }
     }
@@ -460,6 +464,9 @@ impl Actor {
         if let Some(call) = &self.call {
             call.set_screen_sharing(true);
         }
+        // Force the next self-view frame through even if it matches the last one
+        // sent before a previous share.
+        self.frames[FrameKind::Local.index()] = None;
         self.send(UiEvent::Sharing(true));
 
         if include_system_audio {
@@ -485,6 +492,7 @@ impl Actor {
         if let Some(call) = &self.call {
             call.set_screen_sharing(false);
         }
+        self.frames[FrameKind::Local.index()] = None;
         self.send(UiEvent::Sharing(false));
         Ok(())
     }
@@ -538,6 +546,11 @@ impl Actor {
                 .or_else(|| self.capture.latest_preview());
             self.emit_frame(FrameKind::Pip, frame);
         }
+
+        if request.local {
+            let frame = self.capture.latest_preview();
+            self.emit_frame(FrameKind::Local, frame);
+        }
     }
 
     fn emit_frame(&mut self, kind: FrameKind, jpeg: Option<Vec<u8>>) {
@@ -584,5 +597,6 @@ mod tests {
     fn frame_kind_indexes_are_distinct() {
         assert_eq!(FrameKind::Remote.index(), 0);
         assert_eq!(FrameKind::Pip.index(), 1);
+        assert_eq!(FrameKind::Local.index(), 2);
     }
 }
