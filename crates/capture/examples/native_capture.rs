@@ -1,25 +1,29 @@
 //! Runtime check of the production native capture path.
 //!
-//! Starts `WaylandCapture` exactly as the app does, receives encoded samples
-//! from the sink for a few seconds, and writes them as Annex B H.264.
+//! Starts the crate's backend facade ([`CaptureEngine`]) exactly as the app
+//! does — the Wayland/portal path on Linux, GDI on Windows — receives encoded
+//! samples from the sink for a few seconds, and writes them as Annex B H.264.
 //!
 //! ```sh
-//! SHARESCREEN_MEDIA=native cargo run -p sharescreen-capture --example native_capture -- /tmp/native.h264
+//! cargo run -p sharescreen-capture --example native_capture -- /tmp/native.h264
 //! ```
 
 use std::time::Duration;
 
-use sharescreen_capture::WaylandCapture;
+use sharescreen_capture::CaptureEngine;
 use sharescreen_core::{
-    CaptureOptions, CaptureSource, Codec, CursorMode, ScreenCapture, SourceKind,
+    CaptureBackend, CaptureOptions, CaptureSource, Codec, CursorMode, ScreenCapture, SourceKind,
 };
 
 #[tokio::main]
 async fn main() {
-    let path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "/tmp/sharescreen-native.h264".to_string());
-    let mut capture = WaylandCapture::default();
+    let path = std::env::args().nth(1).unwrap_or_else(|| {
+        std::env::temp_dir()
+            .join("sharescreen-native.h264")
+            .to_string_lossy()
+            .into_owned()
+    });
+    let mut capture = CaptureEngine::new(CaptureBackend::Auto).expect("capture backend");
     let (sink, mut samples) = tokio::sync::mpsc::channel(64);
 
     let options = CaptureOptions {
@@ -31,13 +35,17 @@ async fn main() {
         bitrate_kbps: 6000,
         hardware_encoding: true,
     };
-    let source = CaptureSource {
-        id: "screen".into(),
-        name: "screen".into(),
-        kind: SourceKind::Screen,
-    };
+    let source = capture
+        .list_sources()
+        .into_iter()
+        .next()
+        .unwrap_or(CaptureSource {
+            id: "screen".into(),
+            name: "screen".into(),
+            kind: SourceKind::Screen,
+        });
 
-    println!("opening portal picker...");
+    println!("capturing {source:?}...");
     capture.start(source, options, sink).await.expect("start");
 
     let mut out = std::fs::File::create(&path).expect("create output");

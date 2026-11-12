@@ -8,17 +8,26 @@
 //!
 //! The compositor picker appears once. The probe prints the negotiated buffer
 //! layout, encodes NV12 frames for a few seconds, and writes Annex B H.264.
+//!
+//! Linux-only: it drives the XDG portal, PipeWire, and VAAPI directly.
 
-use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::os::fd::AsRawFd;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::{
+    fs::File,
+    io::{BufWriter, Write},
+    os::fd::AsRawFd,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
-use sharescreen_native_media::capture::{pipewire, pipewire::Memory, portal};
-use sharescreen_native_media::encode::{EncoderConfig, FfmpegEncoder, VideoEncoder};
-use sharescreen_native_media::frame::DmaBufFrame;
+#[cfg(target_os = "linux")]
+use sharescreen_native_media::{
+    capture::{pipewire, pipewire::Memory, portal},
+    encode::{EncoderConfig, FfmpegEncoder, VideoEncoder},
+    frame::DmaBufFrame,
+};
 
+#[cfg(target_os = "linux")]
 #[derive(Default)]
 struct Sink {
     encoder: Option<FfmpegEncoder>,
@@ -28,6 +37,7 @@ struct Sink {
     skipped: usize,
 }
 
+#[cfg(target_os = "linux")]
 impl Sink {
     fn frame(&mut self, frame: &DmaBufFrame) {
         if frame.format().is_none() {
@@ -90,6 +100,7 @@ impl Sink {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var("SS_PROBE_DEBUG").is_ok() {
@@ -128,4 +139,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sink.encoded, sink.keyframes, sink.skipped
     );
     Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("probe is Linux-only (portal + PipeWire + VAAPI)");
 }
