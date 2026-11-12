@@ -216,7 +216,7 @@ impl Playback {
             let Ok(buffer) = self.render.GetBuffer(available) else {
                 return;
             };
-            let slice = std::slice::from_raw_parts_mut(buffer as *mut u8, available as usize * 4);
+            let slice = std::slice::from_raw_parts_mut(buffer, available as usize * 4);
             let len = bytes.len().min(slice.len());
             slice[..len].copy_from_slice(&bytes[..len]);
             let _ = self.render.ReleaseBuffer(available, 0);
