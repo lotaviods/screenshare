@@ -69,6 +69,12 @@ pub struct AppView {
     connected: bool,
     connecting: bool,
     room_id: Option<String>,
+    /// Room to re-join after an automatic reconnect (see [`Self::reconnect_for_codec`]).
+    pending_rejoin: Option<String>,
+    /// Media to restart once an automatic reconnect completes.
+    resume_mic: bool,
+    resume_system: bool,
+    resume_share: bool,
     participants: Vec<Participant>,
     error: Option<String>,
     mic_on: bool,
@@ -122,6 +128,10 @@ impl AppView {
             connected: false,
             connecting: false,
             room_id: None,
+            pending_rejoin: None,
+            resume_mic: false,
+            resume_system: false,
+            resume_share: false,
             participants: Vec::new(),
             error: None,
             mic_on: false,
@@ -223,15 +233,21 @@ impl AppView {
                 tracing::info!(connected, "ui connection state changed");
                 self.connecting = false;
                 self.connected = connected;
-                if !connected {
-                    self.screen = Screen::Home;
+                if connected {
+                    self.resume_media_after_reconnect();
+                } else {
+                    // Stay on the call screen while a codec-driven reconnect is
+                    // in flight; only fall back to Home for a real disconnect.
+                    if self.pending_rejoin.is_none() {
+                        self.screen = Screen::Home;
+                    }
                     self.room_id = None;
                     self.participants.clear();
                     self.remote_frame = None;
                     self.local_frame = None;
                 }
             }
-            UiEvent::Call(event) => self.handle_call_event(event),
+            UiEvent::Call(event) => self.handle_call_event(event, cx),
             UiEvent::Devices {
                 microphones,
                 outputs,
@@ -272,11 +288,16 @@ impl AppView {
         cx.notify();
     }
 
-    fn handle_call_event(&mut self, event: CallEvent) {
+    fn handle_call_event(&mut self, event: CallEvent, cx: &mut Context<Self>) {
         match event {
             CallEvent::RoomCreated { room_id } | CallEvent::RoomJoined { room_id } => {
                 self.room_id = Some(room_id);
                 self.screen = Screen::Call;
+                if self.resume_share {
+                    self.resume_share = false;
+                    tracing::info!("resuming screen share after reconnect");
+                    self.begin_share(cx);
+                }
             }
             CallEvent::RoomDeleted { .. } => {
                 self.room_id = None;
@@ -346,6 +367,10 @@ impl AppView {
         self.connected = false;
         self.connecting = false;
         self.room_id = None;
+        self.pending_rejoin = None;
+        self.resume_mic = false;
+        self.resume_system = false;
+        self.resume_share = false;
         self.participants.clear();
         self.remote_frame = None;
         self.local_frame = None;
@@ -418,16 +443,71 @@ impl AppView {
             cx.notify();
             return;
         }
+        let codec_changed =
+            codec_requires_reconnect(self.config.video.codec, config.video.codec, self.connected);
         self.settings = config.clone();
         self.config = config.clone();
         self.error = None;
         self.backend.send(Command::SaveConfig(config));
+        // The video codec is baked into the call's SDP and screen track at
+        // negotiation time, so a new choice only takes effect on a fresh
+        // connection. Reconnect (and re-join the room) now so the user's pick
+        // applies without a manual disconnect.
+        if codec_changed && self.connected {
+            self.reconnect_for_codec();
+        }
         self.screen = if self.room_id.is_some() {
             Screen::Call
         } else {
             Screen::Home
         };
         cx.notify();
+    }
+
+    /// Re-establish the call session so a changed video codec is negotiated in.
+    ///
+    /// The local media streams are bound to the session they were started on,
+    /// so mic/system audio and any active share are stopped here and restarted
+    /// once the new session reports connected and the room is re-joined.
+    fn reconnect_for_codec(&mut self) {
+        tracing::info!("video codec changed while connected; reconnecting to apply it");
+        self.pending_rejoin = self.room_id.clone();
+        self.resume_mic = self.mic_on;
+        self.resume_system = self.system_on;
+        self.resume_share = self.sharing && self.room_id.is_some();
+        if self.sharing {
+            self.backend.send(Command::StopShare);
+            self.sharing = false;
+            self.local_frame = None;
+        }
+        if self.mic_on {
+            self.backend.send(Command::StopMic);
+        }
+        if self.system_on {
+            self.backend.send(Command::StopSystem);
+        }
+        self.backend.send(Command::Disconnect);
+        self.backend.send(Command::Connect);
+        self.connecting = true;
+    }
+
+    /// Restart mic/system audio on the new session, then re-join the room.
+    /// Called once a reconnect completes (see [`Self::reconnect_for_codec`]).
+    fn resume_media_after_reconnect(&mut self) {
+        if self.resume_mic {
+            self.resume_mic = false;
+            self.backend
+                .send(Command::StartMic(self.config.audio.mic_device_id.clone()));
+        }
+        if self.resume_system {
+            self.resume_system = false;
+            let device = self.monitors.first().map(|device| device.id.clone());
+            self.backend.send(Command::StartSystem(device));
+        }
+        if let Some(room) = self.pending_rejoin.take() {
+            tracing::info!(%room, "re-joining room after reconnect");
+            self.backend.send(Command::JoinRoom(room));
+        }
     }
 
     fn open_settings(&mut self, cx: &mut Context<Self>) {
@@ -558,11 +638,13 @@ impl AppView {
         cx.notify();
     }
 
-    fn on_start_share(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+    /// Start sharing the draft source with the current settings. Returns false
+    /// (after surfacing an error) when there is nothing shareable.
+    fn begin_share(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(source_id) = self.share.source.clone() else {
             self.error = Some("no capture source available".into());
             cx.notify();
-            return;
+            return false;
         };
         let Some(source) = self
             .sources
@@ -572,7 +654,7 @@ impl AppView {
         else {
             self.error = Some("capture source disappeared".into());
             cx.notify();
-            return;
+            return false;
         };
         let options = CaptureOptions {
             width: self.share.width,
@@ -593,7 +675,13 @@ impl AppView {
             options,
             include_system_audio: self.share.system_audio,
         });
-        self.share_open = false;
+        true
+    }
+
+    fn on_start_share(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.begin_share(cx) {
+            self.share_open = false;
+        }
         cx.notify();
     }
 
@@ -2141,6 +2229,14 @@ fn next_device(devices: &[Device], current: Option<String>) -> Option<String> {
     }
 }
 
+/// Whether changing the video codec requires a new call session to take effect.
+///
+/// The codec is registered in the SDP and baked into the screen track when the
+/// session negotiates, so a new choice only applies on a fresh connection.
+fn codec_requires_reconnect(previous: Codec, next: Codec, connected: bool) -> bool {
+    connected && previous != next
+}
+
 fn decode_frame(jpeg: Option<Vec<u8>>) -> Option<Arc<RenderImage>> {
     let jpeg = jpeg?;
     let decoded = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg)
@@ -2163,6 +2259,15 @@ mod tests {
         assert_eq!(initials("Ada Lovelace"), "AL");
         assert_eq!(initials("zed"), "ZE");
         assert_eq!(initials(""), "?");
+    }
+
+    #[test]
+    fn codec_change_reconnects_only_while_connected() {
+        // A new codec needs a fresh session, so only reconnect when one exists.
+        assert!(codec_requires_reconnect(Codec::H264, Codec::Vp9, true));
+        assert!(!codec_requires_reconnect(Codec::H264, Codec::Vp9, false));
+        // Picking the same codec again must not churn the connection.
+        assert!(!codec_requires_reconnect(Codec::Vp9, Codec::Vp9, true));
     }
 
     #[test]

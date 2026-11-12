@@ -437,7 +437,15 @@ impl Actor {
         let sink = self.media_sink(Stream::Screen);
         let mut options = options;
         if let Some(call) = &self.call {
-            options.codec = call.video_codec();
+            let session_codec = call.video_codec();
+            if options.codec != session_codec {
+                tracing::warn!(
+                    requested = ?options.codec,
+                    session = ?session_codec,
+                    "screen share codec overridden by the negotiated session codec"
+                );
+            }
+            options.codec = session_codec;
         }
         tracing::info!(
             "starting screen share: source={} resolution={}x{} fps={} bitrate={} kbps",
