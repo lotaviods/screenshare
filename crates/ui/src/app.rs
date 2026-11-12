@@ -530,6 +530,7 @@ impl AppView {
     }
 
     fn open_share(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        tracing::info!("opening share dialog");
         self.share = ShareDraft::from_config(&self.config);
         self.share_open = true;
         self.backend.send(Command::ListSources);
@@ -567,6 +568,11 @@ impl AppView {
             bitrate_kbps: self.share.bitrate,
             hardware_encoding: self.share.hardware,
         };
+        tracing::info!(
+            source = %source.id,
+            system_audio = self.share.system_audio,
+            "start share requested"
+        );
         self.backend.send(Command::StartShare {
             source,
             options,

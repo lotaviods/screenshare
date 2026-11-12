@@ -36,9 +36,12 @@ cargo test --workspace
 ```sh
 make run      # build and run the desktop app (needs a Wayland/X11 session)
 make build    # release build
+make dist     # portable package for the current OS
 ```
 
-`make help` lists all targets.
+`make help` lists all targets. `make dist` runs `scripts/build.sh` on
+Linux/macOS (tar.gz) and `scripts/build.ps1` on Windows (zip with the FFmpeg
+DLLs bundled). Use `make dist-windows` or `make dist-linux` to force one.
 
 Linux needs the GPUI and FFmpeg system dependencies: a Vulkan driver,
 Wayland or X11 client libraries, `xkbcommon`, `fontconfig`, `clang`, `cmake`,
@@ -57,12 +60,21 @@ The build downloads FFmpeg's shared build and links against it. No system
 FFmpeg is needed. Run the portable build script, or `make dist` from Git Bash:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1
+powershell -ExecutionPolicy Bypass -File scripts\build.ps1
 ```
 
 The script stages the app in `dist\sharescreen-windows` with the FFmpeg DLLs
-beside `sharescreen.exe`, and copies the DLLs into `target\release` as well.
-The app needs no FFmpeg on the target machine.
+beside `sharescreen.exe`, copies the DLLs into `target\release` as well, and
+writes `dist\sharescreen-windows.zip`. The app needs no FFmpeg on the target
+machine.
+
+Useful options: `-Profile debug`, `-NoArchive`, `-NoFfmpeg`, `-FfmpegDir`,
+`-FfmpegSha256`, and `-SkipBuild`.
+
+On Linux, `bash scripts/build.sh` (or `make dist`) stages
+`dist/sharescreen-linux` and writes `dist/sharescreen-linux.tar.gz`. The Linux
+package links against the system FFmpeg and desktop libraries, so install the
+dependencies listed above on the target machine.
 
 To run the app directly from the source tree, set `FFMPEG_DIR` while building
 and add FFmpeg's `bin` directory to `PATH` so Windows can find the DLLs:

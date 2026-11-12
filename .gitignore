@@ -12,6 +12,11 @@
 *.deb
 *.rpm
 
+# --- Node / frontend ----------------------------------------------------
+node_modules/
+npm-debug.log*
+.pnpm-store/
+
 # --- Secrets and local state --------------------------------------------
 .env
 .env.*

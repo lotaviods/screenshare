@@ -1,9 +1,9 @@
 # Sharescreen development
 #
-# Targets:
-#   make run      run the GPUI desktop app
-#   make build    build the desktop app (release)
-#   make windows-server  cross-compile the signaling server for Windows
+# Generic targets:
+#   make dist          build the portable package for the current OS
+#   make dist-windows  build dist/sharescreen-windows(.zip)
+#   make dist-linux    build dist/sharescreen-linux.tar.gz
 #
 # The desktop app cannot be cross-compiled from Linux: it links native
 # Wayland/X11, Vulkan, and FFmpeg libraries. Build on the target OS.
@@ -16,7 +16,7 @@ WINDOWS_TARGET ?= x86_64-pc-windows-gnu
 
 .DEFAULT_GOAL := help
 
-.PHONY: help run dev build test fmt clippy check dist windows windows-target windows-server windows-check
+.PHONY: help run dev build test fmt clippy check dist dist-windows dist-linux dist-clean windows windows-target windows-server windows-check
 
 help: ## show targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
@@ -41,8 +41,22 @@ clippy: ## lint all Rust
 check: ## type-check all Rust
 	cargo check --workspace
 
-dist: ## build the portable Windows package (Windows only)
-	powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1
+dist: ## build the portable package for the current OS
+	@case "$$(uname -s)" in \
+		MINGW*|MSYS*|CYGWIN*) \
+			powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1 ;; \
+		*) \
+			bash scripts/build.sh ;; \
+	esac
+
+dist-windows: ## build the portable Windows package
+	powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1
+
+dist-linux: ## build the portable Linux package
+	bash scripts/build.sh
+
+dist-clean: ## remove generated dist packages
+	rm -rf dist
 
 windows: windows-server ## alias for windows-server
 

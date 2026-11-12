@@ -228,7 +228,7 @@ spec against the current code. Checkboxes are off until implemented.
 
 4. **Windows** requires a Windows host to build/test; Linux-side code must not
    assume it compiles unverified.
-   `scripts/build-windows.ps1` downloads FFmpeg and stages the DLLs beside the
+   `scripts/build.ps1` downloads FFmpeg and stages the DLLs beside the
    app; the target machine needs no FFmpeg installation.
 
 ## Suggested build order

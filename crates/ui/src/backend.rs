@@ -194,7 +194,14 @@ impl Actor {
             Command::DeleteRoom => self.delete_room().await,
             Command::ListDevices => self.list_devices(),
             Command::ListSources => {
-                self.send(UiEvent::Sources(self.capture.list_sources()));
+                let started = std::time::Instant::now();
+                let sources = self.capture.list_sources();
+                tracing::info!(
+                    count = sources.len(),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "enumerated capture sources"
+                );
+                self.send(UiEvent::Sources(sources));
                 Ok(())
             }
             Command::StartMic(device) => self.start_mic(device).await,
@@ -351,10 +358,21 @@ impl Actor {
     }
 
     fn list_devices(&self) -> Result<(), String> {
+        let started = std::time::Instant::now();
+        let microphones = self.audio.list_microphones();
+        let outputs = self.audio.list_outputs();
+        let monitors = self.audio.list_system_monitors();
+        tracing::info!(
+            microphones = microphones.len(),
+            outputs = outputs.len(),
+            monitors = monitors.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "enumerated audio devices"
+        );
         self.send(UiEvent::Devices {
-            microphones: self.audio.list_microphones(),
-            outputs: self.audio.list_outputs(),
-            monitors: self.audio.list_system_monitors(),
+            microphones,
+            outputs,
+            monitors,
         });
         Ok(())
     }
@@ -429,6 +447,7 @@ impl Actor {
             .start(source.clone(), options.clone(), sink)
             .await
             .map_err(|e| e.to_string())?;
+        tracing::info!("screen capture started: source={}", source.id);
         let mut config = self.config();
         config.video.width = options.width;
         config.video.height = options.height;

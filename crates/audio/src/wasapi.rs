@@ -263,16 +263,23 @@ fn list(data_flow: EDataFlow, kind: DeviceKind) -> Result<Vec<Device>, String> {
             .EnumAudioEndpoints(data_flow, DEVICE_STATE_ACTIVE)
             .map_err(|e| e.to_string())?;
         let count = collection.GetCount().map_err(|e| e.to_string())?;
+        tracing::debug!(kind = ?kind, count, "enumerating WASAPI endpoints");
 
         let mut devices = Vec::new();
         for index in 0..count {
             let device = collection.Item(index).map_err(|e| e.to_string())?;
-            let id = device.GetId().map_err(|e| e.to_string())?;
-            let id = id.to_string().map_err(|e| e.to_string())?;
-            CoTaskMemFree(Some(id.as_ptr() as *const core::ffi::c_void));
+            // `GetId` returns a string allocated by the COM task allocator. Convert
+            // it into an owned `String` first, then free the original pointer; the
+            // `String` buffer is owned by Rust and must never reach `CoTaskMemFree`.
+            let raw_id = device.GetId().map_err(|e| e.to_string())?;
+            let id = raw_id.to_string().map_err(|e| e.to_string());
+            CoTaskMemFree(Some(raw_id.0 as *const core::ffi::c_void));
+            let id = id?;
             let name = device_name(&device).unwrap_or_else(|| id.clone());
+            tracing::debug!(kind = ?kind, index, %id, %name, "WASAPI endpoint");
             devices.push(Device { id, name, kind });
         }
+        tracing::debug!(kind = ?kind, count = devices.len(), "WASAPI endpoint enumeration finished");
         Ok(devices)
     }
 }
