@@ -10,9 +10,6 @@
 //! WASAPI endpoint enumeration.
 #![cfg(any(target_os = "linux", windows))]
 
-#[cfg(target_os = "linux")]
-mod native;
-#[cfg(windows)]
 mod native;
 #[cfg(target_os = "linux")]
 mod pulse;

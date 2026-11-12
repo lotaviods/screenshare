@@ -5,6 +5,10 @@
 //! loopback through WASAPI. Both are converted to 48 kHz stereo S16LE and
 //! encoded straight to Opus packets. Volume and mute apply as software gain, so
 //! no `volume` element is involved.
+//!
+//! This module owns the platform-independent pipeline (threading, framing,
+//! gain, Opus encode). Each platform backend lives in its own submodule and
+//! only has to provide a [`Capture`] source.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,9 +20,14 @@ use sharescreen_native_media::encode::OpusEncoder;
 use tokio::sync::mpsc;
 
 #[cfg(target_os = "linux")]
-use crate::pulse::{Mixer, Recorder};
+mod linux;
 #[cfg(windows)]
-use crate::wasapi::Recorder;
+mod windows;
+
+#[cfg(target_os = "linux")]
+use linux::{open_mic, open_system};
+#[cfg(windows)]
+use windows::{open_mic, open_system};
 
 /// A running native capture: a capture thread pushing Opus samples.
 pub struct Stream {
@@ -186,72 +195,13 @@ fn spawn(
 }
 
 /// A platform capture that yields interleaved 48 kHz stereo S16LE samples.
+///
+/// Implemented per platform in the [`linux`] and [`windows`] submodules, where
+/// `pump` drains whatever the backend has ready and `next` returns the pending
+/// samples (or `None` when there are none).
 trait Capture {
     fn pump(&mut self);
     fn next(&mut self) -> Option<Vec<i16>>;
-}
-
-#[cfg(target_os = "linux")]
-impl Capture for Recorder {
-    fn pump(&mut self) {
-        Recorder::pump(self);
-    }
-
-    fn next(&mut self) -> Option<Vec<i16>> {
-        let pcm = self.take();
-        if pcm.is_empty() {
-            None
-        } else {
-            Some(pcm)
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Capture for Mixer {
-    fn pump(&mut self) {
-        Mixer::pump(self);
-    }
-
-    fn next(&mut self) -> Option<Vec<i16>> {
-        self.chunk()
-    }
-}
-
-#[cfg(windows)]
-impl Capture for Recorder {
-    fn pump(&mut self) {
-        Recorder::pump(self);
-    }
-
-    fn next(&mut self) -> Option<Vec<i16>> {
-        let pcm = self.take();
-        if pcm.is_empty() {
-            None
-        } else {
-            Some(pcm)
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn open_mic(device: Option<String>) -> Result<Box<dyn Capture>, String> {
-    Recorder::open(device).map(|recorder| Box::new(recorder) as Box<dyn Capture>)
-}
-
-#[cfg(target_os = "linux")]
-fn open_system(device: Option<String>) -> Result<Box<dyn Capture>, String> {
-    Mixer::open(device).map(|mixer| Box::new(mixer) as Box<dyn Capture>)
-}
-
-#[cfg(windows)]
-fn open_mic(device: Option<String>) -> Result<Box<dyn Capture>, String> {
-    Recorder::open_mic(device).map(|recorder| Box::new(recorder) as Box<dyn Capture>)
-}
-
-#[cfg(windows)]
-fn open_system(device: Option<String>) -> Result<Box<dyn Capture>, String> {
-    Recorder::open_system(device).map(|recorder| Box::new(recorder) as Box<dyn Capture>)
 }
 
 fn run_mic(
