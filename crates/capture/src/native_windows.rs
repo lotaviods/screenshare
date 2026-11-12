@@ -24,7 +24,7 @@ pub struct Stream {
     running: Arc<AtomicBool>,
     thread: JoinHandle<()>,
     /// Encodes the self-view JPEG on its own thread, off the capture path.
-    preview: Arc<Previewer>,
+    preview: Option<Arc<Previewer>>,
 }
 
 impl Stream {
@@ -35,7 +35,7 @@ impl Stream {
 
     /// Latest JPEG self-view frame of the running capture.
     pub fn latest_preview(&self) -> Option<Vec<u8>> {
-        self.preview.latest()
+        self.preview.as_ref().and_then(|preview| preview.latest())
     }
 }
 
@@ -47,7 +47,13 @@ pub fn spawn(
     let options = options.clone();
     let running = Arc::new(AtomicBool::new(true));
     let flag = running.clone();
-    let preview = Arc::new(Previewer::spawn());
+    let preview = match Previewer::spawn() {
+        Ok(preview) => Some(Arc::new(preview)),
+        Err(error) => {
+            tracing::warn!(%error, "preview unavailable; continuing capture");
+            None
+        }
+    };
     let preview_worker = preview.clone();
 
     let thread = std::thread::Builder::new()
@@ -69,7 +75,7 @@ fn run(
     options: CaptureOptions,
     running: Arc<AtomicBool>,
     sink: tokio::sync::mpsc::Sender<EncodedSample>,
-    preview: Arc<Previewer>,
+    preview: Option<Arc<Previewer>>,
 ) {
     let fps = options.fps.max(1);
     let bitrate_kbps = options.bitrate_kbps.max(1000);
@@ -139,7 +145,9 @@ fn run(
                 return;
             }
         }
-        preview.publish(frame);
+        if let Some(preview) = &preview {
+            preview.publish(frame);
+        }
         index += 1;
         next += frame_duration;
         let now = Instant::now();

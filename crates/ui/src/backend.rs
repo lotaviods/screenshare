@@ -37,6 +37,8 @@ impl FrameKind {
 /// What the UI wants each poll cycle.
 #[derive(Clone, Debug, Default)]
 pub struct FrameRequest {
+    /// Whether to update (or clear) the remote stage.
+    pub remote: bool,
     /// Remote participant whose decoded frame to fetch.
     pub peer: Option<String>,
     /// Fetch the best frame for the picture-in-picture window.
@@ -540,11 +542,13 @@ impl Actor {
     }
 
     fn poll_frames(&mut self, request: FrameRequest) {
-        let remote = request
-            .peer
-            .as_ref()
-            .and_then(|peer| self.call.as_ref()?.remote_frame(peer));
-        self.emit_frame(FrameKind::Remote, remote);
+        if request.remote {
+            let remote = request
+                .peer
+                .as_ref()
+                .and_then(|peer| self.call.as_ref()?.remote_frame(peer));
+            self.emit_frame(FrameKind::Remote, remote);
+        }
 
         if request.pip {
             let frame = self
@@ -606,5 +610,37 @@ mod tests {
         assert_eq!(FrameKind::Remote.index(), 0);
         assert_eq!(FrameKind::Pip.index(), 1);
         assert_eq!(FrameKind::Local.index(), 2);
+    }
+
+    #[test]
+    fn preview_poll_does_not_clear_remote_frame() {
+        let path = std::env::temp_dir().join(format!(
+            "sharescreen-preview-test-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = ConfigStore::load_from_path(path.clone()).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut actor = Actor::new(store, tx);
+        actor.frames[FrameKind::Remote.index()] = Some(Some(42));
+        actor.poll_frames(FrameRequest {
+            remote: false,
+            local: true,
+            ..Default::default()
+        });
+        assert_eq!(actor.frames[FrameKind::Remote.index()], Some(Some(42)));
+        while let Ok(event) = rx.try_recv() {
+            assert!(!matches!(
+                event,
+                UiEvent::Frame {
+                    kind: FrameKind::Remote,
+                    ..
+                }
+            ));
+        }
+        std::fs::remove_file(path).unwrap();
     }
 }

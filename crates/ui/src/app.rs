@@ -241,9 +241,10 @@ impl AppView {
             return None;
         }
         Some(FrameRequest {
+            remote: true,
             peer,
-            pip: self.pip_window.is_some(),
-            local,
+            pip: false,
+            local: false,
         })
     }
 
@@ -256,6 +257,7 @@ impl AppView {
             return None;
         }
         Some(FrameRequest {
+            remote: false,
             peer: None,
             pip,
             local,
@@ -1614,28 +1616,10 @@ impl AppView {
                         ),
                 )
                 .child(
-                    toggle(
-                        "settings-echo",
-                        "Echo cancellation",
-                        self.settings.audio.echo_cancellation,
-                    )
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        view.settings.audio.echo_cancellation =
-                            !view.settings.audio.echo_cancellation;
-                        cx.notify();
-                    })),
-                )
-                .child(
-                    toggle(
-                        "settings-noise",
-                        "Noise suppression",
-                        self.settings.audio.noise_suppression,
-                    )
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        view.settings.audio.noise_suppression =
-                            !view.settings.audio.noise_suppression;
-                        cx.notify();
-                    })),
+                    div()
+                        .text_sm()
+                        .text_color(rgb(MUTED))
+                        .child("Echo cancellation and noise suppression are not yet available."),
                 ),
         );
 
@@ -1701,7 +1685,7 @@ impl AppView {
                 .child(
                     toggle(
                         "settings-hardware",
-                        "Prefer hardware encoding",
+                        "Prefer hardware encoding (not applied yet)",
                         self.settings.video.hardware_encoding,
                     )
                     .on_click(cx.listener(|view, _, _, cx| {
@@ -1890,7 +1874,7 @@ impl AppView {
             .child(
                 toggle(
                     "share-hardware",
-                    "Prefer hardware encoding",
+                    "Prefer hardware encoding (not applied yet)",
                     self.share.hardware,
                 )
                 .on_click(cx.listener(|view, _, _, cx| {

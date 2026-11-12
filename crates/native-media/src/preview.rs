@@ -41,38 +41,46 @@ struct Shared {
     pending: Mutex<Option<Arc<dyn PreviewSource>>>,
     ready: Condvar,
     latest: Mutex<Option<Vec<u8>>>,
+    requested: AtomicBool,
     running: AtomicBool,
 }
 
 impl Previewer {
     /// Spawn the worker thread.
-    pub fn spawn() -> Self {
+    pub fn spawn() -> std::io::Result<Self> {
         let shared = Arc::new(Shared {
             pending: Mutex::new(None),
             ready: Condvar::new(),
             latest: Mutex::new(None),
+            requested: AtomicBool::new(false),
             running: AtomicBool::new(true),
         });
         let worker = shared.clone();
         let thread = std::thread::Builder::new()
             .name("sharescreen-preview".into())
-            .spawn(move || run(worker))
-            .expect("failed to spawn preview thread");
-        Self {
+            .spawn(move || run(worker))?;
+        Ok(Self {
             shared,
             thread: Some(thread),
-        }
+        })
     }
 
-    /// Hand the newest frame to the worker. Cheap: one `Arc` clone and a lock,
-    /// never an encode.
+    /// Hand the newest frame to the worker without waiting for a contended lock.
     pub fn publish(&self, frame: Arc<dyn PreviewSource>) {
-        *self.shared.pending.lock().unwrap() = Some(frame);
-        self.shared.ready.notify_one();
+        if !self.shared.requested.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        if let Ok(mut pending) = self.shared.pending.try_lock() {
+            *pending = Some(frame);
+            self.shared.ready.notify_one();
+        } else {
+            self.shared.requested.store(true, Ordering::Release);
+        }
     }
 
     /// Latest encoded preview, if any.
     pub fn latest(&self) -> Option<Vec<u8>> {
+        self.shared.requested.store(true, Ordering::Release);
         self.shared.latest.lock().unwrap().clone()
     }
 }
@@ -98,7 +106,7 @@ fn run(shared: Arc<Shared>) {
     let mut last = Instant::now() - MIN_INTERVAL;
 
     while shared.running.load(Ordering::SeqCst) {
-        let Some(frame) = take_pending(&shared) else {
+        let Some(mut frame) = take_pending(&shared) else {
             continue;
         };
         // Coalesce: frames published during the last encode were overwritten,
@@ -106,6 +114,15 @@ fn run(shared: Arc<Shared>) {
         let now = Instant::now();
         if now < last + MIN_INTERVAL {
             std::thread::sleep(last + MIN_INTERVAL - now);
+        }
+        if !shared.running.load(Ordering::SeqCst) {
+            break;
+        }
+        // Frames can arrive during the throttle interval: encode the newest.
+        if let Ok(mut pending) = shared.pending.lock() {
+            if let Some(newer) = pending.take() {
+                frame = newer;
+            }
         }
         last = Instant::now();
 
@@ -177,6 +194,23 @@ mod tests {
         assert_eq!(preview_size(1920, 0, MAX_PREVIEW_WIDTH), (0, 0));
     }
 
+    #[test]
+    fn publishing_does_not_wait_for_pending_lock() {
+        struct Frame;
+        impl PreviewSource for Frame {
+            fn to_jpeg(&self, _: &mut JpegEncoder, _: u32) -> Result<Vec<u8>, String> {
+                Ok(Vec::new())
+            }
+        }
+        let previewer = Previewer::spawn().expect("preview thread");
+        previewer.shared.requested.store(true, Ordering::Release);
+        let guard = previewer.shared.pending.lock().unwrap();
+        // Would deadlock if publish acquired the same mutex in blocking mode.
+        previewer.publish(Arc::new(Frame));
+        assert!(guard.is_none());
+        drop(guard);
+    }
+
     #[cfg(windows)]
     #[test]
     fn worker_encodes_a_jpeg_off_thread() {
@@ -195,7 +229,8 @@ mod tests {
             pts_micros: 0,
         };
 
-        let previewer = Previewer::spawn();
+        let previewer = Previewer::spawn().expect("preview thread");
+        assert!(previewer.latest().is_none());
         previewer.publish(Arc::new(frame));
 
         let deadline = Instant::now() + Duration::from_secs(2);

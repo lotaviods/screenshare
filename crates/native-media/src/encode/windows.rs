@@ -14,28 +14,27 @@ use crate::frame::Frame;
 
 /// Whether FFmpeg exposes an encoder for `codec`.
 pub fn codec_available(codec: Codec) -> bool {
-    find_codec(codec).is_some()
+    codec_names(codec)
+        .iter()
+        .any(|name| find_codec(name).is_some())
 }
 
-/// Find the first usable encoder for `codec`. libx264 is preferred for H.264
+/// Candidate encoders for `codec`. libx264 is preferred for H.264
 /// because it repeats SPS/PPS in-band for RTP; the Media Foundation encoder is
 /// a fallback. libvpx is preferred for VP8/VP9.
-fn find_codec(codec: Codec) -> Option<*const ffi::AVCodec> {
-    let names: &[&str] = match codec {
+fn codec_names(codec: Codec) -> &'static [&'static str] {
+    match codec {
         Codec::H264 => &["libx264", "h264_mf", "h264"],
         Codec::Vp8 => &["libvpx", "libvpx-vp8", "vp8_mf"],
         Codec::Vp9 => &["libvpx-vp9", "vp9_mf"],
-        _ => return None,
-    };
-    for name in names {
-        let name = CString::new(*name).ok()?;
-        let codec = unsafe { ffi::avcodec_find_encoder_by_name(name.as_ptr()) };
-        if !codec.is_null() {
-            tracing::info!(encoder = %name.to_string_lossy(), "using FFmpeg encoder");
-            return Some(codec);
-        }
+        _ => &[],
     }
-    None
+}
+
+fn find_codec(name: &str) -> Option<*const ffi::AVCodec> {
+    let name = CString::new(name).ok()?;
+    let codec = unsafe { ffi::avcodec_find_encoder_by_name(name.as_ptr()) };
+    (!codec.is_null()).then_some(codec)
 }
 
 /// A software encoder over BGRA CPU frames.
@@ -47,7 +46,6 @@ pub struct FfmpegEncoder {
     src_h: u32,
     config: EncoderConfig,
     force_keyframe: bool,
-    jpeg: Option<crate::decode::JpegEncoder>,
 }
 
 // The context is only touched from the owning capture thread.
@@ -60,12 +58,37 @@ impl FfmpegEncoder {
     }
 
     pub fn new(config: EncoderConfig) -> Result<Self, EncodeError> {
-        let Some(codec) = find_codec(config.codec) else {
-            return Err(EncodeError::Unavailable(format!(
-                "no {:?} encoder in FFmpeg",
-                config.codec
-            )));
-        };
+        let mut errors = Vec::new();
+        for name in codec_names(config.codec) {
+            let Some(codec) = find_codec(name) else {
+                continue;
+            };
+            match Self::open(config.clone(), codec) {
+                Ok(encoder) => {
+                    tracing::info!(encoder = name, codec = ?config.codec, "using FFmpeg encoder");
+                    if !errors.is_empty() {
+                        tracing::warn!(encoder = name, "using fallback video encoder");
+                    }
+                    return Ok(encoder);
+                }
+                Err(error) => {
+                    tracing::warn!(encoder = name, %error, "video encoder initialization failed");
+                    errors.push(format!("{name}: {error}"));
+                }
+            }
+        }
+        Err(EncodeError::Unavailable(format!(
+            "no usable {:?} encoder in FFmpeg{}",
+            config.codec,
+            if errors.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", errors.join("; "))
+            }
+        )))
+    }
+
+    fn open(config: EncoderConfig, codec: *const ffi::AVCodec) -> Result<Self, EncodeError> {
         let width = config.width.max(1);
         let height = config.height.max(1);
         let fps = config.fps.max(1);
@@ -125,15 +148,6 @@ impl FfmpegEncoder {
                 )));
             }
 
-            let jpeg = match crate::decode::JpegEncoder::new() {
-                Ok(jpeg) => Some(jpeg),
-                Err(err) => {
-                    ffi::av_frame_free(&mut { frame });
-                    ffi::avcodec_free_context(&mut { ctx });
-                    return Err(EncodeError::Ffmpeg(err));
-                }
-            };
-
             Ok(Self {
                 ctx,
                 frame,
@@ -142,7 +156,6 @@ impl FfmpegEncoder {
                 src_h: height,
                 config,
                 force_keyframe: false,
-                jpeg,
             })
         }
     }
@@ -289,16 +302,6 @@ impl FfmpegEncoder {
             }
             Ok(out)
         }
-    }
-
-    /// Encode one frame as a JPEG preview for the local self-view.
-    pub fn preview(&mut self, frame: &Frame) -> Result<Vec<u8>, EncodeError> {
-        let jpeg = self
-            .jpeg
-            .as_mut()
-            .ok_or_else(|| EncodeError::Ffmpeg("no JPEG encoder".into()))?;
-        jpeg.encode_bgra(&frame.data, frame.width, frame.height)
-            .map_err(EncodeError::Ffmpeg)
     }
 }
 

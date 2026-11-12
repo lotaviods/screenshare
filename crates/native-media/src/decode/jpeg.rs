@@ -120,6 +120,7 @@ impl JpegEncoder {
 
     fn close(&mut self) {
         unsafe {
+            ffi::av_frame_unref(self.frame);
             if !self.sws.is_null() {
                 ffi::sws_freeContext(self.sws);
                 self.sws = ptr::null_mut();
@@ -182,7 +183,10 @@ impl JpegEncoder {
             || src_height != self.src_height
             || self.ctx.is_null()
         {
-            self.open(src_width, src_height, dst_width, dst_height)?;
+            if let Err(error) = self.open(src_width, src_height, dst_width, dst_height) {
+                self.close();
+                return Err(error);
+            }
         }
         let sws = if bgra { self.sws_bgra } else { self.sws };
         unsafe {
@@ -247,6 +251,24 @@ impl Drop for JpegEncoder {
         self.close();
         unsafe {
             ffi::av_frame_free(&mut self.frame);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JpegEncoder;
+
+    #[test]
+    fn encoder_can_change_source_and_output_size() {
+        let mut encoder = JpegEncoder::new().unwrap();
+        for (width, height, out_width, out_height) in [(64, 48, 32, 24), (80, 60, 40, 30)] {
+            let pixels = vec![128; width * height * 4];
+            let jpeg = encoder
+                .encode_bgra_scaled(&pixels, width as u32, height as u32, out_width, out_height)
+                .unwrap();
+            assert!(jpeg.starts_with(&[0xff, 0xd8]));
+            assert!(jpeg.ends_with(&[0xff, 0xd9]));
         }
     }
 }
