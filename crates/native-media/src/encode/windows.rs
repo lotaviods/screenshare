@@ -2,7 +2,6 @@
 //!
 //! FFmpeg is used as a codec layer only: libx264/libvpx converts the BGRA
 //! capture frame to YUV420P with `swscale` and emits Annex-B H.264 or VP8/VP9.
-//! No GStreamer is involved.
 
 use std::ffi::CString;
 use std::ptr;
@@ -32,6 +31,7 @@ fn find_codec(codec: Codec) -> Option<*const ffi::AVCodec> {
         let name = CString::new(*name).ok()?;
         let codec = unsafe { ffi::avcodec_find_encoder_by_name(name.as_ptr()) };
         if !codec.is_null() {
+            tracing::info!(encoder = %name.to_string_lossy(), "using FFmpeg encoder");
             return Some(codec);
         }
     }
@@ -186,7 +186,7 @@ impl FfmpegEncoder {
                     self.config.width as i32,
                     self.config.height as i32,
                     ffi::AVPixelFormat::AV_PIX_FMT_YUV420P,
-                    ffi::SWS_BILINEAR,
+                    crate::SWS_BILINEAR,
                     ptr::null_mut(),
                     ptr::null_mut(),
                     ptr::null_mut(),

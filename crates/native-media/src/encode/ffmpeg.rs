@@ -586,7 +586,7 @@ impl FfmpegEncoder {
                     self.config.width as i32,
                     self.config.height as i32,
                     ffi::AVPixelFormat::AV_PIX_FMT_RGB24,
-                    ffi::SWS_BILINEAR,
+                    crate::SWS_BILINEAR,
                     ptr::null_mut(),
                     ptr::null_mut(),
                     ptr::null_mut(),

@@ -54,20 +54,22 @@ winget install Rustlang.Rustup Microsoft.VisualStudio.2022.BuildTools  # pick "D
 ```
 
 The build downloads FFmpeg's shared build and links against it. No system
-FFmpeg is needed. Run the portable build script:
+FFmpeg is needed. Run the portable build script, or `make dist` from Git Bash:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1
 ```
 
 The script stages the app in `dist\sharescreen-windows` with the FFmpeg DLLs
-beside `sharescreen.exe`. The app needs no FFmpeg on the target machine.
+beside `sharescreen.exe`, and copies the DLLs into `target\release` as well.
+The app needs no FFmpeg on the target machine.
 
-To run the app directly from the source tree, set `FFMPEG_DIR` to the
-extracted FFmpeg root first:
+To run the app directly from the source tree, set `FFMPEG_DIR` while building
+and add FFmpeg's `bin` directory to `PATH` so Windows can find the DLLs:
 
 ```powershell
 $env:FFMPEG_DIR = "C:\path\to\ffmpeg-master-latest-win64-lgpl-shared"
+$env:PATH = "$env:FFMPEG_DIR\bin;$env:PATH"
 cargo run
 ```
 

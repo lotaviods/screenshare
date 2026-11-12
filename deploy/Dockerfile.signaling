@@ -6,7 +6,7 @@ FROM rust:1-bookworm AS builder
 WORKDIR /src
 
 # The signaling server depends only on core + serde/axum/tokio, so no
-# GStreamer system libraries are needed in the image. Only the
+# native media libraries are needed in the image. Only the
 # selected package is built; other workspace members are not compiled.
 COPY . .
 RUN cargo build --release -p sharescreen-server

@@ -210,11 +210,13 @@ impl AppView {
     fn handle_event(&mut self, event: UiEvent, cx: &mut Context<Self>) {
         match event {
             UiEvent::Error(message) => {
+                tracing::warn!("ui error: {message}");
                 self.connecting = false;
                 self.error = Some(message);
             }
             UiEvent::Config(config) => self.config = config,
             UiEvent::Connected(connected) => {
+                tracing::info!(connected, "ui connection state changed");
                 self.connecting = false;
                 self.connected = connected;
                 if !connected {
@@ -318,6 +320,7 @@ impl AppView {
     }
 
     fn on_connect(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        tracing::info!("connect button clicked");
         if self.prepare_home_config(cx).is_some() {
             self.error = None;
             self.connecting = true;

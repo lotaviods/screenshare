@@ -1,7 +1,7 @@
 //! Native RTP depacketization and FFmpeg decoding.
 //!
 //! Remote tracks arrive as RTP packets. This module reassembles them into
-//! decoder-ready frames and decodes them with FFmpeg, without GStreamer.
+//! decoder-ready frames and decodes them with FFmpeg.
 
 pub mod ffmpeg;
 pub mod jpeg;

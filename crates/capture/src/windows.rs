@@ -2,7 +2,7 @@
 //!
 //! `BitBlt` captures monitors and the whole desktop; `PrintWindow` captures a
 //! single window. Frames are copied to a BGRA DIB and encoded by the native
-//! FFmpeg encoder. No GStreamer is involved.
+//! FFmpeg encoder.
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;

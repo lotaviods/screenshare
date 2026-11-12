@@ -1,7 +1,7 @@
 //! `sharescreen-capture`: screen capture backends.
 //!
 //! Linux uses the XDG Desktop Portal + PipeWire + native FFmpeg encode. Windows
-//! uses GDI + FFmpeg H.264/VP8/VP9. Neither path uses GStreamer. The
+//! uses GDI + FFmpeg H.264/VP8/VP9. The
 //! `ScreenCapture` trait in `sharescreen-core` keeps every backend behind one
 //! interface.
 #![cfg(any(target_os = "linux", windows))]

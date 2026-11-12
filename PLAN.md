@@ -23,7 +23,7 @@ spec against the current code. Checkboxes are off until implemented.
 - [x] Native GPU path: portal → PipeWire DMA-BUF → VAAPI surface import →
       `scale_vaapi` RGB→NV12 → `h264_vaapi`/`vp8_vaapi`/`vp9_vaapi`. Zero CPU
       copies, validated on Hyprland + AMD (2560x1440). No JPEG self-view yet.
-- [x] Remove GStreamer from `crates/media`, `crates/call`, and `crates/capture`:
+- [x] Native media pipeline in `crates/media`, `crates/call`, and `crates/capture`:
       native RTP depacketization, FFmpeg decode, JPEG encode, and native audio
       playback. Windows capture is native too.
 - [x] Hardware-encoder auto-detection (VAAPI/NVENC/QSV candidates → software
@@ -33,8 +33,8 @@ spec against the current code. Checkboxes are off until implemented.
       picker on both Wayland and X11.
 - [x] Windows: native GDI capture — `BitBlt` for monitors/desktop,
       `PrintWindow` for windows, monitor enumeration via `EnumDisplayMonitors`,
-      window list via `EnumWindows`. Frames encode through FFmpeg H.264. No
-      GStreamer. **Untested** — needs a Windows host.
+      window list via `EnumWindows`. Frames encode through FFmpeg H.264.
+      **Untested** — needs a Windows host.
 - [x] Windows audio: native WASAPI mic capture + process-loopback system audio,
       enumeration via WASAPI endpoints. **Untested** (same reason).
 - [x] Source enumeration — Wayland delegates to the portal picker.
@@ -55,7 +55,7 @@ spec against the current code. Checkboxes are off until implemented.
 ### `crates/audio` — microphone + system audio
 - [x] Linux mic capture: `libpulse-binding` records the source — runtime-verified.
 - [x] Linux system audio: records each non-call playback stream and mixes them —
-      runtime-verified. No GStreamer.
+      runtime-verified.
 - [x] FFmpeg libopus encodes 20 ms packets; volume/mute apply as software gain.
 - [x] Linux device enumeration (mic, output, system monitor) via
       `libpulse-binding` — runtime-verified.
@@ -99,7 +99,7 @@ spec against the current code. Checkboxes are off until implemented.
 
 ### `deploy/` — Docker Compose infrastructure
 - [x] `compose.yaml`: `signaling` + `coturn` by default, optional `sfu` profile.
-- [x] `Dockerfile.signaling` (multi-stage, no GStreamer/WebKit in the image).
+- [x] `Dockerfile.signaling` (multi-stage, no native media libraries in the image).
 - [x] `.env.example` with all tunables.
 - [x] Health check without curl/wget (`sharescreen-server --health-check`).
 - [x] `README.md` with run instructions and TURN setup.
@@ -112,7 +112,7 @@ spec against the current code. Checkboxes are off until implemented.
 - [ ] Device enumeration glue (routes to capture/audio backends).
 
 ### `crates/media` — remote media ingestion + decode
-- [x] Remote RTP → native depacketizer → FFmpeg decode. No GStreamer.
+- [x] Remote RTP → native depacketizer → FFmpeg decode.
 - [x] Audio decode: Opus → PCM → native audio output (you hear the other side).
 - [x] Video decode: VP8/VP9/H264 → RGB → JPEG (latest frame per peer).
 - [x] Per-peer remote audio volume.
@@ -229,7 +229,7 @@ spec against the current code. Checkboxes are off until implemented.
 4. **Windows** requires a Windows host to build/test; Linux-side code must not
    assume it compiles unverified.
    `scripts/build-windows.ps1` downloads FFmpeg and stages the DLLs beside the
-   app; the target machine needs no FFmpeg and no GStreamer.
+   app; the target machine needs no FFmpeg installation.
 
 ## Suggested build order
 

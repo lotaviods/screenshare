@@ -78,7 +78,7 @@ GNOME, and Sway all implement via their portal backends.
 - **Native GPU path** (`crates/native-media`): the compositor exports DMA-BUFs,
   FFmpeg imports them into VAAPI surfaces, `scale_vaapi` converts RGB to NV12
   on the GPU, and `h264_vaapi`/`vp8_vaapi`/`vp9_vaapi` encode. No pixel touches
-  the CPU. No GStreamer is involved.
+  the CPU.
 - The portal also covers X11 sessions, so there is no separate X11 backend.
 
 The portal permission dialog is handled by the compositor; the app only observes
@@ -90,7 +90,7 @@ the result and surfaces `PermissionDenied` if the user declines.
   windows. Monitor enumeration via `EnumDisplayMonitors`, window list via
   `EnumWindows`.
 - Frames are copied to a BGRA DIB and encoded by FFmpeg's H.264/VP8/VP9
-  encoder. No GStreamer is involved.
+  encoder.
 - WGC/DXGI and hardware Media Foundation encode are future upgrades; the GDI
   path is the first native Windows implementation.
 - WASAPI for microphone capture; WASAPI loopback for system audio.
@@ -107,8 +107,8 @@ Two independent local sources plus remote audio:
 2. System audio — per-application PulseAudio/PipeWire streams (Linux), WASAPI
    process loopback excluding the Sharescreen process tree (Windows).
 
-Both platforms record directly and encode with FFmpeg's libopus, without a
-GStreamer pipeline. Volume and mute apply as software gain before encoding.
+Both platforms record directly and encode with FFmpeg's libopus. Volume and
+mute apply as software gain before encoding.
 
 Both encode to Opus independently and are sent as separate WebRTC tracks so a
 remote user can mute screen audio without muting the mic. Volume, mute, echo
@@ -140,7 +140,7 @@ is reserved for server-side room metadata only if in-memory proves insufficient
 ```
 sharescreen/
 ├── crates/
-│   ├── core/        # domain model + traits (no OS/GStreamer deps)
+│   ├── core/        # domain model + traits (no OS/media deps)
 │   ├── config/      # config + preferences persistence + validation
 │   ├── capture/     # ScreenCapture trait impls (portal/PipeWire, WGC)
 │   ├── audio/       # AudioCapture trait impls (mic + system loopback)
@@ -188,7 +188,7 @@ unit between capture/audio backends and the WebRTC layer, defined in `core`.
 
 Remote tracks are the mirror image: RTP packets → native depacketizer →
 FFmpeg decode → RGB → JPEG for the UI, or Opus → PCM → native audio output.
-No GStreamer is involved in `crates/media` or `crates/call`.
+Decoding lives in `crates/native-media`.
 
 ## Signaling protocol (draft)
 

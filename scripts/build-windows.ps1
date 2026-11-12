@@ -52,8 +52,10 @@ New-Item -ItemType Directory -Path $stage -Force | Out-Null
 Copy-Item -LiteralPath $exe -Destination $stage
 
 # FFmpeg's shared DLLs are the only runtime dependency.
-Get-ChildItem -LiteralPath $ffmpegBin -Filter "*.dll" |
-    Copy-Item -Destination $stage
+$ffmpegDlls = Get-ChildItem -LiteralPath $ffmpegBin -Filter "*.dll"
+$ffmpegDlls | Copy-Item -Destination $stage
+# Keep the direct release binary runnable too, not only the staged folder.
+$ffmpegDlls | Copy-Item -Destination (Split-Path -Parent $exe)
 
 @'
 Sharescreen portable build

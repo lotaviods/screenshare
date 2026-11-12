@@ -1,7 +1,7 @@
 //! `sharescreen-media`: ingests remote WebRTC tracks and decodes them.
 //!
 //! Remote tracks arrive as raw RTP packets. The packets are depacketized and
-//! decoded with FFmpeg, without GStreamer:
+//! decoded with FFmpeg:
 //!
 //! - audio → Opus → PCM → the system output (you hear the other side);
 //! - video → H.264/VP8/VP9 → RGB → JPEG, kept as the latest frame for the UI.

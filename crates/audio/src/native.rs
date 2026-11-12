@@ -1,4 +1,4 @@
-//! Native audio capture: platform capture → FFmpeg/Opus, no GStreamer.
+//! Native audio capture: platform capture → FFmpeg/Opus.
 //!
 //! Linux records the microphone or the application playback streams through
 //! `libpulse-binding`; Windows records the capture endpoint or the process

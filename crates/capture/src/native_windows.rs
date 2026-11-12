@@ -1,8 +1,7 @@
 //! Native Windows capture: GDI desktop/window capture -> FFmpeg.
 //!
 //! Uses `BitBlt` for monitors and `PrintWindow` for windows. Frames are copied
-//! to a BGRA DIB and encoded by FFmpeg's H.264/VP8/VP9 encoder. No GStreamer is
-//! involved.
+//! to a BGRA DIB and encoded by FFmpeg's H.264/VP8/VP9 encoder.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

@@ -63,6 +63,12 @@ impl Recorder {
     /// Open process loopback for the default output device.
     pub(crate) fn open_system(_device: Option<String>) -> Result<Self, String> {
         let com = Com::init();
+        // Process loopback needs an active render endpoint. On machines without
+        // one (for example a VM with no audio device) Windows still "activates"
+        // the virtual loopback client, but the activation corrupts the heap.
+        if outputs().is_empty() {
+            return Err("no audio output device for system audio".into());
+        }
         let client = activate_process_loopback()?;
         Self::initialize(client, true, com)
     }
@@ -385,10 +391,16 @@ mod tests {
     #[test]
     fn format_is_48k_stereo_16bit() {
         let format = wave_format();
-        assert_eq!(format.wFormatTag, WAVE_FORMAT_PCM as u16);
-        assert_eq!(format.nChannels, 2);
-        assert_eq!(format.nSamplesPerSec, 48_000);
-        assert_eq!(format.nBlockAlign, 4);
-        assert_eq!(format.wBitsPerSample, 16);
+        // `WAVEFORMATEX` is packed, so copy the fields out before asserting.
+        let tag = format.wFormatTag;
+        let channels = format.nChannels;
+        let rate = format.nSamplesPerSec;
+        let block_align = format.nBlockAlign;
+        let bits = format.wBitsPerSample;
+        assert_eq!(tag, WAVE_FORMAT_PCM as u16);
+        assert_eq!(channels, 2);
+        assert_eq!(rate, 48_000);
+        assert_eq!(block_align, 4);
+        assert_eq!(bits, 16);
     }
 }

@@ -3,7 +3,7 @@
 //! Capture is native on both platforms: Linux records through
 //! `libpulse-binding` (PulseAudio/PipeWire), Windows records through WASAPI
 //! (process loopback for system audio). FFmpeg's Opus encoder produces the
-//! packets, so GStreamer is not involved. Linux system audio records each
+//! packets. Linux system audio records each
 //! application playback stream and mixes them, so the call's own playback is
 //! never captured. Linux device enumeration uses `libpulse-binding` directly
 //! (license-clean), not the GPL-licensed `pulsectl-rs` fork; Windows uses

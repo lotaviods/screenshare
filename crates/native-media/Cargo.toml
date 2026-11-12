@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Native GPU capture/encode/decode primitives for Sharescreen (no GStreamer)"
+description = "Native GPU capture/encode/decode primitives for Sharescreen"
 
 [dependencies]
 sharescreen-core = { path = "../core" }

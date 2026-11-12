@@ -444,14 +444,17 @@ impl Actor {
         self.send(UiEvent::Sharing(true));
 
         if include_system_audio {
-            let monitor = self
-                .audio
-                .list_system_monitors()
-                .first()
-                .map(|d| d.id.clone());
-            if let Err(error) = self.start_system(monitor).await {
-                tracing::warn!("failed to start system audio with the share: {error}");
-                self.send(UiEvent::Error(error));
+            match self.audio.list_system_monitors().first() {
+                Some(monitor) => {
+                    let monitor = monitor.id.clone();
+                    if let Err(error) = self.start_system(Some(monitor)).await {
+                        tracing::warn!("failed to start system audio with the share: {error}");
+                        self.send(UiEvent::Error(error));
+                    }
+                }
+                None => tracing::warn!(
+                    "system audio requested for the share, but no audio output device is available"
+                ),
             }
         }
         Ok(())
