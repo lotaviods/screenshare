@@ -20,9 +20,7 @@ pub mod playback;
 pub use playback::Output;
 
 use async_trait::async_trait;
-#[cfg(target_os = "linux")]
-use sharescreen_core::DeviceKind;
-use sharescreen_core::{AudioCapture, AudioError, Device, EncodedSample};
+use sharescreen_core::{AudioCapture, AudioError, Device, DeviceKind, EncodedSample};
 use tokio::sync::mpsc;
 
 /// Microphone and system-audio capture engine. The two sources are fully
@@ -47,6 +45,24 @@ impl AudioEngine {
     /// Set the Opus bitrate (kbps) used by streams started after this call.
     pub fn set_bitrate_kbps(&mut self, kbps: u32) {
         self.bitrate_kbps = kbps;
+    }
+
+    /// Remove unexpectedly finished streams and report their last error.
+    pub fn take_failures(&mut self) -> Vec<(DeviceKind, String)> {
+        let mut failures = Vec::new();
+        if self.mic.as_ref().is_some_and(native::Stream::finished) {
+            failures.push((
+                DeviceKind::Microphone,
+                self.mic.take().unwrap().finish_error(),
+            ));
+        }
+        if self.system.as_ref().is_some_and(native::Stream::finished) {
+            failures.push((
+                DeviceKind::AudioOutput,
+                self.system.take().unwrap().finish_error(),
+            ));
+        }
+        failures
     }
 }
 

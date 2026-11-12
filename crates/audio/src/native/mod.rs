@@ -35,9 +35,25 @@ pub struct Stream {
     thread: JoinHandle<()>,
     volume: Arc<Mutex<f64>>,
     muted: Arc<AtomicBool>,
+    error: Arc<Mutex<Option<String>>>,
 }
 
 impl Stream {
+    pub fn finished(&self) -> bool {
+        self.thread.is_finished()
+    }
+
+    pub fn finish_error(self) -> String {
+        let result = self.thread.join();
+        if result.is_err() {
+            return "capture thread panicked".into();
+        }
+        self.error
+            .lock()
+            .ok()
+            .and_then(|mut e| e.take())
+            .unwrap_or_else(|| "capture thread stopped unexpectedly".into())
+    }
     pub fn stop(self) {
         self.running.store(false, Ordering::SeqCst);
         let _ = self.thread.join();
@@ -95,25 +111,21 @@ impl Framer {
         }
     }
 
-    /// Returns false when the consumer is gone.
+    /// Drop packets when the consumer is overloaded, keeping capture responsive.
     fn push(
         &mut self,
         encoder: &mut OpusEncoder,
         sink: &mpsc::Sender<EncodedSample>,
         pcm: &[i16],
-    ) -> bool {
+    ) -> Result<(), String> {
         self.buf.extend_from_slice(pcm);
         let frame = encoder.frame_len();
         while self.buf.len() >= frame {
             let mut chunk: Vec<i16> = self.buf.drain(..frame).collect();
             self.gain.apply(&mut chunk);
-            let encoded = match encoder.encode(&chunk) {
-                Ok(frames) => frames,
-                Err(err) => {
-                    tracing::warn!("native opus encode failed: {err}");
-                    return false;
-                }
-            };
+            let encoded = encoder
+                .encode(&chunk)
+                .map_err(|e| format!("Opus encode failed: {e}"))?;
             if let Some(frame) = encoded {
                 let sample = EncodedSample {
                     kind: MediaKind::Audio,
@@ -123,12 +135,15 @@ impl Framer {
                     duration_micros: frame.duration_micros,
                     keyframe: false,
                 };
-                if sink.blocking_send(sample).is_err() {
-                    return false;
+                match sink.try_send(sample) {
+                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        return Err("audio consumer disconnected".into())
+                    }
                 }
             }
         }
-        true
+        Ok(())
     }
 }
 
@@ -157,7 +172,11 @@ pub fn spawn_system(
 /// Spawn a capture thread and wait until it reports success or failure.
 fn spawn(
     name: &str,
-    body: impl FnOnce(Arc<AtomicBool>, Gain, std::sync::mpsc::SyncSender<Result<(), String>>)
+    body: impl FnOnce(
+            Arc<AtomicBool>,
+            Gain,
+            std::sync::mpsc::SyncSender<Result<(), String>>,
+        ) -> Result<(), String>
         + Send
         + 'static,
 ) -> Result<Stream, AudioError> {
@@ -167,10 +186,18 @@ fn spawn(
     let muted = gain.muted.clone();
     let flag = running.clone();
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let error = Arc::new(Mutex::new(None));
+    let thread_error = error.clone();
 
     let thread = std::thread::Builder::new()
         .name(name.into())
-        .spawn(move || body(flag, gain, ready_tx))
+        .spawn(move || {
+            if let Err(e) = body(flag, gain, ready_tx) {
+                if let Ok(mut error) = thread_error.lock() {
+                    *error = Some(e);
+                }
+            }
+        })
         .map_err(|e| AudioError::Failed(format!("failed to spawn {name} thread: {e}")))?;
 
     match ready_rx.recv() {
@@ -179,6 +206,7 @@ fn spawn(
             thread,
             volume,
             muted,
+            error,
         }),
         Ok(Err(e)) => {
             running.store(false, Ordering::SeqCst);
@@ -200,7 +228,7 @@ fn spawn(
 /// `pump` drains whatever the backend has ready and `next` returns the pending
 /// samples (or `None` when there are none).
 trait Capture {
-    fn pump(&mut self);
+    fn pump(&mut self) -> Result<(), String>;
     fn next(&mut self) -> Option<Vec<i16>>;
 }
 
@@ -211,19 +239,19 @@ fn run_mic(
     gain: Gain,
     sink: mpsc::Sender<EncodedSample>,
     ready: std::sync::mpsc::SyncSender<Result<(), String>>,
-) {
+) -> Result<(), String> {
     let mut capture = match open_mic(device) {
         Ok(capture) => capture,
         Err(error) => {
             let _ = ready.send(Err(error));
-            return;
+            return Ok(());
         }
     };
     let mut encoder = match OpusEncoder::new(bitrate_kbps) {
         Ok(encoder) => encoder,
         Err(error) => {
             let _ = ready.send(Err(error.to_string()));
-            return;
+            return Ok(());
         }
     };
     let _ = ready.send(Ok(()));
@@ -231,14 +259,13 @@ fn run_mic(
     let mut framer = Framer::new(gain);
     tracing::info!("native microphone capture started");
     while running.load(Ordering::SeqCst) {
-        capture.pump();
+        capture.pump()?;
         if let Some(pcm) = capture.next() {
-            if !framer.push(&mut encoder, &sink, &pcm) {
-                break;
-            }
+            framer.push(&mut encoder, &sink, &pcm)?;
         }
         std::thread::sleep(Duration::from_millis(2));
     }
+    Ok(())
 }
 
 fn run_system(
@@ -248,19 +275,19 @@ fn run_system(
     gain: Gain,
     sink: mpsc::Sender<EncodedSample>,
     ready: std::sync::mpsc::SyncSender<Result<(), String>>,
-) {
+) -> Result<(), String> {
     let mut capture = match open_system(device) {
         Ok(capture) => capture,
         Err(error) => {
             let _ = ready.send(Err(error));
-            return;
+            return Ok(());
         }
     };
     let mut encoder = match OpusEncoder::new(bitrate_kbps) {
         Ok(encoder) => encoder,
         Err(error) => {
             let _ = ready.send(Err(error.to_string()));
-            return;
+            return Ok(());
         }
     };
     let _ = ready.send(Ok(()));
@@ -268,14 +295,13 @@ fn run_system(
     let mut framer = Framer::new(gain);
     tracing::info!("native system audio capture started");
     while running.load(Ordering::SeqCst) {
-        capture.pump();
+        capture.pump()?;
         if let Some(chunk) = capture.next() {
-            if !framer.push(&mut encoder, &sink, &chunk) {
-                break;
-            }
+            framer.push(&mut encoder, &sink, &chunk)?;
         }
         std::thread::sleep(Duration::from_millis(2));
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -297,5 +323,20 @@ mod tests {
         let mut pcm = [20_000i16, -30_000];
         gain.apply(&mut pcm);
         assert_eq!(pcm, [i16::MAX, i16::MIN]);
+    }
+
+    #[test]
+    fn unexpected_worker_error_is_retained() {
+        let stream = spawn("audio-test", |_, _, ready| {
+            ready.send(Ok(())).unwrap();
+            Err("device disconnected".into())
+        })
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !stream.finished() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(stream.finished());
+        assert_eq!(stream.finish_error(), "device disconnected");
     }
 }

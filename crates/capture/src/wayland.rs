@@ -32,6 +32,11 @@ struct ActiveCapture {
 }
 
 impl WaylandCapture {
+    pub fn finished(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|active| active.stream.finished())
+    }
     /// Latest JPEG self-view frame of the running capture.
     pub fn latest_preview(&self) -> Option<Vec<u8>> {
         self.active.as_ref().and_then(|a| a.stream.latest_preview())

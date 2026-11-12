@@ -9,8 +9,8 @@ use crate::wasapi::Recorder;
 use super::Capture;
 
 impl Capture for Recorder {
-    fn pump(&mut self) {
-        Recorder::pump(self);
+    fn pump(&mut self) -> Result<(), String> {
+        Recorder::pump(self)
     }
 
     fn next(&mut self) -> Option<Vec<i16>> {

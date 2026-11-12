@@ -27,12 +27,24 @@ pub enum Incoming {
 /// A cloneable handle for sending signaling messages.
 #[derive(Clone)]
 pub struct SignalingSender {
-    out: mpsc::UnboundedSender<SignalMessage>,
+    out: mpsc::UnboundedSender<Outbound>,
+}
+
+enum Outbound {
+    Message(SignalMessage),
+    Close,
 }
 
 impl SignalingSender {
     pub fn send(&self, msg: SignalMessage) -> Result<(), SignalingError> {
-        self.out.send(msg).map_err(|_| SignalingError::Disconnected)
+        self.out
+            .send(Outbound::Message(msg))
+            .map_err(|_| SignalingError::Disconnected)
+    }
+
+    /// Close the WebSocket even if other sender clones are still alive.
+    pub fn close(&self) {
+        let _ = self.out.send(Outbound::Close);
     }
 }
 
@@ -64,12 +76,13 @@ impl SignalingClient {
         tracing::info!(%url, "signaling WebSocket connected");
         let (mut ws_sink, mut ws_stream) = ws.split();
 
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SignalMessage>();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Outbound>();
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel::<Incoming>();
 
         // Writer task: serialize outbound messages and write them to the socket.
         tokio::spawn(async move {
             while let Some(msg) = out_rx.recv().await {
+                let Outbound::Message(msg) = msg else { break };
                 let Ok(text) = serde_json::to_string(&msg) else {
                     continue;
                 };

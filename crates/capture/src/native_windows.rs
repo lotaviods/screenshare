@@ -4,7 +4,7 @@
 //! to a BGRA DIB and encoded by FFmpeg's H.264/VP8/VP9 encoder.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -25,9 +25,20 @@ pub struct Stream {
     thread: JoinHandle<()>,
     /// Encodes the self-view JPEG on its own thread, off the capture path.
     preview: Option<Arc<Previewer>>,
+    notice: Arc<Mutex<Option<String>>>,
+    failure: Arc<Mutex<Option<String>>>,
 }
 
 impl Stream {
+    pub fn failure(&self) -> Option<String> {
+        self.failure.lock().ok().and_then(|failure| failure.clone())
+    }
+    pub fn take_notice(&self) -> Option<String> {
+        self.notice.lock().ok().and_then(|mut notice| notice.take())
+    }
+    pub fn finished(&self) -> bool {
+        self.thread.is_finished()
+    }
     pub fn stop(self) {
         self.running.store(false, Ordering::SeqCst);
         let _ = self.thread.join();
@@ -55,11 +66,20 @@ pub fn spawn(
         }
     };
     let preview_worker = preview.clone();
+    let notice = Arc::new(Mutex::new(None));
+    let worker_notice = notice.clone();
+    let failure = Arc::new(Mutex::new(None));
+    let worker_failure = failure.clone();
 
     let thread = std::thread::Builder::new()
         .name("sharescreen-native-windows".into())
         .spawn(move || {
-            run(source, options, flag, sink, preview_worker);
+            if let Err(error) = run(source, options, flag, sink, preview_worker, worker_notice) {
+                tracing::error!(%error, "screen capture failed");
+                if let Ok(mut failure) = worker_failure.lock() {
+                    *failure = Some(error);
+                }
+            }
         })
         .map_err(|e| CaptureError::Failed(format!("failed to spawn native capture thread: {e}")))?;
 
@@ -67,6 +87,8 @@ pub fn spawn(
         running,
         thread,
         preview,
+        notice,
+        failure,
     })
 }
 
@@ -76,30 +98,29 @@ fn run(
     running: Arc<AtomicBool>,
     sink: tokio::sync::mpsc::Sender<EncodedSample>,
     preview: Option<Arc<Previewer>>,
-) {
+    notice: Arc<Mutex<Option<String>>>,
+) -> Result<(), String> {
     let fps = options.fps.max(1);
     let bitrate_kbps = options.bitrate_kbps.max(1000);
     let width = options.width;
     let height = options.height;
     let cursor = options.cursor;
-    let target = match target::Target::new(&source) {
-        Ok(target) => target,
-        Err(err) => {
-            tracing::error!("native Windows capture failed: {err}");
-            return;
-        }
-    };
+    let target = target::Target::new(&source).map_err(|e| e.to_string())?;
     let mut encoder: Option<FfmpegEncoder> = None;
     let frame_duration = Duration::from_secs_f64(1.0 / fps as f64);
     let mut next = Instant::now();
     let mut index: u64 = 0;
+    let mut last_frame = Instant::now();
 
     while running.load(Ordering::SeqCst) {
         let Some(frame) = target.capture(cursor, index, fps) else {
-            tracing::warn!("native Windows capture returned no frame");
+            if last_frame.elapsed() > Duration::from_secs(5) {
+                return Err("capture source produced no frames for five seconds".into());
+            }
             std::thread::sleep(Duration::from_millis(16));
             continue;
         };
+        last_frame = Instant::now();
         if encoder.is_none() {
             let w = if width == 0 { frame.width } else { width };
             let h = if height == 0 { frame.height } else { height };
@@ -111,15 +132,21 @@ fn run(
                 codec: options.codec,
             };
             match FfmpegEncoder::new(config) {
-                Ok(created) => encoder = Some(created),
+                Ok(created) => {
+                    if let Some(message) = created.fallback_notice() {
+                        if let Ok(mut notice) = notice.lock() {
+                            *notice = Some(message.to_owned());
+                        }
+                    }
+                    encoder = Some(created);
+                }
                 Err(err) => {
-                    tracing::error!("native Windows encoder unavailable: {err}");
-                    return;
+                    return Err(format!("video encoder unavailable: {err}"));
                 }
             }
         }
         let Some(encoder) = encoder.as_mut() else {
-            return;
+            return Err("video encoder unavailable".into());
         };
         // Share the captured frame with the preview worker for free; the worker
         // downsamples and JPEG-encodes it on its own thread.
@@ -135,14 +162,17 @@ fn run(
                         duration_micros: frame.duration_micros,
                         keyframe: frame.keyframe,
                     };
-                    if sink.blocking_send(sample).is_err() {
-                        return;
+                    if !crate::send_while_running(&sink, sample, || running.load(Ordering::SeqCst))
+                    {
+                        if running.load(Ordering::SeqCst) {
+                            return Err("video consumer disconnected".into());
+                        }
+                        return Ok(());
                     }
                 }
             }
             Err(err) => {
-                tracing::warn!("native Windows encode failed: {err}");
-                return;
+                return Err(format!("video encode failed: {err}"));
             }
         }
         if let Some(preview) = &preview {
@@ -157,6 +187,7 @@ fn run(
             next = now;
         }
     }
+    Ok(())
 }
 
 /// Monitors and top-level windows, as the source picker sees them.

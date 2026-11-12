@@ -3,6 +3,7 @@
 mod hub;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use sharescreen_core::{CallEvent, Codec, ConnectionState, EncodedSample, Participant};
@@ -74,6 +75,7 @@ struct Shared {
     room_id: Arc<RwLock<Option<String>>>,
     /// Decoder pipelines for the remote participants' tracks.
     remote: Arc<RemoteMedia>,
+    closing: Arc<AtomicBool>,
 }
 
 /// What this peer is publishing.
@@ -115,6 +117,7 @@ impl CallSession {
             events,
             room_id: Arc::new(RwLock::new(None)),
             remote: Arc::new(RemoteMedia::new()),
+            closing: Arc::new(AtomicBool::new(false)),
         };
 
         // One fan-out task per local media stream.
@@ -220,6 +223,29 @@ impl CallSession {
         self.shared.peers.read().unwrap().len()
     }
 
+    /// Recent selected ICE-pair RTT by peer; absent measurements are omitted.
+    pub fn peer_round_trip_times(
+        &self,
+    ) -> impl std::future::Future<Output = Vec<(String, f64)>> + Send + 'static {
+        let peers: Vec<_> = self
+            .shared
+            .peers
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(id, peer)| (id.clone(), peer.clone()))
+            .collect();
+        async move {
+            let mut result = Vec::new();
+            for (id, peer) in peers {
+                if let Some(ms) = peer.round_trip_time_ms().await {
+                    result.push((id, ms));
+                }
+            }
+            result
+        }
+    }
+
     /// The latest decoded video frame (JPEG) from a peer, if any.
     pub fn remote_frame(&self, peer_id: &str) -> Option<Vec<u8>> {
         self.shared.remote.latest_frame(peer_id)
@@ -246,6 +272,11 @@ impl CallSession {
     /// Close every peer connection and stop the decoders. Called when the
     /// user disconnects from the signaling server.
     pub async fn disconnect(&self) {
+        self.shared.closing.store(true, Ordering::Release);
+        if self.room_id().is_some() {
+            let _ = self.shared.sender.send(SignalMessage::LeaveRoom);
+        }
+        self.shared.sender.close();
         close_all_peers(&self.shared).await;
     }
 }
@@ -258,6 +289,9 @@ async fn hub_loop(hub: Arc<MediaHub>, mut rx: mpsc::Receiver<EncodedSample>) {
 
 async fn dispatch(shared: Shared, mut incoming: mpsc::UnboundedReceiver<Incoming>) {
     while let Some(item) = incoming.recv().await {
+        if shared.closing.load(Ordering::Acquire) {
+            break;
+        }
         match item {
             Incoming::Message(msg) => handle_message(&shared, msg).await,
             Incoming::Disconnected => {

@@ -28,6 +28,25 @@ use sharescreen_core::{
 };
 use tokio::sync::mpsc;
 
+/// Deliver ordered video packets without trapping the capture thread during stop.
+fn send_while_running(
+    sink: &mpsc::Sender<EncodedSample>,
+    mut sample: EncodedSample,
+    running: impl Fn() -> bool,
+) -> bool {
+    while running() {
+        match sink.try_send(sample) {
+            Ok(()) => return true,
+            Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            Err(mpsc::error::TrySendError::Full(returned)) => {
+                sample = returned;
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+    }
+    false
+}
+
 /// Selects and owns a concrete capture backend.
 pub enum CaptureEngine {
     #[cfg(target_os = "linux")]
@@ -37,6 +56,32 @@ pub enum CaptureEngine {
 }
 
 impl CaptureEngine {
+    pub fn failure(&self) -> Option<String> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Wayland(_) => None,
+            #[cfg(windows)]
+            Self::Windows(capture) => capture.failure(),
+        }
+    }
+    /// Take a nonfatal encoder fallback notice, if available.
+    pub fn take_notice(&self) -> Option<String> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Wayland(_) => None,
+            #[cfg(windows)]
+            Self::Windows(capture) => capture.take_notice(),
+        }
+    }
+    /// Whether the current native capture worker has stopped unexpectedly.
+    pub fn finished(&self) -> bool {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Wayland(capture) => capture.finished(),
+            #[cfg(windows)]
+            Self::Windows(capture) => capture.finished(),
+        }
+    }
     /// Latest JPEG self-view frame of the running capture, for the local
     /// picture-in-picture preview.
     pub fn latest_preview(&self) -> Option<Vec<u8>> {
@@ -108,6 +153,38 @@ impl ScreenCapture for CaptureEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_video_channel_does_not_prevent_shutdown() {
+        use sharescreen_core::{Codec, MediaKind};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        use std::time::Duration;
+        let sample = EncodedSample {
+            kind: MediaKind::Video,
+            codec: Codec::H264,
+            data: vec![1],
+            timestamp_micros: 0,
+            duration_micros: 1,
+            keyframe: false,
+        };
+        let (tx, rx) = mpsc::channel(1);
+        tx.try_send(sample.clone()).unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        let worker_running = running.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let sent = send_while_running(&tx, sample, || worker_running.load(Ordering::SeqCst));
+            done_tx.send(sent).unwrap();
+        });
+        running.store(false, Ordering::SeqCst);
+        let result = done_rx.recv_timeout(Duration::from_secs(2));
+        drop(rx);
+        worker.join().unwrap();
+        assert!(!result.unwrap());
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

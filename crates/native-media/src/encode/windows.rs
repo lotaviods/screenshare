@@ -46,6 +46,7 @@ pub struct FfmpegEncoder {
     src_h: u32,
     config: EncoderConfig,
     force_keyframe: bool,
+    fallback: Option<String>,
 }
 
 // The context is only touched from the owning capture thread.
@@ -64,10 +65,14 @@ impl FfmpegEncoder {
                 continue;
             };
             match Self::open(config.clone(), codec) {
-                Ok(encoder) => {
+                Ok(mut encoder) => {
                     tracing::info!(encoder = name, codec = ?config.codec, "using FFmpeg encoder");
                     if !errors.is_empty() {
                         tracing::warn!(encoder = name, "using fallback video encoder");
+                        encoder.fallback = Some(format!(
+                            "Video encoder fallback: using {name} for {:?}",
+                            config.codec
+                        ));
                     }
                     return Ok(encoder);
                 }
@@ -86,6 +91,11 @@ impl FfmpegEncoder {
                 format!(": {}", errors.join("; "))
             }
         )))
+    }
+
+    /// Notice when an earlier available encoder failed to initialize.
+    pub fn fallback_notice(&self) -> Option<&str> {
+        self.fallback.as_deref()
     }
 
     fn open(config: EncoderConfig, codec: *const ffi::AVCodec) -> Result<Self, EncodeError> {
@@ -156,6 +166,7 @@ impl FfmpegEncoder {
                 src_h: height,
                 config,
                 force_keyframe: false,
+                fallback: None,
             })
         }
     }

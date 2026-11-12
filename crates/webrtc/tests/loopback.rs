@@ -80,6 +80,45 @@ async fn negotiate_video(
 }
 
 #[tokio::test]
+async fn connected_peer_reports_selected_pair_rtt() {
+    let (a_tx, mut a_rx) = mpsc::unbounded_channel();
+    let a = WebRtcPeer::new(
+        PeerConfig::default(),
+        Codec::H264,
+        Arc::new(move |e| {
+            let _ = a_tx.send(e);
+        }),
+    )
+    .await
+    .unwrap();
+    let (b_tx, mut b_rx) = mpsc::unbounded_channel();
+    let b = WebRtcPeer::new(
+        PeerConfig::default(),
+        Codec::H264,
+        Arc::new(move |e| {
+            let _ = b_tx.send(e);
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(a.round_trip_time_ms().await.is_none());
+    let _track = negotiate_video(&a, &b, &mut a_rx, &mut b_rx).await;
+    let rtt = timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(ms) = a.round_trip_time_ms().await {
+                break ms;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("selected ICE pair should report a measured RTT");
+    assert!(rtt.is_finite() && rtt >= 0.0);
+    a.close().await.unwrap();
+    b.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn two_peers_connect_and_exchange_media() {
     let (a_tx, mut a_rx) = mpsc::unbounded_channel::<PeerEvent>();
     let a = WebRtcPeer::new(

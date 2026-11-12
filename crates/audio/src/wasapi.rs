@@ -104,13 +104,13 @@ impl Recorder {
     }
 
     /// Drain the next capture packet(s) into `pending`.
-    pub(crate) fn pump(&mut self) {
+    pub(crate) fn pump(&mut self) -> Result<(), String> {
         unsafe {
             loop {
-                let next = match self.capture.GetNextPacketSize() {
-                    Ok(next) => next,
-                    Err(_) => break,
-                };
+                let next = self
+                    .capture
+                    .GetNextPacketSize()
+                    .map_err(|e| e.to_string())?;
                 if next == 0 {
                     break;
                 }
@@ -118,13 +118,9 @@ impl Recorder {
                 let mut data: *mut u8 = std::ptr::null_mut();
                 let mut frames: u32 = 0;
                 let mut flags: u32 = 0;
-                if self
-                    .capture
+                self.capture
                     .GetBuffer(&mut data, &mut frames, &mut flags, None, None)
-                    .is_err()
-                {
-                    break;
-                }
+                    .map_err(|e| e.to_string())?;
 
                 let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
                 if silent || data.is_null() {
@@ -135,9 +131,12 @@ impl Recorder {
                         std::slice::from_raw_parts(data as *const i16, frames as usize * 2);
                     self.pending.extend_from_slice(samples);
                 }
-                let _ = self.capture.ReleaseBuffer(frames);
+                self.capture
+                    .ReleaseBuffer(frames)
+                    .map_err(|e| e.to_string())?;
             }
         }
+        Ok(())
     }
 
     /// Take every pending interleaved stereo sample.

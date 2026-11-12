@@ -9,8 +9,9 @@ use crate::pulse::{Mixer, Recorder};
 use super::Capture;
 
 impl Capture for Recorder {
-    fn pump(&mut self) {
+    fn pump(&mut self) -> Result<(), String> {
         Recorder::pump(self);
+        Ok(())
     }
 
     fn next(&mut self) -> Option<Vec<i16>> {
@@ -24,8 +25,9 @@ impl Capture for Recorder {
 }
 
 impl Capture for Mixer {
-    fn pump(&mut self) {
+    fn pump(&mut self) -> Result<(), String> {
         Mixer::pump(self);
+        Ok(())
     }
 
     fn next(&mut self) -> Option<Vec<i16>> {

@@ -18,6 +18,7 @@ use rtc::rtp_transceiver::rtp_sender::{
     RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind,
 };
 use rtc::rtp_transceiver::PayloadType;
+use rtc::statistics::{report::RTCStatsReportEntry, StatsSelector};
 use serde::{Deserialize, Serialize};
 use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
 use webrtc::media_stream::track_local::TrackLocal;
@@ -249,6 +250,25 @@ impl PeerConnectionEventHandler for Handler {
 }
 
 impl WebRtcPeer {
+    /// Most recent STUN round-trip time for the selected ICE pair, in milliseconds.
+    /// This is network RTT to this peer, not one-way audio or video latency.
+    pub async fn round_trip_time_ms(&self) -> Option<f64> {
+        let report = self.pc.get_stats(Instant::now(), StatsSelector::None).await;
+        let rtt = report.iter().find_map(|entry| {
+            let RTCStatsReportEntry::Transport(transport) = entry else {
+                return None;
+            };
+            let RTCStatsReportEntry::IceCandidatePair(pair) =
+                report.get(&transport.selected_candidate_pair_id)?
+            else {
+                return None;
+            };
+            let ms = pair.current_round_trip_time * 1000.0;
+            (pair.responses_received > 0 && ms.is_finite() && ms >= 0.0).then_some(ms)
+        });
+        rtt
+    }
+
     /// Build a peer connection with the given ICE servers and event callback.
     ///
     /// Only `video_codec` is registered as a video codec, so the negotiated

@@ -5,9 +5,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Div, ElementId, Entity, FontWeight,
-    ObjectFit, Render, RenderImage, SharedString, Stateful, StatefulInteractiveElement, WeakEntity,
-    Window, WindowHandle, WindowKind, WindowOptions, div, img, prelude::*, px, rgb, size,
+    AnyElement, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Div, ElementId, Entity,
+    FontWeight, ObjectFit, Render, RenderImage, SharedString, Stateful, StatefulInteractiveElement,
+    WeakEntity, Window, WindowHandle, WindowKind, WindowOptions, div, img, prelude::*, px, rgb,
+    size,
 };
 use sharescreen_config::{Config, ConfigStore};
 use sharescreen_core::{
@@ -15,7 +16,7 @@ use sharescreen_core::{
     Device, Participant,
 };
 
-use crate::backend::{self, Backend, Command, FrameKind, FrameRequest, UiEvent};
+use crate::backend::{self, Backend, Command, FrameKind, FrameRequest, ShareId, UiEvent};
 use crate::text_input::TextInput;
 
 const BG: u32 = 0x0d0d12;
@@ -77,10 +78,13 @@ pub struct AppView {
     resume_share: bool,
     participants: Vec<Participant>,
     error: Option<String>,
+    encoder_notice: Option<String>,
     mic_on: bool,
     system_on: bool,
     sharing: bool,
     peer_volumes: HashMap<String, f64>,
+    peer_rtt: HashMap<String, f64>,
+    rtt_history: std::collections::VecDeque<f64>,
 
     name_input: Entity<TextInput>,
     host_input: Entity<TextInput>,
@@ -105,8 +109,9 @@ pub struct AppView {
     outputs: Vec<Device>,
     monitors: Vec<Device>,
 
-    remote_frame: Option<Arc<RenderImage>>,
+    remote_frames: HashMap<String, Arc<RenderImage>>,
     local_frame: Option<Arc<RenderImage>>,
+    focused_share: Option<ShareId>,
     pip_window: Option<WindowHandle<PipView>>,
     pip_entity: Option<Entity<PipView>>,
 }
@@ -134,10 +139,13 @@ impl AppView {
             resume_share: false,
             participants: Vec::new(),
             error: None,
+            encoder_notice: None,
             mic_on: false,
             system_on: false,
             sharing: false,
             peer_volumes: HashMap::new(),
+            peer_rtt: HashMap::new(),
+            rtt_history: std::collections::VecDeque::new(),
             name_input: cx.new(|cx| TextInput::new(name.clone(), "Name others will see", cx)),
             host_input: cx.new(|cx| TextInput::new(host.clone(), "127.0.0.1", cx)),
             port_input: cx.new(|cx| TextInput::new(port.clone(), "8080", cx)),
@@ -156,8 +164,9 @@ impl AppView {
             microphones: Vec::new(),
             outputs: Vec::new(),
             monitors: Vec::new(),
-            remote_frame: None,
+            remote_frames: HashMap::new(),
             local_frame: None,
+            focused_share: None,
             pip_window: None,
             pip_entity: None,
         };
@@ -178,6 +187,8 @@ impl AppView {
 
         view.start_frame_poll(cx);
         view.start_preview_poll(cx);
+        view.start_latency_poll(cx);
+        view.start_health_poll(cx);
         view
     }
 
@@ -216,6 +227,35 @@ impl AppView {
         .detach();
     }
 
+    fn start_latency_poll(&self, cx: &mut Context<Self>) {
+        let backend = self.backend.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                match this.update(cx, |view, _| view.connected && view.room_id.is_some()) {
+                    Ok(true) => backend.send(Command::PollLatency),
+                    Ok(false) => {}
+                    Err(_) => break,
+                }
+                cx.background_executor().timer(Duration::from_secs(2)).await;
+            }
+        })
+        .detach();
+    }
+
+    fn start_health_poll(&self, cx: &mut Context<Self>) {
+        let backend = self.backend.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                if this.update(cx, |_, _| ()).is_err() {
+                    break;
+                }
+                backend.send(Command::PollHealth);
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+            }
+        })
+        .detach();
+    }
+
     /// Drop the PiP window handle once its window is gone.
     fn prune_pip(&mut self, cx: &mut Context<Self>) {
         if let Some(handle) = self.pip_window
@@ -228,22 +268,24 @@ impl AppView {
 
     fn frame_request(&mut self, cx: &mut Context<Self>) -> Option<FrameRequest> {
         self.prune_pip(cx);
-        let peer = if self.screen == Screen::Call {
+        let peers: Vec<_> = if self.screen == Screen::Call {
             self.participants
                 .iter()
-                .find(|participant| participant.screen_on)
+                .filter(|participant| participant.screen_on)
                 .map(|participant| participant.id.clone())
+                .collect()
         } else {
-            None
+            Vec::new()
         };
         let local = self.screen == Screen::Call && self.sharing;
-        if peer.is_none() && self.pip_window.is_none() && !local {
+        if self.screen != Screen::Call && self.pip_window.is_none() && !local {
             return None;
         }
         Some(FrameRequest {
             remote: true,
-            peer,
+            peers,
             pip: false,
+            pip_target: None,
             local: false,
         })
     }
@@ -258,10 +300,222 @@ impl AppView {
         }
         Some(FrameRequest {
             remote: false,
-            peer: None,
+            peers: Vec::new(),
             pip,
+            pip_target: self.pip_share(),
             local,
         })
+    }
+
+    fn pip_share(&self) -> Option<ShareId> {
+        self.focused_share.clone().or_else(|| {
+            self.participants
+                .iter()
+                .find(|participant| participant.screen_on)
+                .map(|participant| ShareId::Remote(participant.id.clone()))
+                .or_else(|| self.sharing.then_some(ShareId::Local))
+        })
+    }
+
+    fn forget_remote_share(&mut self, peer: &str) {
+        self.remote_frames.remove(peer);
+        if self.focused_share == Some(ShareId::Remote(peer.to_owned())) {
+            self.focused_share = None;
+        }
+        self.backend.send(Command::ForgetRemote(peer.to_owned()));
+    }
+
+    fn toggle_share_focus(&mut self, share: ShareId, cx: &mut Context<Self>) {
+        self.focused_share = next_share_focus(self.focused_share.as_ref(), share);
+        cx.notify();
+    }
+
+    /// Every active share, local first, with the label and latest frame.
+    fn shares(&self) -> Vec<(ShareId, String, Option<Arc<RenderImage>>)> {
+        let mut shares = Vec::new();
+        if self.sharing {
+            shares.push((ShareId::Local, "You".to_owned(), self.local_frame.clone()));
+        }
+        for participant in self.participants.iter().filter(|p| p.screen_on) {
+            shares.push((
+                ShareId::Remote(participant.id.clone()),
+                participant.name.clone(),
+                self.remote_frames.get(&participant.id).cloned(),
+            ));
+        }
+        shares
+    }
+
+    /// Grid of all shares, or one focused share. Clicking a tile focuses it and
+    /// clicking the focused tile returns to the grid.
+    fn stage(&self, cx: &mut Context<Self>) -> AnyElement {
+        let shares = self.shares();
+        if shares.is_empty() {
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(rgb(MUTED))
+                .child(if self.sharing {
+                    "Waiting for the first preview frame…"
+                } else {
+                    "No one is sharing a screen."
+                })
+                .into_any_element();
+        }
+
+        let focused = self.focused_share.clone().and_then(|wanted| {
+            shares
+                .iter()
+                .find(|(share, ..)| *share == wanted)
+                .map(|(share, name, frame)| (share.clone(), name.clone(), frame.clone()))
+        });
+        if let Some((share, name, frame)) = focused {
+            return self
+                .focused_stage(share, name, frame, cx)
+                .into_any_element();
+        }
+
+        let columns = share_grid_columns(shares.len());
+        let rows = shares.len().div_ceil(columns);
+        let mut grid = div()
+            .grid()
+            .grid_cols(columns as u16)
+            .grid_rows(rows as u16)
+            .gap_2()
+            .size_full()
+            .p_2();
+        for (share, name, frame) in &shares {
+            grid = grid.child(self.share_tile(share.clone(), name.clone(), frame.clone(), cx));
+        }
+        grid.into_any_element()
+    }
+
+    fn share_tile(
+        &self,
+        share: ShareId,
+        name: String,
+        frame: Option<Arc<RenderImage>>,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let mut tile = div()
+            .id(ElementId::Name(SharedString::from(format!(
+                "share-tile-{}",
+                share_key(&share)
+            ))))
+            .min_w_0()
+            .min_h_0()
+            .relative()
+            .overflow_hidden()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(0x111118))
+            .cursor(CursorStyle::PointingHand)
+            .on_click(
+                cx.listener(move |view, _, _, cx| view.toggle_share_focus(share.clone(), cx)),
+            );
+
+        tile = match frame {
+            Some(frame) => tile.child(img(frame).object_fit(ObjectFit::Contain).size_full()),
+            None => tile.child(
+                div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_sm()
+                    .text_color(rgb(MUTED))
+                    .child(format!("Waiting for {name}…")),
+            ),
+        };
+
+        tile.child(
+            div()
+                .absolute()
+                .top_2()
+                .left_2()
+                .px_2()
+                .rounded_md()
+                .bg(rgb(0x000000))
+                .text_xs()
+                .text_color(rgb(0xffffff))
+                .child(SharedString::from(name)),
+        )
+    }
+
+    fn focused_stage(
+        &self,
+        share: ShareId,
+        name: String,
+        frame: Option<Arc<RenderImage>>,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let mut stage = div()
+            .id(ElementId::Name(SharedString::from(format!(
+                "focused-share-{}",
+                share_key(&share)
+            ))))
+            .relative()
+            .size_full()
+            .bg(rgb(0x09090d));
+
+        // Only the video area returns to the grid, so the overlay buttons do
+        // not also trigger it through event bubbling.
+        stage = match frame {
+            Some(frame) => stage.child(
+                div()
+                    .id("focused-share-content")
+                    .size_full()
+                    .cursor(CursorStyle::PointingHand)
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.focused_share = None;
+                        cx.notify();
+                    }))
+                    .child(img(frame).object_fit(ObjectFit::Contain).size_full()),
+            ),
+            None => stage.child(
+                div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_sm()
+                    .text_color(rgb(MUTED))
+                    .child(format!("Waiting for {name}…")),
+            ),
+        };
+
+        stage
+            .child(
+                div()
+                    .absolute()
+                    .top_2()
+                    .left_2()
+                    .px_2()
+                    .rounded_md()
+                    .bg(rgb(0x000000))
+                    .text_xs()
+                    .text_color(rgb(0xffffff))
+                    .child(SharedString::from(name)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_2()
+                    .right_2()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .child(button("show-all-shares", "Show all").on_click(cx.listener(
+                        |view, _, _, cx| {
+                            view.focused_share = None;
+                            cx.notify();
+                        },
+                    )))
+                    .child(button("open-pip", "PiP").on_click(cx.listener(Self::open_pip))),
+            )
     }
 
     fn handle_event(&mut self, event: UiEvent, cx: &mut Context<Self>) {
@@ -271,6 +525,17 @@ impl AppView {
                 self.connecting = false;
                 self.error = Some(message);
             }
+            UiEvent::ConnectionFailed(message) => {
+                self.connected = false;
+                self.connecting = false;
+                self.pending_rejoin = None;
+                self.resume_mic = false;
+                self.resume_system = false;
+                self.resume_share = false;
+                self.room_id = None;
+                self.screen = Screen::Home;
+                self.error = Some(format!("Connection failed: {message}"));
+            }
             UiEvent::Config(config) => self.config = config,
             UiEvent::Connected(connected) => {
                 tracing::info!(connected, "ui connection state changed");
@@ -279,6 +544,8 @@ impl AppView {
                 if connected {
                     self.resume_media_after_reconnect();
                 } else {
+                    self.peer_rtt.clear();
+                    self.rtt_history.clear();
                     // Stay on the call screen while a codec-driven reconnect is
                     // in flight; only fall back to Home for a real disconnect.
                     if self.pending_rejoin.is_none() {
@@ -286,7 +553,8 @@ impl AppView {
                     }
                     self.room_id = None;
                     self.participants.clear();
-                    self.remote_frame = None;
+                    self.remote_frames.clear();
+                    self.focused_share = None;
                     self.local_frame = None;
                 }
             }
@@ -308,14 +576,44 @@ impl AppView {
             }
             UiEvent::Mic(on) => self.mic_on = on,
             UiEvent::System(on) => self.system_on = on,
+            UiEvent::EncoderNotice(message) => self.encoder_notice = Some(message),
+            UiEvent::Latency(values) => {
+                if self.room_id.is_none() {
+                    self.peer_rtt.clear();
+                    self.rtt_history.clear();
+                    return;
+                }
+                self.peer_rtt = values.into_iter().collect();
+                if let Some(max) = self.peer_rtt.values().copied().reduce(f64::max) {
+                    self.rtt_history.push_back(max);
+                    if self.rtt_history.len() > 30 {
+                        self.rtt_history.pop_front();
+                    }
+                } else {
+                    self.rtt_history.clear();
+                }
+            }
             UiEvent::Sharing(on) => {
                 self.sharing = on;
                 if !on {
                     self.local_frame = None;
+                    self.encoder_notice = None;
+                    if self.focused_share == Some(ShareId::Local) {
+                        self.focused_share = None;
+                    }
                 }
             }
             UiEvent::Frame { kind, jpeg } => match kind {
-                FrameKind::Remote => self.remote_frame = decode_frame(jpeg),
+                FrameKind::Remote(peer) => {
+                    // Accept the frame even if the participant update has not
+                    // arrived yet; the map is only read for peers that are
+                    // currently sharing, and cleared when sharing stops.
+                    if let Some(frame) = decode_frame(jpeg) {
+                        self.remote_frames.insert(peer, frame);
+                    } else {
+                        self.remote_frames.remove(&peer);
+                    }
+                }
                 FrameKind::Local => self.local_frame = decode_frame(jpeg),
                 FrameKind::Pip => {
                     let frame = decode_frame(jpeg);
@@ -344,13 +642,19 @@ impl AppView {
             }
             CallEvent::RoomDeleted { .. } => {
                 self.room_id = None;
+                self.peer_rtt.clear();
+                self.rtt_history.clear();
                 self.participants.clear();
-                self.remote_frame = None;
+                self.remote_frames.clear();
+                self.focused_share = None;
                 self.local_frame = None;
                 self.screen = Screen::Home;
             }
             CallEvent::ParticipantJoined { participant }
             | CallEvent::ParticipantUpdated { participant } => {
+                if !participant.screen_on {
+                    self.forget_remote_share(&participant.id);
+                }
                 match self
                     .participants
                     .iter()
@@ -361,8 +665,10 @@ impl AppView {
                 }
             }
             CallEvent::ParticipantLeft { id } => {
+                self.forget_remote_share(&id);
                 self.participants.retain(|participant| participant.id != id);
                 self.peer_volumes.remove(&id);
+                self.peer_rtt.remove(&id);
             }
             CallEvent::ConnectionStateChanged { .. } => {}
             CallEvent::Error { message } => self.error = Some(message),
@@ -415,7 +721,8 @@ impl AppView {
         self.resume_system = false;
         self.resume_share = false;
         self.participants.clear();
-        self.remote_frame = None;
+        self.remote_frames.clear();
+        self.focused_share = None;
         self.local_frame = None;
         self.screen = Screen::Home;
         cx.notify();
@@ -644,8 +951,11 @@ impl AppView {
     fn on_leave(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.backend.send(Command::LeaveRoom);
         self.room_id = None;
+        self.peer_rtt.clear();
+        self.rtt_history.clear();
         self.participants.clear();
-        self.remote_frame = None;
+        self.remote_frames.clear();
+        self.focused_share = None;
         self.local_frame = None;
         self.screen = Screen::Home;
         cx.notify();
@@ -654,8 +964,11 @@ impl AppView {
     fn on_delete_room(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.backend.send(Command::DeleteRoom);
         self.room_id = None;
+        self.peer_rtt.clear();
+        self.rtt_history.clear();
         self.participants.clear();
-        self.remote_frame = None;
+        self.remote_frames.clear();
+        self.focused_share = None;
         self.local_frame = None;
         self.screen = Screen::Home;
         cx.notify();
@@ -1173,12 +1486,14 @@ impl AppView {
                                     .font_weight(FontWeight::BOLD)
                                     .child(participant.name.clone()),
                             )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(MUTED))
-                                    .child(format!("{:?}", participant.connection)),
-                            ),
+                            .child(div().text_xs().text_color(rgb(MUTED)).child(
+                                match self.peer_rtt.get(&participant.id) {
+                                    Some(ms) => {
+                                        format!("{:?} · {ms:.0} ms RTT", participant.connection)
+                                    }
+                                    None => format!("{:?}", participant.connection),
+                                },
+                            )),
                     )
                     .child(
                         div()
@@ -1214,91 +1529,49 @@ impl AppView {
             );
         }
 
+        let rtt = self.rtt_history.back().copied();
+        let mut graph = div().flex().flex_row().items_end().gap_1().h(px(32.));
+        for ms in &self.rtt_history {
+            let height = (ms / 300.0 * 30.0).clamp(2.0, 30.0) as f32;
+            graph = graph.child(div().w(px(4.)).h(px(height)).bg(rgb(if *ms > 200.0 {
+                0xe8994c
+            } else {
+                OK
+            })));
+        }
+        sidebar = sidebar.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().text_xs().text_color(rgb(MUTED)).child(match rtt {
+                    Some(ms) => format!("Peer RTT (highest): {ms:.0} ms"),
+                    None => "Peer RTT: waiting for measurement".to_string(),
+                }))
+                .child(graph)
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child("Network round trip · last 60 s"),
+                ),
+        );
+        if let Some(notice) = &self.encoder_notice {
+            sidebar = sidebar.child(div().text_xs().text_color(rgb(MUTED)).child(notice.clone()));
+        }
         sidebar = sidebar.child(div().flex_1()).child(
-            button("call-settings", "Settings").on_click(cx.listener(Self::on_open_settings)),
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .child(button("call-pip", "Pop out").on_click(cx.listener(Self::open_pip)))
+                .child(
+                    button("call-settings", "Settings")
+                        .on_click(cx.listener(Self::on_open_settings)),
+                ),
         );
 
-        let sharer = self
-            .participants
-            .iter()
-            .find(|participant| participant.screen_on);
-        let stage = if let (Some(frame), Some(participant)) = (&self.remote_frame, sharer) {
-            div()
-                .relative()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    img(frame.clone())
-                        .object_fit(ObjectFit::Contain)
-                        .size_full(),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .top_2()
-                        .right_2()
-                        .flex()
-                        .flex_row()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0xffffff))
-                                .bg(rgb(0x000000))
-                                .px_2()
-                                .rounded_md()
-                                .child(SharedString::from(participant.name.clone())),
-                        )
-                        .child(button("open-pip", "PiP").on_click(cx.listener(Self::open_pip))),
-                )
-        } else if let (true, Some(frame)) = (self.sharing, &self.local_frame) {
-            // While this peer is sharing, show its own capture as the main
-            // stage self-view so the user can see what others receive.
-            div()
-                .relative()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    img(frame.clone())
-                        .object_fit(ObjectFit::Contain)
-                        .size_full(),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .top_2()
-                        .right_2()
-                        .flex()
-                        .flex_row()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0xffffff))
-                                .bg(rgb(0x000000))
-                                .px_2()
-                                .rounded_md()
-                                .child("You"),
-                        )
-                        .child(button("open-pip", "PiP").on_click(cx.listener(Self::open_pip))),
-                )
-        } else {
-            div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(rgb(MUTED))
-                .child(if self.sharing {
-                    "You are sharing your screen."
-                } else {
-                    "No one is sharing a screen."
-                })
-        };
+        let stage = self.stage(cx);
 
         div().flex().flex_row().size_full().child(sidebar).child(
             div()
@@ -2262,6 +2535,33 @@ fn codec_requires_reconnect(previous: Codec, next: Codec, connected: bool) -> bo
     connected && previous != next
 }
 
+/// Stable element-id suffix for a share tile.
+fn share_key(share: &ShareId) -> String {
+    match share {
+        ShareId::Local => "local".to_owned(),
+        ShareId::Remote(peer) => format!("remote-{peer}"),
+    }
+}
+
+/// Clicking the focused share returns to the grid; anything else focuses it.
+fn next_share_focus(current: Option<&ShareId>, clicked: ShareId) -> Option<ShareId> {
+    if current == Some(&clicked) {
+        None
+    } else {
+        Some(clicked)
+    }
+}
+
+/// Column count for the share grid: one tile fills the stage, two to four
+/// share a 2x2 grid, and larger calls use three columns.
+fn share_grid_columns(count: usize) -> usize {
+    match count {
+        0 | 1 => 1,
+        2..=4 => 2,
+        _ => 3,
+    }
+}
+
 fn decode_frame(jpeg: Option<Vec<u8>>) -> Option<Arc<RenderImage>> {
     let jpeg = jpeg?;
     let decoded = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg)
@@ -2302,6 +2602,22 @@ mod tests {
         assert_eq!(servers[0].username.as_deref(), Some("user"));
         assert_eq!(servers[0].credential.as_deref(), Some("pass"));
         assert!(servers[1].username.is_none());
+    }
+
+    #[test]
+    fn share_focus_toggles_and_grid_columns_scale() {
+        let local = ShareId::Local;
+        let remote = ShareId::Remote("peer".into());
+        assert_eq!(next_share_focus(None, local.clone()), Some(local.clone()));
+        assert_eq!(next_share_focus(Some(&local), local.clone()), None);
+        assert_eq!(
+            next_share_focus(Some(&local), remote.clone()),
+            Some(remote.clone())
+        );
+        assert_eq!(share_grid_columns(1), 1);
+        assert_eq!(share_grid_columns(3), 2);
+        assert_eq!(share_grid_columns(5), 3);
+        assert_ne!(share_key(&local), share_key(&remote));
     }
 
     #[test]

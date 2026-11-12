@@ -27,6 +27,9 @@ pub struct Stream {
 }
 
 impl Stream {
+    pub fn finished(&self) -> bool {
+        self.thread.is_finished()
+    }
     pub fn stop(self) {
         self.running.store(0, Ordering::SeqCst);
         let _ = self.thread.join();
@@ -62,6 +65,7 @@ pub fn spawn(
             let mut failed = false;
             let mut frame_count = 0u64;
 
+            let callback_flag = flag.clone();
             let result = pipewire::run(raw, node_id, Memory::DmaBuf, None, flag, move |frame| {
                 if failed || frame.format().is_none() {
                     return;
@@ -79,6 +83,7 @@ pub fn spawn(
                         Err(err) => {
                             tracing::error!("native encoder unavailable: {err}");
                             failed = true;
+                            callback_flag.store(0, Ordering::SeqCst);
                             return;
                         }
                     }
@@ -97,7 +102,10 @@ pub fn spawn(
                                 duration_micros: frame.duration_micros,
                                 keyframe: frame.keyframe,
                             };
-                            if sink.blocking_send(sample).is_err() {
+                            if !crate::send_while_running(&sink, sample, || {
+                                callback_flag.load(Ordering::SeqCst) != 0
+                            }) {
+                                callback_flag.store(0, Ordering::SeqCst);
                                 return;
                             }
                         }
@@ -111,6 +119,7 @@ pub fn spawn(
                     Err(err) => {
                         tracing::warn!("native encode failed: {err}");
                         failed = true;
+                        callback_flag.store(0, Ordering::SeqCst);
                     }
                 }
             });

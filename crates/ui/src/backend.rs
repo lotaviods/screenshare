@@ -1,8 +1,9 @@
 //! Backend actor: owns capture/audio/call state and communicates with the GPUI
 //! thread through channels. The UI never blocks on media or network work.
 
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use sharescreen_audio::AudioEngine;
@@ -10,28 +11,25 @@ use sharescreen_call::{CallConfig, CallSession};
 use sharescreen_capture::CaptureEngine;
 use sharescreen_config::{Config, ConfigStore};
 use sharescreen_core::{
-    AudioCapture, CallEvent, CaptureBackend, CaptureOptions, CaptureSource, Device, EncodedSample,
-    ScreenCapture,
+    AudioCapture, CallEvent, CaptureBackend, CaptureOptions, CaptureSource, Device, DeviceKind,
+    EncodedSample, ScreenCapture,
 };
 use sharescreen_network as network;
 use tokio::sync::mpsc;
 
 /// Which frame stream an update belongs to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum FrameKind {
-    Remote,
+    Remote(String),
     Pip,
     Local,
 }
 
-impl FrameKind {
-    fn index(self) -> usize {
-        match self {
-            Self::Remote => 0,
-            Self::Pip => 1,
-            Self::Local => 2,
-        }
-    }
+/// Identifies one screen share without confusing our preview with a peer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShareId {
+    Local,
+    Remote(String),
 }
 
 /// What the UI wants each poll cycle.
@@ -39,10 +37,12 @@ impl FrameKind {
 pub struct FrameRequest {
     /// Whether to update (or clear) the remote stage.
     pub remote: bool,
-    /// Remote participant whose decoded frame to fetch.
-    pub peer: Option<String>,
+    /// Remote participants whose decoded frames to fetch.
+    pub peers: Vec<String>,
     /// Fetch the best frame for the picture-in-picture window.
     pub pip: bool,
+    /// The share shown in PiP, if one is selected.
+    pub pip_target: Option<ShareId>,
     /// Fetch this peer's own self-view frame for the main stage while sharing.
     pub local: bool,
 }
@@ -74,6 +74,9 @@ pub enum Command {
         volume: f64,
     },
     Poll(FrameRequest),
+    ForgetRemote(String),
+    PollLatency,
+    PollHealth,
     SaveConfig(Config),
 }
 
@@ -81,6 +84,7 @@ pub enum Command {
 #[allow(clippy::large_enum_variant)] // channel messages, not stored in bulk
 pub enum UiEvent {
     Error(String),
+    ConnectionFailed(String),
     Config(Config),
     Connected(bool),
     Call(CallEvent),
@@ -93,6 +97,9 @@ pub enum UiEvent {
     Mic(bool),
     System(bool),
     Sharing(bool),
+    /// Latest RTT measurements for the active peer connections, in ms.
+    Latency(Vec<(String, f64)>),
+    EncoderNotice(String),
     Frame {
         kind: FrameKind,
         jpeg: Option<Vec<u8>>,
@@ -152,8 +159,13 @@ struct Actor {
     share: Option<ShareTarget>,
     mic_running: bool,
     /// Last hash sent per frame stream. `None` means nothing sent yet.
-    frames: [Option<Option<u64>>; 3],
+    frames: HashMap<FrameKind, Option<u64>>,
     last_hotplug_check: std::time::Instant,
+    device_enumeration: Arc<AtomicBool>,
+    source_enumeration: Arc<AtomicBool>,
+    latency_inflight: Arc<AtomicBool>,
+    latency_generation: Arc<AtomicU64>,
+    session_generation: Arc<AtomicU64>,
 }
 
 impl Actor {
@@ -172,8 +184,13 @@ impl Actor {
             call: None,
             share: None,
             mic_running: false,
-            frames: [None; 3],
+            frames: HashMap::new(),
             last_hotplug_check: std::time::Instant::now(),
+            device_enumeration: Arc::new(AtomicBool::new(false)),
+            source_enumeration: Arc::new(AtomicBool::new(false)),
+            latency_inflight: Arc::new(AtomicBool::new(false)),
+            latency_generation: Arc::new(AtomicU64::new(0)),
+            session_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -192,24 +209,20 @@ impl Actor {
     async fn handle(&mut self, command: Command) {
         tracing::debug!(?command, "backend command");
         let result = match command {
-            Command::Connect => self.connect().await,
+            Command::Connect => match self.connect().await {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    self.send(UiEvent::ConnectionFailed(error));
+                    Ok(())
+                }
+            },
             Command::Disconnect => self.disconnect().await,
             Command::CreateRoom => self.create_room(),
             Command::JoinRoom(room) => self.join_room(room),
             Command::LeaveRoom => self.leave_room().await,
             Command::DeleteRoom => self.delete_room().await,
             Command::ListDevices => self.list_devices(),
-            Command::ListSources => {
-                let started = std::time::Instant::now();
-                let sources = self.capture.list_sources();
-                tracing::info!(
-                    count = sources.len(),
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "enumerated capture sources"
-                );
-                self.send(UiEvent::Sources(sources));
-                Ok(())
-            }
+            Command::ListSources => self.list_sources(),
             Command::StartMic(device) => self.start_mic(device).await,
             Command::StopMic => self.stop_mic().await,
             Command::StartSystem(device) => self.start_system(device).await,
@@ -237,6 +250,15 @@ impl Actor {
                 self.poll_frames(request);
                 Ok(())
             }
+            Command::ForgetRemote(peer) => {
+                self.frames.remove(&FrameKind::Remote(peer));
+                Ok(())
+            }
+            Command::PollLatency => {
+                self.poll_latency();
+                Ok(())
+            }
+            Command::PollHealth => self.check_media_health().await,
             Command::SaveConfig(config) => self.save_config(config),
         };
 
@@ -244,6 +266,57 @@ impl Actor {
             tracing::warn!("{error}");
             self.send(UiEvent::Error(error));
         }
+    }
+
+    fn poll_latency(&self) {
+        let Some(call) = &self.call else { return };
+        if self.latency_inflight.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let query = call.peer_round_trip_times();
+        let flag = self.latency_inflight.clone();
+        let generation = self.latency_generation.clone();
+        let current = generation.load(Ordering::Acquire);
+        let ui = self.ui.clone();
+        tokio::spawn(async move {
+            let _guard = EnumerationGuard(flag);
+            let values = query.await;
+            if generation.load(Ordering::Acquire) == current {
+                let _ = ui.send(UiEvent::Latency(values));
+            }
+        });
+    }
+
+    async fn check_media_health(&mut self) -> Result<(), String> {
+        if let Some(notice) = self.capture.take_notice() {
+            self.send(UiEvent::EncoderNotice(notice));
+        }
+        for (kind, error) in self.audio.take_failures() {
+            match kind {
+                DeviceKind::Microphone => {
+                    self.mic_running = false;
+                    if let Some(call) = &self.call {
+                        call.set_mic_on(false);
+                    }
+                    self.send(UiEvent::Mic(false));
+                    self.send(UiEvent::Error(format!("Microphone stopped: {error}")));
+                }
+                DeviceKind::AudioOutput => {
+                    self.send(UiEvent::System(false));
+                    self.send(UiEvent::Error(format!("System audio stopped: {error}")));
+                }
+                _ => {}
+            }
+        }
+        if self.share.is_some() && self.capture.finished() {
+            let error = self
+                .capture
+                .failure()
+                .unwrap_or_else(|| "worker stopped unexpectedly; see the log for details".into());
+            self.stop_share().await?;
+            self.send(UiEvent::Error(format!("Screen capture stopped: {error}")));
+        }
+        Ok(())
     }
 
     fn media_sink(&self, stream: Stream) -> mpsc::Sender<EncodedSample> {
@@ -282,8 +355,13 @@ impl Actor {
         let (tx, mut rx) = mpsc::unbounded_channel::<CallEvent>();
         let ui = self.ui.clone();
         let store = self.store.clone();
+        let generation = self.session_generation.clone();
+        let current = generation.fetch_add(1, Ordering::AcqRel) + 1;
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
+                if generation.load(Ordering::Acquire) != current {
+                    break;
+                }
                 if let CallEvent::RoomCreated { room_id } | CallEvent::RoomJoined { room_id } =
                     &event
                     && let Ok(mut store) = store.lock()
@@ -320,6 +398,14 @@ impl Actor {
     }
 
     async fn disconnect(&mut self) -> Result<(), String> {
+        self.frames.clear();
+        self.session_generation.fetch_add(1, Ordering::AcqRel);
+        self.latency_generation.fetch_add(1, Ordering::AcqRel);
+        if self.share.is_some() {
+            self.stop_share().await?;
+        }
+        self.stop_mic().await?;
+        self.stop_system().await?;
         if let Some(session) = self.call.as_ref() {
             session.disconnect().await;
         }
@@ -348,6 +434,8 @@ impl Actor {
     }
 
     async fn leave_room(&mut self) -> Result<(), String> {
+        self.frames.clear();
+        self.latency_generation.fetch_add(1, Ordering::AcqRel);
         let session = self
             .call
             .as_ref()
@@ -356,6 +444,8 @@ impl Actor {
     }
 
     async fn delete_room(&mut self) -> Result<(), String> {
+        self.frames.clear();
+        self.latency_generation.fetch_add(1, Ordering::AcqRel);
         let session = self
             .call
             .as_ref()
@@ -364,21 +454,39 @@ impl Actor {
     }
 
     fn list_devices(&self) -> Result<(), String> {
-        let started = std::time::Instant::now();
-        let microphones = self.audio.list_microphones();
-        let outputs = self.audio.list_outputs();
-        let monitors = self.audio.list_system_monitors();
-        tracing::info!(
-            microphones = microphones.len(),
-            outputs = outputs.len(),
-            monitors = monitors.len(),
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "enumerated audio devices"
-        );
-        self.send(UiEvent::Devices {
-            microphones,
-            outputs,
-            monitors,
+        if self.device_enumeration.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let flag = self.device_enumeration.clone();
+        let ui = self.ui.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = EnumerationGuard(flag);
+            let audio = AudioEngine::default();
+            let _ = ui.send(UiEvent::Devices {
+                microphones: audio.list_microphones(),
+                outputs: audio.list_outputs(),
+                monitors: audio.list_system_monitors(),
+            });
+        });
+        Ok(())
+    }
+
+    fn list_sources(&self) -> Result<(), String> {
+        if self.source_enumeration.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let flag = self.source_enumeration.clone();
+        let ui = self.ui.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = EnumerationGuard(flag);
+            match CaptureEngine::new(CaptureBackend::Auto) {
+                Ok(capture) => {
+                    let _ = ui.send(UiEvent::Sources(capture.list_sources()));
+                }
+                Err(error) => {
+                    let _ = ui.send(UiEvent::Error(error.to_string()));
+                }
+            }
         });
         Ok(())
     }
@@ -476,7 +584,7 @@ impl Actor {
         }
         // Force the next self-view frame through even if it matches the last one
         // sent before a previous share.
-        self.frames[FrameKind::Local.index()] = None;
+        self.frames.remove(&FrameKind::Local);
         self.send(UiEvent::Sharing(true));
 
         if include_system_audio {
@@ -502,7 +610,7 @@ impl Actor {
         if let Some(call) = &self.call {
             call.set_screen_sharing(false);
         }
-        self.frames[FrameKind::Local.index()] = None;
+        self.frames.remove(&FrameKind::Local);
         self.send(UiEvent::Sharing(false));
         Ok(())
     }
@@ -543,19 +651,24 @@ impl Actor {
 
     fn poll_frames(&mut self, request: FrameRequest) {
         if request.remote {
-            let remote = request
-                .peer
-                .as_ref()
-                .and_then(|peer| self.call.as_ref()?.remote_frame(peer));
-            self.emit_frame(FrameKind::Remote, remote);
+            self.frames.retain(|kind, _| match kind {
+                FrameKind::Remote(id) => request.peers.contains(id),
+                _ => true,
+            });
+            for peer in &request.peers {
+                let frame = self.call.as_ref().and_then(|call| call.remote_frame(peer));
+                self.emit_frame(FrameKind::Remote(peer.clone()), frame);
+            }
         }
 
         if request.pip {
-            let frame = self
-                .call
-                .as_ref()
-                .and_then(|call| call.shared_screen_frame())
-                .or_else(|| self.capture.latest_preview());
+            let frame = match &request.pip_target {
+                Some(ShareId::Remote(peer)) => {
+                    self.call.as_ref().and_then(|call| call.remote_frame(peer))
+                }
+                Some(ShareId::Local) => self.capture.latest_preview(),
+                None => None,
+            };
             self.emit_frame(FrameKind::Pip, frame);
         }
 
@@ -571,11 +684,10 @@ impl Actor {
             bytes.hash(&mut hasher);
             hasher.finish()
         });
-        let slot = &mut self.frames[kind.index()];
-        if slot.as_ref() == Some(&hash) {
+        if self.frames.get(&kind) == Some(&hash) {
             return;
         }
-        *slot = Some(hash);
+        self.frames.insert(kind.clone(), hash);
         self.send(UiEvent::Frame { kind, jpeg });
     }
 
@@ -601,15 +713,27 @@ enum Stream {
     Screen,
 }
 
+struct EnumerationGuard(Arc<AtomicBool>);
+
+impl Drop for EnumerationGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn frame_kind_indexes_are_distinct() {
-        assert_eq!(FrameKind::Remote.index(), 0);
-        assert_eq!(FrameKind::Pip.index(), 1);
-        assert_eq!(FrameKind::Local.index(), 2);
+    fn enumeration_guard_releases_after_panic() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let child = flag.clone();
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = EnumerationGuard(child);
+            panic!("enumerator failure");
+        });
+        assert!(!flag.load(Ordering::Acquire));
     }
 
     #[test]
@@ -625,22 +749,46 @@ mod tests {
         let store = ConfigStore::load_from_path(path.clone()).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut actor = Actor::new(store, tx);
-        actor.frames[FrameKind::Remote.index()] = Some(Some(42));
+        let remote = FrameKind::Remote("peer".into());
+        actor.frames.insert(remote.clone(), Some(42));
         actor.poll_frames(FrameRequest {
             remote: false,
             local: true,
             ..Default::default()
         });
-        assert_eq!(actor.frames[FrameKind::Remote.index()], Some(Some(42)));
+        assert_eq!(actor.frames.get(&remote), Some(&Some(42)));
         while let Ok(event) = rx.try_recv() {
             assert!(!matches!(
                 event,
                 UiEvent::Frame {
-                    kind: FrameKind::Remote,
+                    kind: FrameKind::Remote(_),
                     ..
                 }
             ));
         }
+        actor.emit_frame(FrameKind::Remote("a".into()), Some(vec![1]));
+        actor.emit_frame(FrameKind::Remote("b".into()), Some(vec![1]));
+        let mut delivered = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let UiEvent::Frame {
+                kind: FrameKind::Remote(id),
+                ..
+            } = event
+            {
+                delivered.push(id);
+            }
+        }
+        assert_eq!(delivered, ["a", "b"]);
+        actor.poll_frames(FrameRequest {
+            remote: true,
+            ..Default::default()
+        });
+        assert!(
+            !actor
+                .frames
+                .keys()
+                .any(|key| matches!(key, FrameKind::Remote(_)))
+        );
         std::fs::remove_file(path).unwrap();
     }
 }

@@ -18,6 +18,21 @@ pub struct WindowsCapture {
 }
 
 impl WindowsCapture {
+    pub fn failure(&self) -> Option<String> {
+        self.stream
+            .as_ref()
+            .and_then(native_windows::Stream::failure)
+    }
+    pub fn take_notice(&self) -> Option<String> {
+        self.stream
+            .as_ref()
+            .and_then(native_windows::Stream::take_notice)
+    }
+    pub fn finished(&self) -> bool {
+        self.stream
+            .as_ref()
+            .is_some_and(native_windows::Stream::finished)
+    }
     /// Latest JPEG self-view frame of the running capture.
     pub fn latest_preview(&self) -> Option<Vec<u8>> {
         self.stream.as_ref().and_then(|s| s.latest_preview())
