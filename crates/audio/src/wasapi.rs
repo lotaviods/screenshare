@@ -5,6 +5,7 @@
 //! process loopback (Windows 10 build 20348 or later) and excludes the
 //! Sharescreen process tree, so the call's own audio is never captured.
 
+use std::mem::ManuallyDrop;
 use std::sync::mpsc;
 
 use windows::core::{
@@ -328,7 +329,14 @@ fn activate_process_loopback() -> Result<IAudioClient, String> {
         },
     };
 
-    let mut variant = PROPVARIANT::default();
+    // The activation params are passed by reference through a `VT_BLOB`
+    // variant. The `windows` crate's `PROPVARIANT` `Drop` calls `PropVariantClear`,
+    // which for `VT_BLOB` frees `pBlobData` with `CoTaskMemFree`. Here
+    // `pBlobData` points at the stack-allocated `params`, so that free hands a
+    // stack pointer to the heap allocator and crashes with
+    // `STATUS_HEAP_CORRUPTION` (0xc0000374). Keep the variant out of `Drop`;
+    // it owns nothing, and `params` outlives the activation below.
+    let mut variant = ManuallyDrop::new(PROPVARIANT::default());
     unsafe {
         (*variant.Anonymous.Anonymous).vt = VT_BLOB;
         (*variant.Anonymous.Anonymous).Anonymous.blob = windows::Win32::System::Com::BLOB {
@@ -343,7 +351,7 @@ fn activate_process_loopback() -> Result<IAudioClient, String> {
         ActivateAudioInterfaceAsync(
             VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
             &IAudioClient::IID,
-            Some(&variant),
+            Some(&*variant),
             &handler,
         )
     }
