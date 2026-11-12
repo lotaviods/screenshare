@@ -177,9 +177,12 @@ impl AppView {
         .detach();
 
         view.start_frame_poll(cx);
+        view.start_preview_poll(cx);
         view
     }
 
+    /// Poll remote video at 10 fps. Decoded remote frames are expensive to
+    /// JPEG round-trip in the UI, so there is no point asking faster.
     fn start_frame_poll(&self, cx: &mut Context<Self>) {
         let backend = self.backend.clone();
         cx.spawn(async move |this, cx| {
@@ -195,13 +198,36 @@ impl AppView {
         .detach();
     }
 
-    fn frame_request(&mut self, cx: &mut Context<Self>) -> Option<FrameRequest> {
+    /// Poll the local self-view at ~30 fps so the preview looks smooth. It runs
+    /// separately from [`Self::start_frame_poll`] so remote decoding stays at
+    /// 10 fps. The backend dedupes unchanged frames, so this is cheap.
+    fn start_preview_poll(&self, cx: &mut Context<Self>) {
+        let backend = self.backend.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                if let Ok(Some(request)) = this.update(cx, |view, cx| view.preview_request(cx)) {
+                    backend.send(Command::Poll(request));
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(33))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    /// Drop the PiP window handle once its window is gone.
+    fn prune_pip(&mut self, cx: &mut Context<Self>) {
         if let Some(handle) = self.pip_window
             && handle.update(cx, |_, _, _| ()).is_err()
         {
             self.pip_window = None;
             self.pip_entity = None;
         }
+    }
+
+    fn frame_request(&mut self, cx: &mut Context<Self>) -> Option<FrameRequest> {
+        self.prune_pip(cx);
         let peer = if self.screen == Screen::Call {
             self.participants
                 .iter()
@@ -217,6 +243,21 @@ impl AppView {
         Some(FrameRequest {
             peer,
             pip: self.pip_window.is_some(),
+            local,
+        })
+    }
+
+    /// The faster self-view request: PiP and the local stage, no remote peer.
+    fn preview_request(&mut self, cx: &mut Context<Self>) -> Option<FrameRequest> {
+        self.prune_pip(cx);
+        let local = self.screen == Screen::Call && self.sharing;
+        let pip = self.pip_window.is_some();
+        if !pip && !local {
+            return None;
+        }
+        Some(FrameRequest {
+            peer: None,
+            pip,
             local,
         })
     }

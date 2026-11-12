@@ -12,8 +12,12 @@ pub struct JpegEncoder {
     frame: *mut ffi::AVFrame,
     sws: *mut ffi::SwsContext,
     sws_bgra: *mut ffi::SwsContext,
+    /// Encoded (destination) size.
     width: u32,
     height: u32,
+    /// Scaler source size; equals the destination size unless downscaling.
+    src_width: u32,
+    src_height: u32,
 }
 
 unsafe impl Send for JpegEncoder {}
@@ -38,12 +42,21 @@ impl JpegEncoder {
                 sws_bgra: ptr::null_mut(),
                 width: 0,
                 height: 0,
+                src_width: 0,
+                src_height: 0,
             })
         }
     }
 
-    /// Open (or re-open) the codec for the current frame size.
-    fn open(&mut self, width: u32, height: u32) -> Result<(), String> {
+    /// Open (or re-open) the codec, scaling `src_width`×`src_height` input down
+    /// to the encoded `width`×`height` output.
+    fn open(
+        &mut self,
+        src_width: u32,
+        src_height: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
         unsafe {
             self.close();
             let ctx = ffi::avcodec_alloc_context3(self.codec);
@@ -62,9 +75,11 @@ impl JpegEncoder {
             self.ctx = ctx;
             self.width = width;
             self.height = height;
+            self.src_width = src_width;
+            self.src_height = src_height;
             self.sws = ffi::sws_getContext(
-                width as i32,
-                height as i32,
+                src_width as i32,
+                src_height as i32,
                 ffi::AVPixelFormat::AV_PIX_FMT_RGB24,
                 width as i32,
                 height as i32,
@@ -78,8 +93,8 @@ impl JpegEncoder {
                 return Err("sws_getContext failed".into());
             }
             self.sws_bgra = ffi::sws_getContext(
-                width as i32,
-                height as i32,
+                src_width as i32,
+                src_height as i32,
                 ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
                 width as i32,
                 height as i32,
@@ -121,19 +136,62 @@ impl JpegEncoder {
 
     /// Encode one RGB24 frame. Returns a JPEG byte stream.
     pub fn encode(&mut self, rgb: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
-        if width == 0 || height == 0 || rgb.len() < width as usize * height as usize * 3 {
-            return Err("empty RGB frame".into());
+        self.encode_frame(false, rgb, width, height, width, height)
+    }
+
+    /// Encode one BGRA frame. Returns a JPEG byte stream.
+    pub fn encode_bgra(&mut self, bgra: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
+        self.encode_frame(true, bgra, width, height, width, height)
+    }
+
+    /// Encode one BGRA frame, scaling `src_width`×`src_height` down to
+    /// `dst_width`×`dst_height`. Used for the downscaled self-view preview.
+    pub fn encode_bgra_scaled(
+        &mut self,
+        bgra: &[u8],
+        src_width: u32,
+        src_height: u32,
+        dst_width: u32,
+        dst_height: u32,
+    ) -> Result<Vec<u8>, String> {
+        self.encode_frame(true, bgra, src_width, src_height, dst_width, dst_height)
+    }
+
+    /// Shared scaler + mjpeg encode. `bgra` selects the source pixel format.
+    fn encode_frame(
+        &mut self,
+        bgra: bool,
+        bytes: &[u8],
+        src_width: u32,
+        src_height: u32,
+        dst_width: u32,
+        dst_height: u32,
+    ) -> Result<Vec<u8>, String> {
+        let bpp = if bgra { 4usize } else { 3 };
+        if src_width == 0
+            || src_height == 0
+            || dst_width == 0
+            || dst_height == 0
+            || bytes.len() < src_width as usize * src_height as usize * bpp
+        {
+            return Err("empty frame".into());
         }
-        if width != self.width || height != self.height || self.ctx.is_null() {
-            self.open(width, height)?;
+        if dst_width != self.width
+            || dst_height != self.height
+            || src_width != self.src_width
+            || src_height != self.src_height
+            || self.ctx.is_null()
+        {
+            self.open(src_width, src_height, dst_width, dst_height)?;
         }
+        let sws = if bgra { self.sws_bgra } else { self.sws };
         unsafe {
             let ret = ffi::av_frame_make_writable(self.frame);
             if ret < 0 {
                 return Err(format!("av_frame_make_writable failed: {ret}"));
             }
-            let src_data = [rgb.as_ptr(), ptr::null(), ptr::null(), ptr::null()];
-            let src_stride = [width as i32 * 3, 0, 0, 0];
+            let src_data = [bytes.as_ptr(), ptr::null(), ptr::null(), ptr::null()];
+            let src_stride = [src_width as i32 * bpp as i32, 0, 0, 0];
             let dst_data = [
                 (*self.frame).data[0],
                 (*self.frame).data[1],
@@ -147,80 +205,16 @@ impl JpegEncoder {
                 (*self.frame).linesize[3],
             ];
             let ret = ffi::sws_scale(
-                self.sws,
+                sws,
                 src_data.as_ptr(),
                 src_stride.as_ptr(),
                 0,
-                height as i32,
+                src_height as i32,
                 dst_data.as_ptr(),
                 dst_stride.as_ptr(),
             );
             if ret < 0 {
                 return Err(format!("sws_scale failed: {ret}"));
-            }
-
-            let ret = ffi::avcodec_send_frame(self.ctx, self.frame);
-            if ret < 0 && ret != ffi::AVERROR(ffi::EAGAIN) {
-                return Err(format!("avcodec_send_frame failed: {ret}"));
-            }
-            let mut packet = ffi::av_packet_alloc();
-            if packet.is_null() {
-                return Err("av_packet_alloc failed".into());
-            }
-            let ret = ffi::avcodec_receive_packet(self.ctx, packet);
-            if ret < 0 && ret != ffi::AVERROR(ffi::EAGAIN) && ret != ffi::AVERROR_EOF {
-                ffi::av_packet_free(&mut packet);
-                return Err(format!("avcodec_receive_packet failed: {ret}"));
-            }
-            let bytes = if ret >= 0 {
-                let data = std::slice::from_raw_parts((*packet).data, (*packet).size as usize);
-                data.to_vec()
-            } else {
-                Vec::new()
-            };
-            ffi::av_packet_free(&mut packet);
-            Ok(bytes)
-        }
-    }
-
-    /// Encode one BGRA frame. Returns a JPEG byte stream.
-    pub fn encode_bgra(&mut self, bgra: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
-        if width == 0 || height == 0 || bgra.len() < width as usize * height as usize * 4 {
-            return Err("empty BGRA frame".into());
-        }
-        if width != self.width || height != self.height || self.ctx.is_null() {
-            self.open(width, height)?;
-        }
-        unsafe {
-            let ret = ffi::av_frame_make_writable(self.frame);
-            if ret < 0 {
-                return Err(format!("av_frame_make_writable failed: {ret}"));
-            }
-            let src_data = [bgra.as_ptr(), ptr::null(), ptr::null(), ptr::null()];
-            let src_stride = [width as i32 * 4, 0, 0, 0];
-            let dst_data = [
-                (*self.frame).data[0],
-                (*self.frame).data[1],
-                (*self.frame).data[2],
-                (*self.frame).data[3],
-            ];
-            let dst_stride = [
-                (*self.frame).linesize[0],
-                (*self.frame).linesize[1],
-                (*self.frame).linesize[2],
-                (*self.frame).linesize[3],
-            ];
-            let ret = ffi::sws_scale(
-                self.sws_bgra,
-                src_data.as_ptr(),
-                src_stride.as_ptr(),
-                0,
-                height as i32,
-                dst_data.as_ptr(),
-                dst_stride.as_ptr(),
-            );
-            if ret < 0 {
-                return Err(format!("sws_scale(BGRA) failed: {ret}"));
             }
 
             let ret = ffi::avcodec_send_frame(self.ctx, self.frame);

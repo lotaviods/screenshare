@@ -4,7 +4,7 @@
 //! to a BGRA DIB and encoded by FFmpeg's H.264/VP8/VP9 encoder.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -12,6 +12,7 @@ use sharescreen_core::{
     CaptureError, CaptureOptions, CaptureSource, Codec, EncodedSample, MediaKind, SourceKind,
 };
 use sharescreen_native_media::encode::{EncoderConfig, FfmpegEncoder, VideoEncoder};
+use sharescreen_native_media::preview::Previewer;
 
 /// Whether the native path can encode this request.
 pub fn available(codec: Codec) -> bool {
@@ -22,7 +23,8 @@ pub fn available(codec: Codec) -> bool {
 pub struct Stream {
     running: Arc<AtomicBool>,
     thread: JoinHandle<()>,
-    preview: Arc<Mutex<Option<Vec<u8>>>>,
+    /// Encodes the self-view JPEG on its own thread, off the capture path.
+    preview: Arc<Previewer>,
 }
 
 impl Stream {
@@ -33,7 +35,7 @@ impl Stream {
 
     /// Latest JPEG self-view frame of the running capture.
     pub fn latest_preview(&self) -> Option<Vec<u8>> {
-        self.preview.lock().unwrap().clone()
+        self.preview.latest()
     }
 }
 
@@ -45,14 +47,13 @@ pub fn spawn(
     let options = options.clone();
     let running = Arc::new(AtomicBool::new(true));
     let flag = running.clone();
-    let preview = Arc::new(Mutex::new(None));
-    let preview_sink = preview.clone();
-    let preview_every = options.fps.max(10) / 10;
+    let preview = Arc::new(Previewer::spawn());
+    let preview_worker = preview.clone();
 
     let thread = std::thread::Builder::new()
         .name("sharescreen-native-windows".into())
         .spawn(move || {
-            run(source, options, flag, sink, preview_sink, preview_every);
+            run(source, options, flag, sink, preview_worker);
         })
         .map_err(|e| CaptureError::Failed(format!("failed to spawn native capture thread: {e}")))?;
 
@@ -68,8 +69,7 @@ fn run(
     options: CaptureOptions,
     running: Arc<AtomicBool>,
     sink: tokio::sync::mpsc::Sender<EncodedSample>,
-    preview_sink: Arc<Mutex<Option<Vec<u8>>>>,
-    preview_every: u32,
+    preview: Arc<Previewer>,
 ) {
     let fps = options.fps.max(1);
     let bitrate_kbps = options.bitrate_kbps.max(1000);
@@ -87,7 +87,6 @@ fn run(
     let frame_duration = Duration::from_secs_f64(1.0 / fps as f64);
     let mut next = Instant::now();
     let mut index: u64 = 0;
-    let mut frame_count: u64 = 0;
 
     while running.load(Ordering::SeqCst) {
         let Some(frame) = target.capture(cursor, index, fps) else {
@@ -116,6 +115,9 @@ fn run(
         let Some(encoder) = encoder.as_mut() else {
             return;
         };
+        // Share the captured frame with the preview worker for free; the worker
+        // downsamples and JPEG-encodes it on its own thread.
+        let frame = Arc::new(frame);
         match encoder.encode(&frame, false) {
             Ok(frames) => {
                 for frame in frames {
@@ -131,18 +133,13 @@ fn run(
                         return;
                     }
                 }
-                if frame_count.is_multiple_of(preview_every as u64) {
-                    if let Ok(jpeg) = encoder.preview(&frame) {
-                        *preview_sink.lock().unwrap() = Some(jpeg);
-                    }
-                }
-                frame_count = frame_count.wrapping_add(1);
             }
             Err(err) => {
                 tracing::warn!("native Windows encode failed: {err}");
                 return;
             }
         }
+        preview.publish(frame);
         index += 1;
         next += frame_duration;
         let now = Instant::now();

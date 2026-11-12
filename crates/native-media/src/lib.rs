@@ -25,12 +25,14 @@ pub(crate) const SWS_BILINEAR: i32 = 2;
 pub mod decode;
 pub mod encode;
 pub mod frame;
+pub mod preview;
 
 #[cfg(target_os = "linux")]
 pub mod capture;
 
 pub use encode::FfmpegEncoder;
 pub use encode::{Backend, EncoderConfig, OpusEncoder, VideoEncoder};
+pub use preview::{PreviewSource, Previewer};
 
 pub use frame::Frame;
 #[cfg(windows)]
