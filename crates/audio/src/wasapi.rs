@@ -154,6 +154,10 @@ impl Drop for Recorder {
 }
 
 /// Plays remote audio on a WASAPI render endpoint.
+///
+/// Jitter buffering and 20 ms pacing live in `crate::playback::Output` above
+/// this sink, so Windows gets the same prebuffer/underrun policy as Linux.
+/// Live WASAPI playback was not validated on this Linux host.
 pub(crate) struct Playback {
     client: IAudioClient,
     render: IAudioRenderClient,

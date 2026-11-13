@@ -158,7 +158,9 @@ fn run(
     };
 
     let mut decoded = 0u64;
-    let mut process = |frame: &[u8]| match kind {
+    // `output` is passed in instead of captured so the receive timeout can
+    // also pump the playback buffer while no packets arrive.
+    let mut process = |frame: &[u8], output: &mut Option<Output>| match kind {
         RemoteTrackKind::Video => {
             let (Some(video), Some(jpeg)) = (video.as_mut(), jpeg.as_mut()) else {
                 return;
@@ -197,26 +199,40 @@ fn run(
                         .iter()
                         .map(|sample| (*sample as f64 * gain).clamp(-32768.0, 32767.0) as i16)
                         .collect();
-                    output.play(&scaled);
+                    // Queue decoded audio; the jitter buffer releases it on the
+                    // 20 ms playback cadence instead of writing every packet
+                    // straight to the device.
+                    output.push(&scaled);
                 }
                 Err(e) => tracing::warn!("Opus decode failed: {e}"),
             }
         }
     };
 
+    // Audio needs a short poll so the playback buffer can emit silence on an
+    // underrun; video only needs to drain the depacketizer promptly.
+    let poll_interval = if kind == RemoteTrackKind::Audio {
+        Duration::from_millis(10)
+    } else {
+        Duration::from_millis(100)
+    };
+
     while running.load(Ordering::SeqCst) {
-        let packet = match rx.recv_timeout(Duration::from_millis(100)) {
+        let packet = match rx.recv_timeout(poll_interval) {
             Ok(packet) => packet,
             Err(RecvTimeoutError::Timeout) => {
                 for frame in depacketizer.flush() {
-                    process(&frame);
+                    process(&frame, &mut output);
+                }
+                if let Some(output) = output.as_mut() {
+                    output.tick();
                 }
                 continue;
             }
             Err(RecvTimeoutError::Disconnected) => break,
         };
         for frame in depacketizer.push(&packet) {
-            process(&frame);
+            process(&frame, &mut output);
         }
     }
 }

@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use crate::playback::{playback_bytes_for_ms, PLAYBACK_MAX_MS, PLAYBACK_TARGET_MS};
 use libpulse_binding as pulse;
 use pulse::callbacks::ListResult;
 use pulse::context::introspect::{SinkInfo, SourceInfo};
@@ -354,8 +355,27 @@ impl PlaybackSink {
         map.init_stereo();
         let mut stream = PulseStream::new(&mut context, "sharescreen playback", &spec, Some(&map))
             .ok_or("failed to create audio playback stream")?;
+        // Match the old GStreamer `pulsesink buffer-time=60000`: hold ~60 ms
+        // on the server and keep the hard latency bound at ~200 ms. The jitter
+        // buffer in `playback::Output` adds the same 60 ms prebuffer before it
+        // starts writing, so a network stall does not immediately underrun the
+        // device. ADJUST_LATENCY tells PulseAudio to honour these timings.
+        let target_bytes = playback_bytes_for_ms(PLAYBACK_TARGET_MS);
+        let attr = pulse::def::BufferAttr {
+            maxlength: playback_bytes_for_ms(PLAYBACK_MAX_MS),
+            tlength: target_bytes,
+            prebuf: target_bytes,
+            minreq: u32::MAX,
+            fragsize: u32::MAX,
+        };
         stream
-            .connect_playback(device.as_deref(), None, StreamFlags::empty(), None, None)
+            .connect_playback(
+                device.as_deref(),
+                Some(&attr),
+                StreamFlags::ADJUST_LATENCY,
+                None,
+                None,
+            )
             .map_err(|e| format!("failed to connect playback: {e}"))?;
         Ok(Self {
             mainloop,
