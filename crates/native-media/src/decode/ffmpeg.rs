@@ -170,10 +170,24 @@ impl Drop for VideoDecoder {
     }
 }
 
+/// Decoded Opus output format: interleaved S16 at 48 kHz stereo.
+const OPUS_OUT_RATE: i32 = 48_000;
+const OPUS_OUT_CHANNELS: i32 = 2;
+
 /// Decodes Opus packets into interleaved 16-bit PCM.
+///
+/// FFmpeg's native `opus` decoder emits planar float (`FLTP`), not S16.
+/// `swresample` converts whatever the decoder actually produces (format, rate
+/// and channel layout included) into the interleaved S16 the playback path
+/// expects.
 pub struct OpusDecoder {
     ctx: *mut ffi::AVCodecContext,
     frame: *mut ffi::AVFrame,
+    swr: *mut ffi::SwrContext,
+    /// Input parameters the current `swr` was configured for.
+    swr_format: ffi::AVSampleFormat,
+    swr_rate: i32,
+    swr_layout: ffi::AVChannelLayout,
 }
 
 unsafe impl Send for OpusDecoder {}
@@ -190,6 +204,9 @@ impl OpusDecoder {
             if ctx.is_null() {
                 return Err("avcodec_alloc_context3 failed".into());
             }
+            // The native decoder may still choose FLTP; the resampler below is
+            // the real format boundary and handles either case.
+            (*ctx).request_sample_fmt = ffi::AVSampleFormat::AV_SAMPLE_FMT_S16;
             let ret = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
             if ret < 0 {
                 ffi::avcodec_free_context(&mut { ctx });
@@ -200,8 +217,90 @@ impl OpusDecoder {
                 ffi::avcodec_free_context(&mut { ctx });
                 return Err("av_frame_alloc failed".into());
             }
-            Ok(Self { ctx, frame })
+            Ok(Self {
+                ctx,
+                frame,
+                swr: ptr::null_mut(),
+                swr_format: ffi::AVSampleFormat::AV_SAMPLE_FMT_NONE,
+                swr_rate: 0,
+                swr_layout: std::mem::zeroed(),
+            })
         }
+    }
+
+    /// (Re)build the resampler when the decoder's real output parameters change.
+    unsafe fn ensure_resampler(&mut self, frame: *mut ffi::AVFrame) -> Result<(), String> {
+        let format = std::mem::transmute::<i32, ffi::AVSampleFormat>((*frame).format);
+        let rate = if (*frame).sample_rate > 0 {
+            (*frame).sample_rate
+        } else {
+            OPUS_OUT_RATE
+        };
+
+        // A malformed layout is unusual, but fall back to the negotiated stereo
+        // layout rather than handing an invalid descriptor to swresample.
+        let frame_layout = &(*frame).ch_layout;
+        let mut fallback_layout: ffi::AVChannelLayout = std::mem::zeroed();
+        let in_layout =
+            if frame_layout.nb_channels > 0 && ffi::av_channel_layout_check(frame_layout) != 0 {
+                frame_layout as *const ffi::AVChannelLayout
+            } else {
+                ffi::av_channel_layout_default(&mut fallback_layout, OPUS_OUT_CHANNELS);
+                &fallback_layout
+            };
+
+        let unchanged = !self.swr.is_null()
+            && self.swr_format == format
+            && self.swr_rate == rate
+            && ffi::av_channel_layout_compare(&self.swr_layout, in_layout) == 0;
+        if unchanged {
+            return Ok(());
+        }
+
+        if !self.swr.is_null() {
+            ffi::swr_free(&mut self.swr);
+        }
+        ffi::av_channel_layout_uninit(&mut self.swr_layout);
+
+        let mut out_layout: ffi::AVChannelLayout = std::mem::zeroed();
+        ffi::av_channel_layout_default(&mut out_layout, OPUS_OUT_CHANNELS);
+        let mut swr: *mut ffi::SwrContext = ptr::null_mut();
+        let ret = ffi::swr_alloc_set_opts2(
+            &mut swr,
+            &out_layout,
+            ffi::AVSampleFormat::AV_SAMPLE_FMT_S16,
+            OPUS_OUT_RATE,
+            in_layout,
+            format,
+            rate,
+            0,
+            ptr::null_mut(),
+        );
+        ffi::av_channel_layout_uninit(&mut out_layout);
+        if ret < 0 || swr.is_null() {
+            if !swr.is_null() {
+                ffi::swr_free(&mut swr);
+            }
+            return Err(format!("swr_alloc_set_opts2 failed: {ret}"));
+        }
+        let ret = ffi::swr_init(swr);
+        if ret < 0 {
+            ffi::swr_free(&mut swr);
+            return Err(format!("swr_init failed: {ret}"));
+        }
+
+        let mut layout: ffi::AVChannelLayout = std::mem::zeroed();
+        let ret = ffi::av_channel_layout_copy(&mut layout, in_layout);
+        if ret < 0 {
+            ffi::swr_free(&mut swr);
+            return Err(format!("av_channel_layout_copy failed: {ret}"));
+        }
+
+        self.swr = swr;
+        self.swr_format = format;
+        self.swr_rate = rate;
+        self.swr_layout = layout;
+        Ok(())
     }
 
     /// Decode one Opus packet. Returns interleaved 16-bit PCM.
@@ -221,18 +320,42 @@ impl OpusDecoder {
                     return Err(format!("avcodec_receive_frame failed: {ret}"));
                 }
                 let samples = (*self.frame).nb_samples as usize;
-                let channels = (*self.frame).ch_layout.nb_channels as usize;
-                if samples == 0 || channels == 0 {
+                if samples == 0 {
                     continue;
                 }
-                let data = (*self.frame).data[0] as *const i16;
-                if data.is_null() {
-                    continue;
+                self.ensure_resampler(self.frame)?;
+
+                let max_out = ffi::swr_get_out_samples(self.swr, samples as i32);
+                let max_out = if max_out > 0 {
+                    max_out as usize
+                } else {
+                    samples.saturating_add(64)
+                };
+                let channels = OPUS_OUT_CHANNELS as usize;
+                let mut pcm = vec![0i16; max_out.saturating_mul(channels)];
+                let out_data = [
+                    pcm.as_mut_ptr() as *mut u8,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ];
+                let in_data = if (*self.frame).extended_data.is_null() {
+                    (*self.frame).data.as_ptr() as *const *const u8
+                } else {
+                    (*self.frame).extended_data as *const *const u8
+                };
+                let converted = ffi::swr_convert(
+                    self.swr,
+                    out_data.as_ptr(),
+                    max_out as i32,
+                    in_data,
+                    samples as i32,
+                );
+                if converted < 0 {
+                    return Err(format!("swr_convert failed: {converted}"));
                 }
-                out.reserve(samples * channels);
-                for i in 0..samples * channels {
-                    out.push(*data.add(i));
-                }
+                let converted = converted as usize;
+                out.extend_from_slice(&pcm[..converted.saturating_mul(channels)]);
             }
             Ok(out)
         }
@@ -242,6 +365,10 @@ impl OpusDecoder {
 impl Drop for OpusDecoder {
     fn drop(&mut self) {
         unsafe {
+            if !self.swr.is_null() {
+                ffi::swr_free(&mut self.swr);
+            }
+            ffi::av_channel_layout_uninit(&mut self.swr_layout);
             ffi::av_frame_free(&mut self.frame);
             ffi::avcodec_free_context(&mut self.ctx);
         }
