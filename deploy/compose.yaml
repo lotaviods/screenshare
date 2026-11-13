@@ -6,6 +6,9 @@
 #   signaling  room management + WebRTC signaling + TURN credential issuance
 #   coturn     STUN/TURN for NAT traversal and relay fallback
 #
+# Deploy target: 192.168.1.200. The `signaling` service uses `restart: always`,
+# so Docker recreates it after a crash or host reboot.
+
 # The `sfu` service is optional and off by default (profile `sfu`); the desktop
 # client currently negotiates a peer-to-peer mesh only.
 
@@ -17,12 +20,12 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile.signaling
     image: sharescreen-signaling:latest
-    restart: unless-stopped
+    restart: always
     environment:
       PORT: "8080"
       RUST_LOG: "${RUST_LOG:-info}"
       # TURN credentials handed to clients (coturn's shared-secret scheme).
-      TURN_URLS: "turn:turn:3478?transport=udp,turn:turn:3478?transport=tcp,turns:turn:5349?transport=tcp"
+      TURN_URLS: "${TURN_URLS:-turn:turn:3478?transport=udp,turn:turn:3478?transport=tcp,turns:turn:5349?transport=tcp}"
       TURN_SECRET: "${TURN_SECRET:?set TURN_SECRET in deploy/.env}"
       TURN_TTL: "${TURN_TTL:-3600}"
       TURN_USER: "${TURN_USER:-sharescreen}"
@@ -48,14 +51,17 @@ services:
       - --no-multicast-peers
       - --min-port=49152
       - --max-port=65535
-    # Relay ports must be reachable for TURN to relay media.
+    # Relay ports must be reachable for TURN to relay media. Keep this range
+    # small: Docker publishes one rule per port, and a wide range (the old
+    # 49152-65535 default) makes `docker compose up` stall for minutes.
     ports:
       - "${TURN_PORT:-3478}:3478/udp"
       - "${TURN_PORT:-3478}:3478/tcp"
       - "${TURN_TLS_PORT:-5349}:5349/tcp"
-      - "${TURN_MIN_PORT:-49152}-${TURN_MAX_PORT:-65535}:${TURN_MIN_PORT:-49152}-${TURN_MAX_PORT:-65535}/udp"
+      - "${TURN_MIN_PORT:-49152}-${TURN_MAX_PORT:-49251}:${TURN_MIN_PORT:-49152}-${TURN_MAX_PORT:-49251}/udp"
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 3478 || exit 1"]
+      # The image has no nc; its own STUN client verifies coturn responds.
+      test: ["CMD-SHELL", "turnutils_stunclient -p 3478 127.0.0.1 >/dev/null 2>&1 || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3

@@ -9,7 +9,7 @@ to run the app.
 | Service | Purpose | Default ports |
 | --- | --- | --- |
 | `signaling` | Room management, WebRTC signaling, TURN credential issuance | `8080` |
-| `coturn` | STUN discovery + TURN relay fallback | `3478/udp+tcp`, `5349/tcp`, `49152-65535/udp` |
+| `coturn` | STUN discovery + TURN relay fallback | `3478/udp+tcp`, `5349/tcp`, `49152-49251/udp` |
 | `sfu` | Optional SFU (profile `sfu`, off by default) | `7880`, `7881/udp` |
 
 Room state is kept in memory, so no database service is required. The signaling
@@ -23,6 +23,9 @@ cp deploy/.env.example deploy/.env
 # set TURN_SECRET to a long random value (openssl rand -hex 32)
 docker compose -f deploy/compose.yaml --env-file deploy/.env up -d
 docker compose -f deploy/compose.yaml ps
+
+Deploy target: **192.168.1.200**. The `signaling` service uses `restart: always`,
+so Docker restarts it after a crash or host reboot.
 ```
 
 TURN credentials are issued on demand by the signaling server using coturn's
