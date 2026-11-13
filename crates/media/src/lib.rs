@@ -17,11 +17,14 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use sharescreen_audio::Output;
-use sharescreen_core::Codec;
+use sharescreen_core::{Codec, EncodedSample, MediaKind};
 use sharescreen_native_media::decode::{
     JpegEncoder, OpusDecoder, RtpDepacketizer, RtpKind, VideoDecoder,
 };
+use sharescreen_native_media::preview::{preview_size, Demand, MAX_PREVIEW_WIDTH};
 use sharescreen_webrtc::{RemoteTrack, RemoteTrackKind};
+
+pub use sharescreen_native_media::linux_preview::LinuxPreviewer;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MediaError {
@@ -224,6 +227,198 @@ fn codec_name(codec: Codec) -> &'static str {
         Codec::Vp8 => "vp8",
         Codec::Vp9 => "vp9",
         _ => "h264",
+    }
+}
+
+/// Renders the local screen share the way a peer receives it.
+///
+/// The outgoing access units are decoded again with the same decoder the
+/// remote path uses, instead of re-encoding the raw captured frame. The
+/// self-view therefore shows the real negotiated stream: codec, resolution,
+/// frame rate and compression artifacts.
+///
+/// Nothing runs while the UI is not polling, the tap never blocks the peer
+/// path, and the JPEG stage runs only as fast as the UI consumes frames.
+/// Decoding itself is in order and cannot skip access units, so a sample that
+/// cannot be queued resets the decoder and lets it resynchronize.
+pub struct LocalPreview {
+    running: Arc<AtomicBool>,
+    tx: mpsc::SyncSender<EncodedSample>,
+    frames: Arc<Mutex<Option<Vec<u8>>>>,
+    /// Set by every poll, cleared when the worker produces a frame: keeps the
+    /// JPEG stage from outrunning the UI.
+    consumed: Arc<AtomicBool>,
+    demand: Arc<Demand>,
+    thread: Option<JoinHandle<()>>,
+}
+
+/// Samples the worker may have queued before it is considered behind.
+const PREVIEW_QUEUE: usize = 4;
+
+/// Access units to wait for a keyframe flag before decoding anyway.
+///
+/// A hardware encoder may not flag keyframes. Waiting forever would leave the
+/// self-view blank, so after this many samples the decoder starts mid-GOP
+/// (exactly what a peer joining late sees) and recovers at the next IDR.
+const PREVIEW_KEYFRAME_WAIT: u32 = 90;
+
+impl LocalPreview {
+    /// Start the loopback decoder. Never fails: a preview that cannot start
+    /// simply produces no frames.
+    pub fn new() -> Self {
+        let running = Arc::new(AtomicBool::new(true));
+        let frames = Arc::new(Mutex::new(None));
+        let consumed = Arc::new(AtomicBool::new(true));
+        let demand = Arc::new(Demand::new());
+        let (tx, rx) = mpsc::sync_channel(PREVIEW_QUEUE);
+
+        let flag = running.clone();
+        let slot = frames.clone();
+        let eaten = consumed.clone();
+        let wanted = demand.clone();
+        let thread = std::thread::Builder::new()
+            .name("sharescreen-selfview".into())
+            .spawn(move || preview_loop(rx, flag, slot, eaten, wanted))
+            .map_err(|e| tracing::error!("failed to spawn self-view thread: {e}"))
+            .ok();
+
+        Self {
+            running,
+            tx,
+            frames,
+            consumed,
+            demand,
+            thread,
+        }
+    }
+
+    /// Offer one outgoing sample to the loopback. Audio is ignored.
+    pub fn push(&self, sample: &EncodedSample) {
+        if sample.kind != MediaKind::Video || sample.data.is_empty() {
+            return;
+        }
+        if !self.demand.wanted() {
+            return;
+        }
+        // Full queue means the decoder is behind the capture rate.
+        let _ = self.tx.try_send(sample.clone());
+    }
+
+    /// The latest decoded self-view frame (JPEG), if any.
+    pub fn latest_frame(&self) -> Option<Vec<u8>> {
+        self.demand.touch();
+        self.consumed.store(true, Ordering::Release);
+        self.frames.lock().unwrap().clone()
+    }
+}
+
+impl Default for LocalPreview {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for LocalPreview {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn preview_loop(
+    rx: mpsc::Receiver<EncodedSample>,
+    running: Arc<AtomicBool>,
+    frames: Arc<Mutex<Option<Vec<u8>>>>,
+    consumed: Arc<AtomicBool>,
+    demand: Arc<Demand>,
+) {
+    let mut jpeg = match JpegEncoder::new() {
+        Ok(encoder) => encoder,
+        Err(e) => {
+            tracing::error!("self-view JPEG encoder unavailable: {e}");
+            return;
+        }
+    };
+    let mut decoder: Option<VideoDecoder> = None;
+    let mut codec: Option<Codec> = None;
+    let mut waiting_keyframe = true;
+    let mut waited = 0u32;
+
+    while running.load(Ordering::SeqCst) {
+        let sample = match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(sample) => sample,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        if !demand.wanted() {
+            // Nobody is looking: drop the decoder so a later request starts
+            // from a keyframe instead of a stale reference frame.
+            decoder = None;
+            codec = None;
+            waiting_keyframe = true;
+            waited = 0;
+            continue;
+        }
+
+        if codec != Some(sample.codec) {
+            codec = Some(sample.codec);
+            decoder = match VideoDecoder::new(codec_name(sample.codec)) {
+                Ok(created) => Some(created),
+                Err(e) => {
+                    tracing::warn!("self-view cannot decode {:?}: {e}", sample.codec);
+                    None
+                }
+            };
+            waiting_keyframe = true;
+        }
+        let Some(video) = decoder.as_mut() else {
+            continue;
+        };
+        if waiting_keyframe {
+            if sample.keyframe {
+                waiting_keyframe = false;
+                waited = 0;
+            } else {
+                waited += 1;
+                if waited <= PREVIEW_KEYFRAME_WAIT {
+                    continue;
+                }
+                // Some hardware encoders never flag keyframes. Waiting forever
+                // would leave the self-view blank, so start mid-GOP instead.
+                waiting_keyframe = false;
+                waited = 0;
+            }
+        }
+        match video.decode(&sample.data) {
+            Ok(pixels) => {
+                // The decoder must run in order, but the JPEG stage only needs
+                // to run as fast as the UI consumes frames. Skipping a frame
+                // nobody read leaves the previous JPEG in place.
+                if !consumed.swap(false, Ordering::AcqRel) {
+                    continue;
+                }
+                for rgb in pixels {
+                    let (width, height) = (video.width(), video.height());
+                    let (dst_width, dst_height) = preview_size(width, height, MAX_PREVIEW_WIDTH);
+                    if dst_width == 0 || dst_height == 0 {
+                        continue;
+                    }
+                    match jpeg.encode_rgb_scaled(&rgb, width, height, dst_width, dst_height) {
+                        Ok(bytes) => *frames.lock().unwrap() = Some(bytes),
+                        Err(e) => tracing::warn!("self-view JPEG encode failed: {e}"),
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("self-view decode failed, waiting for a keyframe: {e}");
+                decoder = None;
+                codec = None;
+                waiting_keyframe = true;
+                waited = 0;
+            }
+        }
     }
 }
 

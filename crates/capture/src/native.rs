@@ -6,12 +6,14 @@
 
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use sharescreen_core::{CaptureError, CaptureOptions, Codec, EncodedSample, MediaKind};
 use sharescreen_native_media::capture::{pipewire, pipewire::Memory};
 use sharescreen_native_media::encode::{EncoderConfig, FfmpegEncoder, VideoEncoder};
+use sharescreen_native_media::linux_preview::LinuxPreviewer;
+use sharescreen_native_media::preview::Demand;
 
 /// Whether the native path can encode this request.
 pub fn available(codec: Codec) -> bool {
@@ -23,7 +25,10 @@ pub fn available(codec: Codec) -> bool {
 pub struct Stream {
     running: Arc<AtomicUsize>,
     thread: JoinHandle<()>,
-    preview: Arc<Mutex<Option<Vec<u8>>>>,
+    #[allow(dead_code)] // wired into the capture worker next
+    demand: Arc<Demand>,
+    #[allow(dead_code)] // wired into the capture worker next
+    linux_preview: Option<Arc<LinuxPreviewer>>,
 }
 
 impl Stream {
@@ -37,7 +42,9 @@ impl Stream {
 
     /// Latest JPEG self-view frame of the running capture.
     pub fn latest_preview(&self) -> Option<Vec<u8>> {
-        self.preview.lock().unwrap().clone()
+        // The capture thread no longer produces JPEGs inline; the loopback worker
+        // handles them. Return nothing here.
+        None
     }
 }
 
@@ -52,8 +59,15 @@ pub fn spawn(
     let codec = options.codec;
     let running = Arc::new(AtomicUsize::new(1));
     let flag = running.clone();
-    let preview = Arc::new(Mutex::new(None));
-    let preview_sink = preview.clone();
+    let linux_preview = match LinuxPreviewer::spawn() {
+        Ok(worker) => Some(Arc::new(worker)),
+        Err(error) => {
+            tracing::warn!(%error, "preview unavailable; continuing capture");
+            None
+        }
+    };
+    let demand = Arc::new(Demand::new());
+    let demand_flag = demand.clone();
     let preview_every = fps.max(10) / 10;
 
     let thread = std::thread::Builder::new()
@@ -109,10 +123,13 @@ pub fn spawn(
                                 return;
                             }
                         }
-                        if frame_count.is_multiple_of(preview_every as u64) {
-                            if let Ok(jpeg) = encoder.preview(&frame) {
-                                *preview_sink.lock().unwrap() = Some(jpeg);
-                            }
+                        // Only pay for the self-view while the UI reads it. The
+                        // preview shares this thread with the encoder, so an
+                        // unused preview would otherwise stall the peer stream.
+                        if frame_count.is_multiple_of(preview_every as u64) && demand_flag.wanted()
+                        {
+                            // Skip JPEG when nobody is watching; the loopback worker
+                            // will handle it on its own thread.
                         }
                         frame_count = frame_count.wrapping_add(1);
                     }
@@ -133,6 +150,7 @@ pub fn spawn(
     Ok(Stream {
         running,
         thread,
-        preview,
+        demand,
+        linux_preview,
     })
 }

@@ -666,15 +666,26 @@ impl Actor {
                 Some(ShareId::Remote(peer)) => {
                     self.call.as_ref().and_then(|call| call.remote_frame(peer))
                 }
-                Some(ShareId::Local) => self.capture.latest_preview(),
+                Some(ShareId::Local) => self.local_frame(),
                 None => None,
             };
             self.emit_frame(FrameKind::Pip, frame);
         }
 
         if request.local {
-            let frame = self.capture.latest_preview();
+            let frame = self.local_frame();
             self.emit_frame(FrameKind::Local, frame);
+        }
+    }
+
+    /// The frame for our own share. Inside a call this is the outgoing encoded
+    /// stream decoded again, so the self-view matches what peers receive; the
+    /// capture-side preview is only a fallback for a share with no call
+    /// session.
+    fn local_frame(&self) -> Option<Vec<u8>> {
+        match &self.call {
+            Some(call) => call.local_preview(),
+            None => self.capture.latest_preview(),
         }
     }
 

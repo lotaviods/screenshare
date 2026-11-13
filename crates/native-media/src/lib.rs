@@ -26,13 +26,15 @@ pub mod decode;
 pub mod encode;
 pub mod frame;
 pub mod preview;
+pub use preview::{PreviewSource, Previewer};
+pub mod linux_preview;
 
 #[cfg(target_os = "linux")]
 pub mod capture;
 
 pub use encode::FfmpegEncoder;
 pub use encode::{Backend, EncoderConfig, OpusEncoder, VideoEncoder};
-pub use preview::{PreviewSource, Previewer};
+pub use linux_preview::LinuxPreviewer;
 
 pub use frame::Frame;
 #[cfg(windows)]

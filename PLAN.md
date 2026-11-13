@@ -40,8 +40,10 @@ spec against the current code. Checkboxes are off until implemented.
 - [x] Source enumeration — Wayland delegates to the portal picker.
 - [x] Cursor mode (hidden / embedded / metadata) mapping.
 - [x] Resolution + frame-rate + bitrate + codec selection.
-- [x] Local self-view: the capture pipeline tees a JPEG branch (10 fps) for a
-      picture-in-picture preview of what is being shared.
+- [x] Local self-view: inside a call the outgoing encoded stream is decoded
+      again (`LocalPreview`) and shown in the stage tile and picture-in-picture,
+      so it matches what peers receive; the capture-side JPEG branch remains the
+      fallback when no call session exists.
 - [x] Dynamic monitor change (hotplug): a watcher re-checks the source list
       every 3 s while sharing and moves capture to a remaining source when the
       shared one disappears. Linux portal/X11 expose one synthetic source, so

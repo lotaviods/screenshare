@@ -152,6 +152,9 @@ impl Converter {
                 num: config.fps.max(1) as i32,
                 den: 1,
             };
+            // AVCOL_SPC_RGB is 0, so a zeroed params struct claims RGB while
+            // the mapped frames carry no color space. Set unspecified to match.
+            params.color_space = ffi::AVColorSpace::AVCOL_SPC_UNSPECIFIED;
             params.hw_frames_ctx = ffi::av_buffer_ref(input_frames);
             let ret = ffi::av_buffersrc_parameters_set(src, &mut params);
             if !params.hw_frames_ctx.is_null() {
@@ -541,8 +544,22 @@ impl FfmpegEncoder {
     }
 
     /// Encode one frame as a JPEG preview for the local self-view.
+    ///
+    /// The self-view is downscaled to [`MAX_PREVIEW_WIDTH`], like the Windows
+    /// backend: scaling and JPEG cost drop several times at 1440p and above,
+    /// and this runs on the capture thread that also encodes the real stream.
+    ///
+    /// [`MAX_PREVIEW_WIDTH`]: crate::preview::MAX_PREVIEW_WIDTH
     pub fn preview(&mut self, frame: &Frame) -> Result<Vec<u8>, EncodeError> {
         let format = frame.format().ok_or(EncodeError::UnsupportedFormat(None))?;
+        let (preview_width, preview_height) = crate::preview::preview_size(
+            self.config.width,
+            self.config.height,
+            crate::preview::MAX_PREVIEW_WIDTH,
+        );
+        if preview_width == 0 || preview_height == 0 {
+            return Err(EncodeError::Ffmpeg("empty preview frame".into()));
+        }
         let (sw_format, input_frames) = if format.is_nv12() {
             (ffi::AVPixelFormat::AV_PIX_FMT_NV12, self.frames)
         } else {
@@ -583,8 +600,8 @@ impl FfmpegEncoder {
                     self.config.width as i32,
                     self.config.height as i32,
                     sw_format,
-                    self.config.width as i32,
-                    self.config.height as i32,
+                    preview_width as i32,
+                    preview_height as i32,
                     ffi::AVPixelFormat::AV_PIX_FMT_RGB24,
                     crate::SWS_BILINEAR,
                     ptr::null_mut(),
@@ -598,7 +615,7 @@ impl FfmpegEncoder {
                 self.preview_sw_format = sw_format;
             }
 
-            let mut rgb = vec![0u8; self.config.width as usize * self.config.height as usize * 3];
+            let mut rgb = vec![0u8; preview_width as usize * preview_height as usize * 3];
             let src_data = [
                 (*cpu).data[0],
                 (*cpu).data[1],
@@ -617,7 +634,7 @@ impl FfmpegEncoder {
                 ptr::null_mut(),
                 ptr::null_mut(),
             ];
-            let dst_stride = [self.config.width as i32 * 3, 0, 0, 0];
+            let dst_stride = [preview_width as i32 * 3, 0, 0, 0];
             let ret = ffi::sws_scale(
                 self.preview_sws,
                 src_data.as_ptr() as *const *const u8,
@@ -637,7 +654,7 @@ impl FfmpegEncoder {
                 .jpeg
                 .as_mut()
                 .ok_or_else(|| EncodeError::Ffmpeg("no JPEG encoder".into()))?;
-            jpeg.encode(&rgb, self.config.width, self.config.height)
+            jpeg.encode(&rgb, preview_width, preview_height)
                 .map_err(EncodeError::Ffmpeg)
         }
     }

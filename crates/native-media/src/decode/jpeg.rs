@@ -158,6 +158,19 @@ impl JpegEncoder {
         self.encode_frame(true, bgra, src_width, src_height, dst_width, dst_height)
     }
 
+    /// Encode one RGB24 frame, scaling `src_width`×`src_height` down to
+    /// `dst_width`×`dst_height`. Used for the downscaled self-view preview.
+    pub fn encode_rgb_scaled(
+        &mut self,
+        rgb: &[u8],
+        src_width: u32,
+        src_height: u32,
+        dst_width: u32,
+        dst_height: u32,
+    ) -> Result<Vec<u8>, String> {
+        self.encode_frame(false, rgb, src_width, src_height, dst_width, dst_height)
+    }
+
     /// Shared scaler + mjpeg encode. `bgra` selects the source pixel format.
     fn encode_frame(
         &mut self,

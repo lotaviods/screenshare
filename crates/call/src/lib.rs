@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use sharescreen_core::{CallEvent, Codec, ConnectionState, EncodedSample, Participant};
+use sharescreen_media::LocalPreview;
 use sharescreen_media::RemoteMedia;
 use sharescreen_signaling::{
     Incoming, PeerInfo, PeerPayload, SignalMessage, SignalingClient, SignalingSender,
@@ -75,6 +76,7 @@ struct Shared {
     room_id: Arc<RwLock<Option<String>>>,
     /// Decoder pipelines for the remote participants' tracks.
     remote: Arc<RemoteMedia>,
+    local_preview: Arc<LocalPreview>,
     closing: Arc<AtomicBool>,
 }
 
@@ -102,6 +104,7 @@ impl CallSession {
         let mic = Arc::new(MediaHub::new());
         let system = Arc::new(MediaHub::new());
         let screen = Arc::new(MediaHub::new());
+        let local_preview = Arc::new(LocalPreview::new());
 
         let shared = Shared {
             cfg: Arc::new(RwLock::new(cfg.clone())),
@@ -117,13 +120,15 @@ impl CallSession {
             events,
             room_id: Arc::new(RwLock::new(None)),
             remote: Arc::new(RemoteMedia::new()),
+            local_preview: local_preview.clone(),
             closing: Arc::new(AtomicBool::new(false)),
         };
 
-        // One fan-out task per local media stream.
-        tokio::spawn(hub_loop(mic, mic_rx));
-        tokio::spawn(hub_loop(system, system_rx));
-        tokio::spawn(hub_loop(screen, screen_rx));
+        // One fan-out task per local media stream. The screen stream also feeds
+        // the self-view loopback, so it is tapped before it reaches the peers.
+        tokio::spawn(hub_loop(mic, mic_rx, None));
+        tokio::spawn(hub_loop(system, system_rx, None));
+        tokio::spawn(hub_loop(screen, screen_rx, Some(local_preview)));
 
         // Signaling dispatch.
         tokio::spawn(dispatch(shared.clone(), incoming));
@@ -251,6 +256,16 @@ impl CallSession {
         self.shared.remote.latest_frame(peer_id)
     }
 
+    /// The latest frame of our own screen share as a peer decodes it, if any.
+    ///
+    /// This is the outgoing encoded stream played back, not a second capture of
+    /// the screen, so the self-view matches what the other participants see.
+    /// Calling it also marks the self-view as watched; the loopback stops
+    /// decoding when nobody polls.
+    pub fn local_preview(&self) -> Option<Vec<u8>> {
+        self.shared.local_preview.latest_frame()
+    }
+
     /// The latest decoded frame of whichever participant is sharing, if any.
     pub fn shared_screen_frame(&self) -> Option<Vec<u8>> {
         let sharer = self
@@ -281,8 +296,15 @@ impl CallSession {
     }
 }
 
-async fn hub_loop(hub: Arc<MediaHub>, mut rx: mpsc::Receiver<EncodedSample>) {
+async fn hub_loop(
+    hub: Arc<MediaHub>,
+    mut rx: mpsc::Receiver<EncodedSample>,
+    preview: Option<Arc<LocalPreview>>,
+) {
     while let Some(sample) = rx.recv().await {
+        if let Some(preview) = &preview {
+            preview.push(&sample);
+        }
         hub.broadcast(&sample).await;
     }
 }

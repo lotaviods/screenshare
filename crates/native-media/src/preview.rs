@@ -9,10 +9,10 @@
 //! implementing [`PreviewSource`] for its frame type (BGRA from GDI/Screen
 //! Capture on Windows, a downloaded CPU frame from the DMA-BUF on Linux).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::decode::JpegEncoder;
 
@@ -22,6 +22,53 @@ pub const MAX_PREVIEW_WIDTH: u32 = 1280;
 
 /// Slowest interval between preview encodes (~30 fps ceiling).
 const MIN_INTERVAL: Duration = Duration::from_millis(33);
+
+/// How long a preview stays wanted after the last consumer poll.
+pub const DEMAND_WINDOW: Duration = Duration::from_millis(1000);
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Whether a consumer still wants preview frames.
+///
+/// A consumer touches this on every poll. A producer keeps working for a short
+/// window after the last poll, so an occasional slow poll does not stop it,
+/// and skips the work entirely when nobody has polled. Producers run on hot
+/// paths (the capture callback, the encoder thread), so this must stay
+/// lock-free.
+#[derive(Debug)]
+pub struct Demand {
+    last: AtomicU64,
+}
+
+impl Demand {
+    pub fn new() -> Self {
+        Self {
+            last: AtomicU64::new(0),
+        }
+    }
+
+    /// Record a consumer poll.
+    pub fn touch(&self) {
+        self.last.store(now_millis(), Ordering::Release);
+    }
+
+    /// Whether a consumer polled within [`DEMAND_WINDOW`].
+    pub fn wanted(&self) -> bool {
+        now_millis().saturating_sub(self.last.load(Ordering::Acquire))
+            <= DEMAND_WINDOW.as_millis() as u64
+    }
+}
+
+impl Default for Demand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// A captured frame the preview worker can turn into a downscaled JPEG.
 ///
@@ -173,6 +220,18 @@ impl PreviewSource for crate::frame::RawFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_demand_is_not_wanted() {
+        assert!(!Demand::new().wanted());
+    }
+
+    #[test]
+    fn touched_demand_is_wanted() {
+        let demand = Demand::new();
+        demand.touch();
+        assert!(demand.wanted());
+    }
 
     #[test]
     fn small_frames_pass_through() {
