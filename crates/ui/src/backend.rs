@@ -6,6 +6,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
+use gpui::RenderImage;
 use sharescreen_audio::AudioEngine;
 use sharescreen_call::{CallConfig, CallSession};
 use sharescreen_capture::CaptureEngine;
@@ -102,7 +103,8 @@ pub enum UiEvent {
     EncoderNotice(String),
     Frame {
         kind: FrameKind,
-        jpeg: Option<Vec<u8>>,
+        /// Already-decoded BGRA pixels; the GPUI thread only wraps them.
+        frame: Option<Arc<RenderImage>>,
     },
 }
 
@@ -699,7 +701,10 @@ impl Actor {
             return;
         }
         self.frames.insert(kind.clone(), hash);
-        self.send(UiEvent::Frame { kind, jpeg });
+        // JPEG decoding and the RGBA->BGRA pass run on the backend thread, not
+        // the GPUI thread. Only a cheap `RenderImage` wrapper crosses over.
+        let frame = decode_frame(jpeg);
+        self.send(UiEvent::Frame { kind, frame });
     }
 
     fn save_config(&mut self, config: Config) -> Result<(), String> {
@@ -732,6 +737,23 @@ impl Drop for EnumerationGuard {
     }
 }
 
+/// Decode a JPEG into the BGRA buffer GPUI renders.
+///
+/// This runs on the backend actor's Tokio thread so the UI thread never does
+/// image decoding or a per-pixel channel swap.
+fn decode_frame(jpeg: Option<Vec<u8>>) -> Option<Arc<RenderImage>> {
+    let jpeg = jpeg?;
+    let decoded = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg)
+        .ok()?
+        .into_rgba8();
+    let mut buffer = decoded;
+    // GPUI expects BGRA.
+    for pixel in buffer.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
+    }
+    Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -745,6 +767,26 @@ mod tests {
             panic!("enumerator failure");
         });
         assert!(!flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn frame_payload_is_decoded_off_the_ui_thread() {
+        let rgba = image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 30, 255]));
+        let mut jpeg = Vec::new();
+        image::DynamicImage::ImageRgba8(rgba)
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpeg),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+
+        let frame = decode_frame(Some(jpeg)).expect("decoded frame");
+        let bytes = frame.as_bytes(0).expect("frame pixels");
+        assert_eq!(bytes.len(), 2 * 2 * 4, "BGRA buffer size");
+        // The channel swap ran in the backend: solid blue-ish input arrives as
+        // BGRA, and the alpha channel is opaque.
+        assert_eq!(bytes[3], 255);
+        assert!(bytes[0] > bytes[2], "expected BGR order");
     }
 
     #[test]

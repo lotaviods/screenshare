@@ -603,20 +603,19 @@ impl AppView {
                     }
                 }
             }
-            UiEvent::Frame { kind, jpeg } => match kind {
+            UiEvent::Frame { kind, frame } => match kind {
                 FrameKind::Remote(peer) => {
                     // Accept the frame even if the participant update has not
                     // arrived yet; the map is only read for peers that are
                     // currently sharing, and cleared when sharing stops.
-                    if let Some(frame) = decode_frame(jpeg) {
+                    if let Some(frame) = frame {
                         self.remote_frames.insert(peer, frame);
                     } else {
                         self.remote_frames.remove(&peer);
                     }
                 }
-                FrameKind::Local => self.local_frame = decode_frame(jpeg),
+                FrameKind::Local => self.local_frame = frame,
                 FrameKind::Pip => {
-                    let frame = decode_frame(jpeg);
                     if let Some(pip) = &self.pip_entity {
                         pip.update(cx, |pip, cx| {
                             pip.frame = frame;
@@ -2560,19 +2559,6 @@ fn share_grid_columns(count: usize) -> usize {
         2..=4 => 2,
         _ => 3,
     }
-}
-
-fn decode_frame(jpeg: Option<Vec<u8>>) -> Option<Arc<RenderImage>> {
-    let jpeg = jpeg?;
-    let decoded = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg)
-        .ok()?
-        .into_rgba8();
-    let mut buffer = decoded;
-    // GPUI expects BGRA.
-    for pixel in buffer.as_chunks_mut::<4>().0 {
-        pixel.swap(0, 2);
-    }
-    Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
 }
 
 #[cfg(test)]
