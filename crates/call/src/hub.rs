@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use futures_util::future::join_all;
 use sharescreen_core::EncodedSample;
 use sharescreen_webrtc::TrackWriter;
 
@@ -29,14 +30,23 @@ impl MediaHub {
     }
 
     /// Write one sample to every registered peer.
+    ///
+    /// Every peer write is polled concurrently, so one slow connection no
+    /// longer serializes the others. No per-peer queue is added here: the
+    /// call remains backpressured by the slowest current write instead of
+    /// letting an unbounded backlog build up in the hub.
     pub async fn broadcast(&self, sample: &EncodedSample) {
         let writers: Vec<Arc<TrackWriter>> =
             self.writers.read().unwrap().values().cloned().collect();
         tracing::debug!("broadcasting sample to {} peer(s)", writers.len());
-        for writer in writers {
-            if let Err(e) = writer.write(sample.clone()).await {
-                tracing::warn!("failed to write sample to peer: {e}");
+        let writes = writers.into_iter().map(|writer| {
+            let sample = sample.clone();
+            async move {
+                if let Err(e) = writer.write(sample).await {
+                    tracing::warn!("failed to write sample to peer: {e}");
+                }
             }
-        }
+        });
+        join_all(writes).await;
     }
 }

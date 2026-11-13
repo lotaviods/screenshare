@@ -5817,6 +5817,7 @@ name = "sharescreen-call"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures-util",
  "serde_json",
  "sharescreen-core",
  "sharescreen-media",
