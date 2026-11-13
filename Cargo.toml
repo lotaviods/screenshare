@@ -32,6 +32,16 @@ rust-version = "1.90"
 xattr = { path = "vendor/xattr" }
 ffmpeg-sys-next = { path = "vendor/ffmpeg-sys-next" }
 
+# Release build for cross-compiling the Windows app from a non-Windows host.
+#
+# GPUI's build script only precompiles HLSL with fxc.exe when the *host* is
+# Windows, so a `--release` cross-build fails on the missing shader bytes.
+# Keeping debug assertions on makes GPUI compile its shaders at runtime with
+# D3DCompile instead, which the Windows system d3dcompiler_47.dll provides.
+[profile.winrelease]
+inherits = "release"
+debug-assertions = true
+
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
