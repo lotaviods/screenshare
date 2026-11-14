@@ -1889,9 +1889,45 @@ impl AppView {
                 )
                 .child(
                     div()
-                        .text_sm()
-                        .text_color(rgb(MUTED))
-                        .child("Echo cancellation and noise suppression are not yet available."),
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(MUTED))
+                                .child("Noise suppression uses WebRTC DSP (high). Echo cancellation uses the system output as its reference."),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap_2()
+                                .child(
+                                    button("settings-noise-suppression", if self.settings.audio.noise_suppression { "Noise suppression: on" } else { "Noise suppression: off" })
+                                        .on_click(cx.listener(|view, _, _, cx| {
+                                            view.settings.audio.noise_suppression = !view.settings.audio.noise_suppression;
+                                            view.backend.send(Command::SaveConfig(view.settings.clone()));
+                                            if view.mic_on {
+                                                view.backend.send(Command::StopMic);
+                                                view.backend.send(Command::StartMic(view.settings.audio.mic_device_id.clone()));
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    button("settings-echo-cancellation", if self.settings.audio.echo_cancellation { "Echo cancellation: on" } else { "Echo cancellation: off" })
+                                        .on_click(cx.listener(|view, _, _, cx| {
+                                            view.settings.audio.echo_cancellation = !view.settings.audio.echo_cancellation;
+                                            view.backend.send(Command::SaveConfig(view.settings.clone()));
+                                            if view.mic_on {
+                                                view.backend.send(Command::StopMic);
+                                                view.backend.send(Command::StartMic(view.settings.audio.mic_device_id.clone()));
+                                            }
+                                            cx.notify();
+                                        })),
+                                ),
+                        ),
                 ),
         );
 

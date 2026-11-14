@@ -39,6 +39,10 @@ pub(super) fn open_mic(device: Option<String>) -> Result<Box<dyn Capture>, Strin
     Recorder::open(device).map(|recorder| Box::new(recorder) as Box<dyn Capture>)
 }
 
+pub(super) fn open_echo_reference() -> Result<Box<dyn Capture>, String> {
+    Recorder::open_echo_reference().map(|recorder| Box::new(recorder) as Box<dyn Capture>)
+}
+
 pub(super) fn open_system(device: Option<String>) -> Result<Box<dyn Capture>, String> {
     Mixer::open(device).map(|mixer| Box::new(mixer) as Box<dyn Capture>)
 }

@@ -61,6 +61,19 @@ impl Recorder {
         Self::initialize(client, false, com)
     }
 
+    /// Capture the default render endpoint as the echo-canceller reference.
+    pub(crate) fn open_echo_reference() -> Result<Self, String> {
+        let com = Com::init();
+        let enumerator: IMMDeviceEnumerator =
+            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
+                .map_err(|e| e.to_string())?;
+        let device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }
+            .map_err(|e| e.to_string())?;
+        let client: IAudioClient =
+            unsafe { device.Activate(CLSCTX_ALL, None) }.map_err(|e| e.to_string())?;
+        Self::initialize(client, true, com)
+    }
+
     /// Open process loopback for the default output device.
     pub(crate) fn open_system(_device: Option<String>) -> Result<Self, String> {
         let com = Com::init();
@@ -204,25 +217,29 @@ impl Playback {
         }
     }
 
-    /// Write interleaved 16-bit stereo samples. Drops what does not fit.
+    /// Write only complete interleaved 16-bit stereo frames that fit.
     pub(crate) fn play(&mut self, samples: &[i16]) {
-        let bytes = samples
-            .iter()
-            .flat_map(|s| s.to_le_bytes())
-            .collect::<Vec<u8>>();
+        // WASAPI's ReleaseBuffer count is in audio frames, not samples. Never
+        // release the entire available region after initializing only a
+        // prefix: the uninitialized tail is audible garbage.
         unsafe {
             let padding = self.client.GetCurrentPadding().unwrap_or(0);
             let available = self.buffer_size.saturating_sub(padding);
             if available == 0 {
                 return;
             }
+            let frames = (samples.len() / 2).min(available as usize) as u32;
+            if frames == 0 {
+                return;
+            }
             let Ok(buffer) = self.render.GetBuffer(available) else {
                 return;
             };
-            let slice = std::slice::from_raw_parts_mut(buffer, available as usize * 4);
-            let len = bytes.len().min(slice.len());
-            slice[..len].copy_from_slice(&bytes[..len]);
-            let _ = self.render.ReleaseBuffer(available, 0);
+            let bytes = std::slice::from_raw_parts_mut(buffer, available as usize * 4);
+            let pcm_bytes =
+                std::slice::from_raw_parts(samples.as_ptr() as *const u8, frames as usize * 4);
+            bytes[..pcm_bytes.len()].copy_from_slice(pcm_bytes);
+            let _ = self.render.ReleaseBuffer(frames, 0);
         }
     }
 

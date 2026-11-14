@@ -178,6 +178,10 @@ impl Actor {
             .expect("no capture backend available");
         let mut audio = AudioEngine::default();
         audio.set_bitrate_kbps(config.audio.bitrate_kbps);
+        audio.set_processing_options(
+            config.audio.noise_suppression,
+            config.audio.echo_cancellation,
+        );
         Self {
             store: Arc::new(StdMutex::new(store)),
             ui,
@@ -494,6 +498,9 @@ impl Actor {
     }
 
     async fn start_mic(&mut self, device: Option<String>) -> Result<(), String> {
+        let settings = self.config().audio;
+        self.audio
+            .set_processing_options(settings.noise_suppression, settings.echo_cancellation);
         let sink = self.media_sink(Stream::Mic);
         self.audio
             .start_mic(device.as_deref(), sink)
@@ -716,6 +723,8 @@ impl Actor {
         drop(store);
         let _ = self.audio.set_mic_volume(saved.audio.mic_volume);
         let _ = self.audio.set_system_volume(saved.audio.system_volume);
+        self.audio
+            .set_processing_options(saved.audio.noise_suppression, saved.audio.echo_cancellation);
         self.send(UiEvent::Config(saved));
         Ok(())
     }

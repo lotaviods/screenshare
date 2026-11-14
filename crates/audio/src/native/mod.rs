@@ -17,6 +17,8 @@ use std::time::Duration;
 
 use sharescreen_core::{AudioError, Codec, EncodedSample, MediaKind};
 use sharescreen_native_media::encode::OpusEncoder;
+use sonora::config::{EchoCanceller, HighPassFilter, NoiseSuppression, NoiseSuppressionLevel};
+use sonora::{AudioProcessing, Config as DspConfig, StreamConfig};
 use tokio::sync::mpsc;
 
 #[cfg(target_os = "linux")]
@@ -25,9 +27,9 @@ mod linux;
 mod windows;
 
 #[cfg(target_os = "linux")]
-use linux::{open_mic, open_system};
+use linux::{open_echo_reference, open_mic, open_system};
 #[cfg(windows)]
-use windows::{open_mic, open_system};
+use windows::{open_echo_reference, open_mic, open_system};
 
 /// A running native capture: a capture thread pushing Opus samples.
 pub struct Stream {
@@ -100,15 +102,56 @@ impl Gain {
 /// Accumulates interleaved PCM into fixed Opus frames and pushes them to `sink`.
 struct Framer {
     buf: Vec<i16>,
+    dsp_buf: Vec<i16>,
+    render_buf: Vec<i16>,
+    dsp: Option<AudioProcessing>,
     gain: Gain,
 }
 
 impl Framer {
-    fn new(gain: Gain) -> Self {
+    fn new(gain: Gain, process_voice: bool, noise_suppression: bool, echo_reference: bool) -> Self {
+        let dsp = process_voice.then(|| {
+            let mut dsp = AudioProcessing::builder()
+                .config(DspConfig {
+                    high_pass_filter: Some(HighPassFilter::default()),
+                    echo_canceller: echo_reference.then(EchoCanceller::default),
+                    noise_suppression: noise_suppression.then(|| NoiseSuppression {
+                        level: NoiseSuppressionLevel::High,
+                        ..NoiseSuppression::default()
+                    }),
+                    ..DspConfig::default()
+                })
+                .capture_config(StreamConfig::new(48_000, 2))
+                .render_config(StreamConfig::new(48_000, 2))
+                .build();
+            if echo_reference {
+                // Approximate the receiver prebuffer. The AEC can track the
+                // residual path, but needs a realistic initial render delay.
+                let _ = dsp.set_stream_delay_ms(60);
+            }
+            dsp
+        });
         Self {
             buf: Vec::new(),
+            dsp_buf: Vec::new(),
+            render_buf: Vec::new(),
+            dsp,
             gain,
         }
+    }
+
+    fn push_render(&mut self, pcm: &[i16]) -> Result<(), String> {
+        let Some(dsp) = &mut self.dsp else {
+            return Ok(());
+        };
+        self.render_buf.extend_from_slice(pcm);
+        while self.render_buf.len() >= 960 {
+            let input: Vec<i16> = self.render_buf.drain(..960).collect();
+            let mut output = vec![0i16; input.len()];
+            dsp.process_render_i16(&input, &mut output)
+                .map_err(|e| format!("echo reference DSP failed: {e}"))?;
+        }
+        Ok(())
     }
 
     /// Drop packets when the consumer is overloaded, keeping capture responsive.
@@ -118,7 +161,21 @@ impl Framer {
         sink: &mpsc::Sender<EncodedSample>,
         pcm: &[i16],
     ) -> Result<(), String> {
-        self.buf.extend_from_slice(pcm);
+        // Sonora's WebRTC processing operates on 10 ms frames. Buffer capture
+        // chunks to that boundary before processing; then the Opus framer
+        // collects the processed PCM into its encoder frame size.
+        if let Some(dsp) = &mut self.dsp {
+            self.dsp_buf.extend_from_slice(pcm);
+            while self.dsp_buf.len() >= 960 {
+                let input: Vec<i16> = self.dsp_buf.drain(..960).collect();
+                let mut output = vec![0i16; input.len()];
+                dsp.process_capture_i16(&input, &mut output)
+                    .map_err(|e| format!("audio DSP failed: {e}"))?;
+                self.buf.extend_from_slice(&output);
+            }
+        } else {
+            self.buf.extend_from_slice(pcm);
+        }
         let frame = encoder.frame_len();
         while self.buf.len() >= frame {
             let mut chunk: Vec<i16> = self.buf.drain(..frame).collect();
@@ -151,10 +208,21 @@ impl Framer {
 pub fn spawn_mic(
     device: Option<String>,
     bitrate_kbps: u32,
+    noise_suppression: bool,
+    echo_cancellation: bool,
     sink: mpsc::Sender<EncodedSample>,
 ) -> Result<Stream, AudioError> {
     spawn("sharescreen-native-mic", move |running, gain, ready| {
-        run_mic(device, bitrate_kbps, running, gain, sink, ready)
+        run_mic(
+            device,
+            bitrate_kbps,
+            noise_suppression,
+            echo_cancellation,
+            running,
+            gain,
+            sink,
+            ready,
+        )
     })
 }
 
@@ -235,6 +303,8 @@ trait Capture {
 fn run_mic(
     device: Option<String>,
     bitrate_kbps: u32,
+    noise_suppression: bool,
+    echo_cancellation: bool,
     running: Arc<AtomicBool>,
     gain: Gain,
     sink: mpsc::Sender<EncodedSample>,
@@ -256,10 +326,24 @@ fn run_mic(
     };
     let _ = ready.send(Ok(()));
 
-    let mut framer = Framer::new(gain);
+    let mut reference = match echo_cancellation.then(open_echo_reference) {
+        None => None,
+        Some(Ok(reference)) => Some(reference),
+        Some(Err(error)) => {
+            tracing::warn!(%error, noise_suppression, "echo reference unavailable; echo cancellation disabled");
+            None
+        }
+    };
+    let mut framer = Framer::new(gain, true, noise_suppression, reference.is_some());
     tracing::info!("native microphone capture started");
     while running.load(Ordering::SeqCst) {
         capture.pump()?;
+        if let Some(reference) = &mut reference {
+            reference.pump()?;
+            if let Some(render) = reference.next() {
+                framer.push_render(&render)?;
+            }
+        }
         if let Some(pcm) = capture.next() {
             framer.push(&mut encoder, &sink, &pcm)?;
         }
@@ -292,7 +376,7 @@ fn run_system(
     };
     let _ = ready.send(Ok(()));
 
-    let mut framer = Framer::new(gain);
+    let mut framer = Framer::new(gain, false, false, false);
     tracing::info!("native system audio capture started");
     while running.load(Ordering::SeqCst) {
         capture.pump()?;

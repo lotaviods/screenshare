@@ -294,6 +294,29 @@ pub(crate) struct Recorder {
 impl Recorder {
     /// Connect to PulseAudio and record `device` (or the default source).
     pub(crate) fn open(device: Option<String>) -> Result<Self, String> {
+        Self::open_source(device, None)
+    }
+
+    /// Capture the default output monitor for echo-canceller reference audio.
+    pub(crate) fn open_echo_reference() -> Result<Self, String> {
+        let (sources, _) = enumerate()?;
+        let mut mainloop = Mainloop::new().ok_or("failed to create PulseAudio mainloop")?;
+        let mut context = Context::new(&mainloop, "sharescreen-echo-reference")
+            .ok_or("failed to create PulseAudio context")?;
+        if let Err(e) = context.connect(None, FlagSet::NOFLAGS, None) {
+            return Err(format!("PulseAudio connect failed: {e:?}"));
+        }
+        wait_ready(&mut mainloop, &context)?;
+        let wanted =
+            default_sink_name(&mut mainloop, &mut context).map(|name| format!("{name}.monitor"));
+        let source = sources
+            .into_iter()
+            .find(|source| source.monitor_of_sink.is_some() && Some(source.name.clone()) == wanted)
+            .ok_or("default output monitor not found")?;
+        Self::from_context(mainloop, context, Some(source.name), None)
+    }
+
+    fn open_source(device: Option<String>, monitor: Option<u32>) -> Result<Self, String> {
         let mut mainloop = Mainloop::new().ok_or("failed to create PulseAudio mainloop")?;
         let mut context = Context::new(&mainloop, "sharescreen-microphone")
             .ok_or("failed to create PulseAudio context")?;
@@ -301,7 +324,16 @@ impl Recorder {
             return Err(format!("PulseAudio connect failed: {e:?}"));
         }
         wait_ready(&mut mainloop, &context)?;
-        let input = record(&mut context, device.as_deref(), None)?;
+        Self::from_context(mainloop, context, device, monitor)
+    }
+
+    fn from_context(
+        mainloop: Mainloop,
+        mut context: Context,
+        device: Option<String>,
+        monitor: Option<u32>,
+    ) -> Result<Self, String> {
+        let input = record(&mut context, device.as_deref(), monitor)?;
         Ok(Self {
             mainloop,
             context,

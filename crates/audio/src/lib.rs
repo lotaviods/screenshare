@@ -27,6 +27,8 @@ use tokio::sync::mpsc;
 /// independent: separate capture threads, and separate volume controls.
 pub struct AudioEngine {
     bitrate_kbps: u32,
+    noise_suppression: bool,
+    echo_cancellation: bool,
     mic: Option<native::Stream>,
     system: Option<native::Stream>,
 }
@@ -35,6 +37,8 @@ impl Default for AudioEngine {
     fn default() -> Self {
         Self {
             bitrate_kbps: 96,
+            noise_suppression: true,
+            echo_cancellation: true,
             mic: None,
             system: None,
         }
@@ -45,6 +49,11 @@ impl AudioEngine {
     /// Set the Opus bitrate (kbps) used by streams started after this call.
     pub fn set_bitrate_kbps(&mut self, kbps: u32) {
         self.bitrate_kbps = kbps;
+    }
+
+    pub fn set_processing_options(&mut self, noise_suppression: bool, echo_cancellation: bool) {
+        self.noise_suppression = noise_suppression;
+        self.echo_cancellation = echo_cancellation;
     }
 
     /// Remove unexpectedly finished streams and report their last error.
@@ -153,6 +162,8 @@ impl AudioCapture for AudioEngine {
         self.mic = Some(native::spawn_mic(
             device_id.map(str::to_owned),
             self.bitrate_kbps,
+            self.noise_suppression,
+            self.echo_cancellation,
             sink,
         )?);
         Ok(())
