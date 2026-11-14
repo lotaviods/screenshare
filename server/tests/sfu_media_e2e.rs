@@ -536,6 +536,20 @@ async fn focus_switch_subscribes_to_the_second_publisher() {
         .expect("focused track should stay open");
     assert_eq!(packet.payload, vec![0xC3; 32]);
 
+    // The previous focus must stop forwarding. Its writer stays negotiated, so
+    // re-focusing it later does not need another m-line.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    while timeout(Duration::from_millis(50), first.next_packet())
+        .await
+        .is_ok()
+    {}
+    assert!(
+        timeout(Duration::from_millis(700), first.next_packet())
+            .await
+            .is_err(),
+        "the unfocused publisher must stop forwarding"
+    );
+
     running.store(false, Ordering::Release);
     a_writer.abort();
     c_writer.abort();

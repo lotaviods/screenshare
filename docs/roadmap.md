@@ -22,9 +22,9 @@ Last updated: 2026-11-14.
 | Crash on call end | Root cause proven; P0.1 code landed in `5836c7b`, live PulseAudio lifecycle validation pending |
 | Audio stutter | Playback worker/cadence, queue/write reporting, adaptive prebuffer, libopus PLC/FEC and RTP gap recovery landed in `5836c7b`; live session unverified |
 | Video decode | Nonblocking overload policy, IDR recovery and self-view JPEG cap landed in `5836c7b`; runtime acceptance pending |
-| Scale to 6-8 | Relay SFU forwards real RTP end-to-end and focus switching works in automated 2-3 client tests; mesh remains the default, and subscription teardown, keyframe requests, thumbnails and measurements remain open |
+| Scale to 6-8 | Relay SFU forwards real RTP end-to-end; focus switching adds the new track and pauses the old subscription in automated 2-3 client tests. Mesh remains the default; keyframe requests, thumbnails and measurements remain open |
 | Windows | Untested; release gate recorded (D11) |
-| Code changes | Inherited working tree committed as `5836c7b`; SFU media-path tests and the codec pin are in the follow-up commit |
+| Code changes | Inherited working tree committed as `5836c7b`; SFU media-path tests and the codec pin are in `95a09d2` |
 
 ## Context
 
@@ -282,7 +282,7 @@ under 1 %, no stuck decoder. Not measured.
 
 - [x] P2.1 Relay one screen track plus two audio tracks between three clients
       through the `server` crate; no transcoding. Landed 2026-11-14 in the SFU
-      media-path commit:
+      media-path commit `95a09d2`:
       `server/tests/sfu_relay.rs` proves payload/sequence/timestamp survival
       through the forwarder, and `server/tests/sfu_media_e2e.rs` drives two
       real clients through live signaling (screen + mic) and a third publisher
@@ -312,10 +312,10 @@ decision remain open.
       topology, not the codec handling. Confirmed 2026-11-14 (D18).
 - [ ] P3.5 Focus switching: `set_focus(peer_id)` swaps the full-quality
       subscription and requests a keyframe; everyone else stays on the
-      thumbnail track (D15). The focus swap and the new egress track work in
-      `server/tests/sfu_media_e2e.rs`, but the old subscription keeps
-      forwarding until the publisher unpublishes (bandwidth waste) and no
-      keyframe is requested.
+      thumbnail track (D15). The swap, the new egress track and pausing the
+      previous subscription are proven in `server/tests/sfu_media_e2e.rs`
+      (2026-11-14, `95a09d2`); keyframe requests and thumbnail tracks are still
+      missing, and the 500 ms time is not asserted.
 
 Acceptance: 4 clients on one relay; a late joiner gets video without a manual
 keyframe; leaving mid-share does not disturb the others; focusing a different
@@ -398,17 +398,18 @@ continue without re-deriving the analysis belongs here.
   the subscription policy, the codec pin (D17) and the bounded `RtpForwarder`.
   `server/src/lib.rs` wires publications, focus, per-viewer snapshots, ingress
   source tasks, egress writers, ICE buffering and cleanup.
-- Proven relay behaviour, 2026-11-14, SFU media-path commit:
+- Proven relay behaviour, 2026-11-14, SFU media-path commit `95a09d2`:
   - `server/tests/sfu_relay.rs` drives publisher -> ingress peer -> forwarder ->
     egress peer -> subscriber and asserts the payload, sequence number and
     timestamp survive, with the egress SSRC rewritten.
   - `server/tests/sfu_media_e2e.rs` drives two real clients through the live
     WebSocket server (screen + microphone) and a third publisher whose track
-    is added after a focus switch. Both tests run in under a second.
+    is added after a focus switch; it also asserts that the previously focused
+    publisher stops forwarding. Both tests run in under two seconds.
   - `crates/webrtc/tests/loopback.rs` proves an answerer can pre-register
     egress tracks and fill the offerer's reserved receive-only slots.
 - The unused `str0m` scaffolding (`RelayPeer`, `str0m` dependency) was removed
-  in the media-path commit; D18 records why.
+  in the media-path commit `95a09d2`; D18 records why.
 - Client negotiation: `WebRtcPeer` adds receive-only transceivers and named
   relay tracks; remote tracks expose stream/track ids. The call layer now has
   the `ConnectionMode::Sfu` path with publication, offer/answer, ICE,
@@ -430,23 +431,20 @@ continue without re-deriving the analysis belongs here.
 
 ### Start here (next actions, in order)
 
-1. Make subscriptions shrink: when a viewer's snapshot drops a track, stop its
-   forwarder subscription (and count it). The current code only adds tracks, so
-   a focus swap keeps the old publisher's video flowing until it unpublishes.
-2. Request a keyframe on subscribe/focus (P3.3): send PLI/FIR upstream from the
+1. Request a keyframe on subscribe/focus (P3.3): send PLI/FIR upstream from the
    ingress receiver when a new viewer is wired, so the first focused frame does
    not wait for the encoder's periodic IDR.
-3. Show exported audio/media counters in the call sidebar and run the Phase 0
+2. Show exported audio/media counters in the call sidebar and run the Phase 0
    acceptance session on a machine with PulseAudio (1 h, two peers, zero drops).
-4. Measure P2.2 (CPU, memory, one-way latency at 3 peers) and write the P2.3
+3. Measure P2.2 (CPU, memory, one-way latency at 3 peers) and write the P2.3
    LiveKit comparison.
-5. Rework the call UI/default from mesh to SFU, then implement the two-encode
+4. Rework the call UI/default from mesh to SFU, then implement the two-encode
    thumbnail track (D16) and the shared decode budget (P4.3).
-6. Run the 8-peer soak and complete the Windows build/device gates.
+5. Run the 8-peer soak and complete the Windows build/device gates.
 
-Do not treat the SFU as production-ready before subscription teardown,
-keyframe requests and a multi-host session exist. The automated tests prove the
-media path, not call quality.
+Do not treat the SFU as production-ready before keyframe requests and a
+multi-host session exist. The automated tests prove the media path, not call
+quality.
 
 ### Facts a new reader would otherwise re-discover
 
@@ -471,8 +469,10 @@ media path, not call quality.
 - The server's answerer pre-registers egress tracks before setting the remote
   offer; `rtc` maps them onto the receive-only m-lines the client reserved.
   This is why the client must reserve enough audio/video slots up front.
-- The SFU only adds subscriptions today. A focus swap keeps the previous
-  publisher's track in the forwarder, which wastes bandwidth until unpublish.
+- The SFU pauses a subscription by deactivating the viewer's forwarder entry
+  instead of dropping the writer. A focus swap therefore stops the old
+  publisher's packets while keeping the negotiated m-line reusable, so
+  re-focusing an earlier publisher does not consume another receive slot.
 - `rtc` 0.21 exposes send-side simulcast metadata (`RTCRtpEncodingParameters`
   with `rid` and `scale_resolution_down_by`) but does not downscale pre-encoded
   samples, so simulcast would not save an encode for us (D16).
@@ -691,9 +691,15 @@ media path, not call quality.
 - Re-ran `cargo test --workspace`, `cargo clippy --workspace --all-targets --
   -D warnings`, `cargo fmt --all` and `git diff --check`; all pass. Started
   `sharescreen-ui` (Vulkan window) and `sharescreen-server` (binds :8080).
-- Remaining gaps recorded above: subscription teardown on focus swap, keyframe
-  requests, metrics in the UI, CPU/latency measurements, thumbnail encode,
-  shared decode budget, 8-peer soak and Windows.
+- Made focus swaps pause the previous subscription: `RtpForwarder` now keeps
+  the negotiated writer and gates it with an `active` flag. Renegotiation
+  activates currently subscribed tracks and deactivates the rest, so the old
+  publisher stops forwarding without losing its m-line. Added a fan-out unit
+  test and extended the three-client test to assert the unfocused publisher
+  goes silent.
+- Remaining gaps recorded above: keyframe requests, metrics in the UI,
+  CPU/latency measurements, thumbnail encode, shared decode budget, 8-peer
+  soak and Windows.
 
 ## Not validated
 
@@ -705,5 +711,5 @@ media path, not call quality.
 - Hardware capture/encode failure paths (DMA-BUF, VAAPI, WASAPI) under driver
   error conditions.
 - Live PulseAudio close/reopen and audio-jitter measurements.
-- SFU subscription teardown after a focus swap, keyframe requests on subscribe,
-  and relay CPU/memory/latency measurements.
+- Keyframe requests on subscribe, relay CPU/memory/latency measurements and
+  thumbnail decoding/encoding behaviour.

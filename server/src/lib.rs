@@ -462,23 +462,34 @@ async fn handle_sfu_offer(
             "SFU renegotiation: reusing existing peer, adding new tracks only"
         );
 
-        let publications: Vec<sfu::PublishedTrack> = {
+        let (publications, subscribed): (
+            Vec<sfu::PublishedTrack>,
+            std::collections::BTreeSet<String>,
+        ) = {
             let rooms = state.sfu_rooms.lock().unwrap();
             let Some(room) = rooms.get(room_id) else {
                 return Err("SFU room not found".into());
             };
-            let subscribed = room.subscriptions_for(peer_id).tracks;
-            room.publications()
-                .filter(|publication| subscribed.contains(&publication.id))
-                .cloned()
-                .collect()
+            (
+                room.publications().cloned().collect(),
+                room.subscriptions_for(peer_id).tracks,
+            )
         };
 
         for publication in publications {
             let track_key = sfu_track_key(room_id, &publication.id);
-            // Skip tracks the viewer already receives; they are already in the
-            // forwarder and their m-lines exist in the peer's local description.
-            if state.sfu_forwarder.has_subscriber(&track_key, peer_id) {
+            let wanted = subscribed.contains(&publication.id);
+            let already_wired = state.sfu_forwarder.has_subscriber(&track_key, peer_id);
+            if wanted && already_wired {
+                // The egress track is already negotiated. Re-enable it instead
+                // of adding another m-line; focus swaps reuse the same slot.
+                state.sfu_forwarder.set_active(&track_key, peer_id, true);
+                continue;
+            }
+            if !wanted {
+                if already_wired {
+                    state.sfu_forwarder.set_active(&track_key, peer_id, false);
+                }
                 continue;
             }
             tracing::info!(

@@ -175,8 +175,16 @@ pub struct RtpForwarder<T> {
 
 struct FanoutTrack<T> {
     kind: TrackKind,
-    subscribers: HashMap<String, mpsc::Sender<T>>,
+    subscribers: HashMap<String, FanoutSubscriber<T>>,
     epoch: u64,
+}
+
+/// One viewer's queue for a track. The writer stays registered after a
+/// subscription swap so re-focusing does not negotiate a new m-line; it is
+/// simply deactivated and stops receiving packets.
+struct FanoutSubscriber<T> {
+    sender: mpsc::Sender<T>,
+    active: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -220,7 +228,34 @@ impl<T: Clone + Send + 'static> RtpForwarder<T> {
             epoch,
         });
         track.kind = kind;
-        track.subscribers.insert(viewer.into(), sender);
+        track.subscribers.insert(
+            viewer.into(),
+            FanoutSubscriber {
+                sender,
+                active: true,
+            },
+        );
+    }
+
+    /// Enable or disable forwarding to one viewer without tearing down its
+    /// negotiated track. Used when a focus switch changes the subscription set.
+    pub fn set_active(&self, track_id: &str, viewer: &str, active: bool) {
+        if let Some(track) = self.tracks.write().unwrap().get_mut(track_id) {
+            if let Some(subscriber) = track.subscribers.get_mut(viewer) {
+                subscriber.active = active;
+            }
+        }
+    }
+
+    /// Whether a viewer currently receives packets for this track.
+    pub fn is_active(&self, track_id: &str, viewer: &str) -> bool {
+        self.tracks
+            .read()
+            .unwrap()
+            .get(track_id)
+            .and_then(|track| track.subscribers.get(viewer))
+            .map(|subscriber| subscriber.active)
+            .unwrap_or(false)
     }
 
     pub fn unsubscribe(&self, track_id: &str, viewer: &str) {
@@ -279,12 +314,20 @@ impl<T: Clone + Send + 'static> RtpForwarder<T> {
                 }
                 Some((
                     track.kind,
-                    track.subscribers.values().cloned().collect::<Vec<_>>(),
+                    track
+                        .subscribers
+                        .values()
+                        .filter(|subscriber| subscriber.active)
+                        .map(|subscriber| subscriber.sender.clone())
+                        .collect::<Vec<_>>(),
                 ))
             })
         else {
             return;
         };
+        if subscribers.is_empty() {
+            return;
+        }
 
         match kind {
             TrackKind::Audio => {
@@ -596,6 +639,28 @@ mod tests {
             .unwrap();
         assert_eq!(rx.recv().await, Some(2));
         assert_eq!(forwarder.metrics().audio_packets_queued, 2);
+    }
+
+    #[tokio::test]
+    async fn deactivating_a_subscription_stops_forwarding_but_keeps_the_writer() {
+        let forwarder = RtpForwarder::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        forwarder.subscribe("screen", TrackKind::Screen, "viewer", tx);
+        forwarder.forward("screen", 1u8).await;
+        assert_eq!(rx.recv().await, Some(1));
+
+        forwarder.set_active("screen", "viewer", false);
+        assert!(!forwarder.is_active("screen", "viewer"));
+        assert!(
+            forwarder.has_subscriber("screen", "viewer"),
+            "the negotiated writer must survive a subscription pause"
+        );
+        forwarder.forward("screen", 2u8).await;
+        assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+
+        forwarder.set_active("screen", "viewer", true);
+        forwarder.forward("screen", 3u8).await;
+        assert_eq!(rx.recv().await, Some(3));
     }
 
     #[tokio::test]
