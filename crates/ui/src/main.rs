@@ -17,8 +17,9 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 
 use app::AppView;
 use text_input::{
-    Backspace, Copy, Cut, Delete, End, Home, Left, Paste, Right, SelectAll, SelectLeft,
-    SelectRight, ShowCharacterPalette,
+    Backspace, Copy, Cut, Delete, DeleteWordLeft, DeleteWordRight, End, Escape, FocusNext,
+    FocusPrev, Home, Left, Paste, Right, SelectAll, SelectEnd, SelectHome, SelectLeft, SelectRight,
+    SelectWordLeft, SelectWordRight, ShowCharacterPalette, WordLeft, WordRight,
 };
 
 /// A `Write` sink shared by every log event so the log file stays open.
@@ -108,16 +109,30 @@ fn main() {
         cx.bind_keys([
             KeyBinding::new("backspace", Backspace, None),
             KeyBinding::new("delete", Delete, None),
+            KeyBinding::new("secondary-backspace", DeleteWordLeft, None),
+            KeyBinding::new("secondary-delete", DeleteWordRight, None),
             KeyBinding::new("left", Left, None),
             KeyBinding::new("right", Right, None),
+            KeyBinding::new("secondary-left", WordLeft, None),
+            KeyBinding::new("secondary-right", WordRight, None),
             KeyBinding::new("shift-left", SelectLeft, None),
             KeyBinding::new("shift-right", SelectRight, None),
-            KeyBinding::new("cmd-a", SelectAll, None),
-            KeyBinding::new("cmd-v", Paste, None),
-            KeyBinding::new("cmd-c", Copy, None),
-            KeyBinding::new("cmd-x", Cut, None),
+            KeyBinding::new("secondary-shift-left", SelectWordLeft, None),
+            KeyBinding::new("secondary-shift-right", SelectWordRight, None),
+            // `secondary` is cmd on macOS and ctrl on Linux/Windows. Binding
+            // `cmd-*` here would map to Super outside macOS, so the usual
+            // Ctrl+C/Ctrl+V shortcuts never reached the field.
+            KeyBinding::new("secondary-a", SelectAll, None),
+            KeyBinding::new("secondary-v", Paste, None),
+            KeyBinding::new("secondary-c", Copy, None),
+            KeyBinding::new("secondary-x", Cut, None),
             KeyBinding::new("home", Home, None),
             KeyBinding::new("end", End, None),
+            KeyBinding::new("shift-home", SelectHome, None),
+            KeyBinding::new("shift-end", SelectEnd, None),
+            KeyBinding::new("escape", Escape, None),
+            KeyBinding::new("tab", FocusNext, None),
+            KeyBinding::new("shift-tab", FocusPrev, None),
             KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, None),
         ]);
 
