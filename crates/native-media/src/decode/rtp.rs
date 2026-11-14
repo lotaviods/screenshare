@@ -23,7 +23,11 @@ pub struct RtpDepacketizer {
     fu: Vec<u8>,
     in_fu: bool,
     last_ts: Option<u32>,
+    last_seq: Option<u16>,
+    discard_ts: Option<u32>,
 }
+
+const MAX_H264_ACCESS_UNIT_BYTES: usize = 32 * 1024 * 1024;
 
 impl RtpDepacketizer {
     pub fn new(kind: RtpKind) -> Self {
@@ -33,6 +37,8 @@ impl RtpDepacketizer {
             fu: Vec::new(),
             in_fu: false,
             last_ts: None,
+            last_seq: None,
+            discard_ts: None,
         }
     }
 
@@ -45,10 +51,42 @@ impl RtpDepacketizer {
         match self.kind {
             RtpKind::H264 => {
                 let ts = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+                let seq = u16::from_be_bytes([packet[2], packet[3]]);
                 let mut out = Vec::new();
+                if self.discard_ts == Some(ts) {
+                    self.last_seq = Some(seq);
+                    return out;
+                }
+                let sequence_gap = self
+                    .last_seq
+                    .is_some_and(|last| seq != last.wrapping_add(1));
+                if sequence_gap {
+                    self.h264.clear();
+                    self.fu.clear();
+                    self.in_fu = false;
+                    // A gap inside an access unit invalidates that unit. If
+                    // the timestamp changed, keep the new packet as the start
+                    // of a fresh unit instead of dropping an extra frame.
+                    self.discard_ts = (self.last_ts == Some(ts)).then_some(ts);
+                    self.last_ts = Some(ts);
+                    self.last_seq = Some(seq);
+                    if self.discard_ts == Some(ts) {
+                        return out;
+                    }
+                    self.push_h264(payload);
+                    return out;
+                }
+                self.last_seq = Some(seq);
                 if let Some(last) = self.last_ts {
-                    if last != ts && !self.h264.is_empty() {
-                        out.push(std::mem::take(&mut self.h264));
+                    if last != ts {
+                        self.discard_ts = None;
+                        if self.in_fu {
+                            self.h264.clear();
+                            self.fu.clear();
+                            self.in_fu = false;
+                        } else if !self.h264.is_empty() {
+                            out.push(std::mem::take(&mut self.h264));
+                        }
                     }
                 }
                 self.last_ts = Some(ts);
@@ -61,7 +99,10 @@ impl RtpDepacketizer {
 
     /// Return the access unit still buffered, if any.
     pub fn flush(&mut self) -> Vec<Vec<u8>> {
-        if self.h264.is_empty() {
+        if self.h264.is_empty() || self.in_fu {
+            self.h264.clear();
+            self.fu.clear();
+            self.in_fu = false;
             return Vec::new();
         }
         self.last_ts = None;
@@ -89,11 +130,23 @@ impl RtpDepacketizer {
                 self.in_fu = true;
             }
             if self.in_fu {
+                if self.fu.len().saturating_add(payload.len()) > MAX_H264_ACCESS_UNIT_BYTES {
+                    self.fu.clear();
+                    self.h264.clear();
+                    self.in_fu = false;
+                    self.discard_ts = self.last_ts;
+                    return;
+                }
                 self.fu.extend_from_slice(&payload[2..]);
             }
             if end {
                 self.in_fu = false;
-                self.h264.extend_from_slice(&self.fu);
+                if self.h264.len().saturating_add(self.fu.len()) <= MAX_H264_ACCESS_UNIT_BYTES {
+                    self.h264.extend_from_slice(&self.fu);
+                } else {
+                    self.h264.clear();
+                    self.discard_ts = self.last_ts;
+                }
                 self.fu.clear();
             }
             return;
@@ -107,6 +160,13 @@ impl RtpDepacketizer {
                 if i + size > payload.len() {
                     break;
                 }
+                if self.h264.len().saturating_add(size).saturating_add(4)
+                    > MAX_H264_ACCESS_UNIT_BYTES
+                {
+                    self.h264.clear();
+                    self.discard_ts = self.last_ts;
+                    break;
+                }
                 self.h264.extend_from_slice(&[0, 0, 0, 1]);
                 self.h264.extend_from_slice(&payload[i..i + size]);
                 i += size;
@@ -114,6 +174,17 @@ impl RtpDepacketizer {
             return;
         }
         if (1..=23).contains(&nal_type) {
+            if self
+                .h264
+                .len()
+                .saturating_add(payload.len())
+                .saturating_add(4)
+                > MAX_H264_ACCESS_UNIT_BYTES
+            {
+                self.h264.clear();
+                self.discard_ts = self.last_ts;
+                return;
+            }
             self.h264.extend_from_slice(&[0, 0, 0, 1]);
             self.h264.extend_from_slice(payload);
         }
@@ -153,9 +224,15 @@ mod tests {
     #[test]
     fn fu_a_reassembles_into_one_nal() {
         let mut d = RtpDepacketizer::new(RtpKind::H264);
-        assert!(d.push(&rtp(&[0x7c, 0x85, 0xaa])).is_empty());
-        assert!(d.push(&rtp(&[0x7c, 0x05, 0xbb])).is_empty());
-        assert!(d.push(&rtp(&[0x7c, 0x45, 0xcc])).is_empty());
+        let mut start = rtp(&[0x7c, 0x85, 0xaa]);
+        start[2..4].copy_from_slice(&10u16.to_be_bytes());
+        let mut middle = rtp(&[0x7c, 0x05, 0xbb]);
+        middle[2..4].copy_from_slice(&11u16.to_be_bytes());
+        let mut end = rtp(&[0x7c, 0x45, 0xcc]);
+        end[2..4].copy_from_slice(&12u16.to_be_bytes());
+        assert!(d.push(&start).is_empty());
+        assert!(d.push(&middle).is_empty());
+        assert!(d.push(&end).is_empty());
         assert_eq!(d.flush(), vec![vec![0, 0, 0, 1, 0x65, 0xaa, 0xbb, 0xcc]]);
     }
 
@@ -163,9 +240,11 @@ mod tests {
     fn timestamp_change_closes_the_unit() {
         let mut d = RtpDepacketizer::new(RtpKind::H264);
         let mut first = rtp(&[0x65, 0x01]);
+        first[2..4].copy_from_slice(&20u16.to_be_bytes());
         first[4..8].copy_from_slice(&1u32.to_be_bytes());
         assert!(d.push(&first).is_empty());
         let mut second = rtp(&[0x65, 0x02]);
+        second[2..4].copy_from_slice(&21u16.to_be_bytes());
         second[4..8].copy_from_slice(&2u32.to_be_bytes());
         assert_eq!(d.push(&second), vec![vec![0, 0, 0, 1, 0x65, 0x01]]);
         assert_eq!(d.flush(), vec![vec![0, 0, 0, 1, 0x65, 0x02]]);

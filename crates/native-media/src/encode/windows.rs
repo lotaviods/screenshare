@@ -14,19 +14,25 @@ use crate::frame::Frame;
 
 /// Whether FFmpeg exposes an encoder for `codec`.
 pub fn codec_available(codec: Codec) -> bool {
-    codec_names(codec)
+    codec_names(codec, false)
         .iter()
         .any(|name| find_codec(name).is_some())
+        || codec_names(codec, true)
+            .iter()
+            .any(|name| find_codec(name).is_some())
 }
 
 /// Candidate encoders for `codec`. libx264 is preferred for H.264
 /// because it repeats SPS/PPS in-band for RTP; the Media Foundation encoder is
 /// a fallback. libvpx is preferred for VP8/VP9.
-fn codec_names(codec: Codec) -> &'static [&'static str] {
-    match codec {
-        Codec::H264 => &["libx264", "h264_mf", "h264"],
-        Codec::Vp8 => &["libvpx", "libvpx-vp8", "vp8_mf"],
-        Codec::Vp9 => &["libvpx-vp9", "vp9_mf"],
+fn codec_names(codec: Codec, prefer_hardware: bool) -> &'static [&'static str] {
+    match (codec, prefer_hardware) {
+        (Codec::H264, true) => &["h264_mf", "libx264", "h264"],
+        (Codec::H264, false) => &["libx264", "h264", "h264_mf"],
+        (Codec::Vp8, true) => &["vp8_mf", "libvpx", "libvpx-vp8"],
+        (Codec::Vp8, false) => &["libvpx", "libvpx-vp8", "vp8_mf"],
+        (Codec::Vp9, true) => &["vp9_mf", "libvpx-vp9"],
+        (Codec::Vp9, false) => &["libvpx-vp9", "vp9_mf"],
         _ => &[],
     }
 }
@@ -60,8 +66,9 @@ impl FfmpegEncoder {
 
     pub fn new(config: EncoderConfig) -> Result<Self, EncodeError> {
         let mut errors = Vec::new();
-        for name in codec_names(config.codec) {
+        for name in codec_names(config.codec, config.hardware_encoding) {
             let Some(codec) = find_codec(name) else {
+                errors.push(format!("{name}: encoder not available"));
                 continue;
             };
             match Self::open(config.clone(), codec) {

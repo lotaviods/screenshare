@@ -29,6 +29,7 @@ use sharescreen_core::{
 use tokio::sync::mpsc;
 
 /// Deliver ordered video packets without trapping the capture thread during stop.
+#[cfg(test)]
 fn send_while_running(
     sink: &mpsc::Sender<EncodedSample>,
     mut sample: EncodedSample,
@@ -59,7 +60,7 @@ impl CaptureEngine {
     pub fn failure(&self) -> Option<String> {
         match self {
             #[cfg(target_os = "linux")]
-            Self::Wayland(_) => None,
+            Self::Wayland(capture) => capture.failure(),
             #[cfg(windows)]
             Self::Windows(capture) => capture.failure(),
         }

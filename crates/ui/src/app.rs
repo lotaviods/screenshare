@@ -10,7 +10,7 @@ use gpui::{
     WeakEntity, Window, WindowHandle, WindowKind, WindowOptions, div, img, prelude::*, px, rgb,
     size,
 };
-use sharescreen_config::{Config, ConfigStore};
+use sharescreen_config::{Config, ConfigStore, NoiseSuppressionLevel};
 use sharescreen_core::{
     CallEvent, CaptureBackend, CaptureOptions, CaptureSource, Codec, ConnectionMode, CursorMode,
     Device, Participant,
@@ -1018,7 +1018,7 @@ impl AppView {
             cursor: CursorMode::Embedded,
             codec: self.config.video.codec,
             bitrate_kbps: self.share.bitrate,
-            hardware_encoding: self.share.hardware,
+            hardware_encoding: cfg!(target_os = "linux") || self.share.hardware,
         };
         tracing::info!(
             source = %source.id,
@@ -1896,7 +1896,7 @@ impl AppView {
                             div()
                                 .text_sm()
                                 .text_color(rgb(MUTED))
-                                .child("Noise suppression uses WebRTC DSP (moderate). Echo cancellation uses the system output as its reference."),
+                                .child("Noise suppression uses WebRTC DSP. Choose its strength; stronger settings can add voice artifacts. Echo cancellation uses the system output as its reference."),
                         )
                         .child(
                             div()
@@ -1914,6 +1914,24 @@ impl AppView {
                                             }
                                             cx.notify();
                                         })),
+                                )
+                                .child(
+                                    button("settings-noise-level", match self.settings.audio.noise_suppression_level {
+                                        NoiseSuppressionLevel::Low => "Suppression strength: low",
+                                        NoiseSuppressionLevel::Moderate => "Suppression strength: moderate",
+                                        NoiseSuppressionLevel::High => "Suppression strength: high",
+                                        NoiseSuppressionLevel::VeryHigh => "Suppression strength: very high",
+                                    })
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.settings.audio.noise_suppression_level =
+                                            view.settings.audio.noise_suppression_level.next();
+                                        view.backend.send(Command::SaveConfig(view.settings.clone()));
+                                        if view.mic_on {
+                                            view.backend.send(Command::StopMic);
+                                            view.backend.send(Command::StartMic(view.settings.audio.mic_device_id.clone()));
+                                        }
+                                        cx.notify();
+                                    })),
                                 )
                                 .child(
                                     button("settings-echo-cancellation", if self.settings.audio.echo_cancellation { "Echo cancellation: on" } else { "Echo cancellation: off" })
@@ -1990,18 +2008,25 @@ impl AppView {
                         )
                         .child(div().flex_1()),
                 )
-                .child(
+                .child(if cfg!(target_os = "windows") {
                     toggle(
                         "settings-hardware",
-                        "Prefer hardware encoding (not applied yet)",
+                        "Prefer Media Foundation hardware encoding",
                         self.settings.video.hardware_encoding,
                     )
                     .on_click(cx.listener(|view, _, _, cx| {
                         view.settings.video.hardware_encoding =
                             !view.settings.video.hardware_encoding;
                         cx.notify();
-                    })),
-                ),
+                    }))
+                    .into_any_element()
+                } else {
+                    div()
+                        .text_sm()
+                        .text_color(rgb(MUTED))
+                        .child("Linux screen sharing uses VAAPI hardware encoding.")
+                        .into_any_element()
+                }),
         );
 
         page = page.child(
@@ -2179,17 +2204,24 @@ impl AppView {
                         }),
                 ),
             )
-            .child(
+            .child(if cfg!(target_os = "windows") {
                 toggle(
                     "share-hardware",
-                    "Prefer hardware encoding (not applied yet)",
+                    "Prefer Media Foundation hardware encoding",
                     self.share.hardware,
                 )
                 .on_click(cx.listener(|view, _, _, cx| {
                     view.share.hardware = !view.share.hardware;
                     cx.notify();
-                })),
-            )
+                }))
+                .into_any_element()
+            } else {
+                div()
+                    .text_sm()
+                    .text_color(rgb(MUTED))
+                    .child("VAAPI hardware encoding is used when available.")
+                    .into_any_element()
+            })
             .child(
                 toggle(
                     "share-system-audio",

@@ -51,6 +51,8 @@ pub struct EncoderConfig {
     pub fps: u32,
     pub bitrate_kbps: u32,
     pub codec: Codec,
+    /// Prefer a Media Foundation encoder on Windows when available.
+    pub hardware_encoding: bool,
 }
 
 /// Encode captured frames. Implementations run on a dedicated thread.

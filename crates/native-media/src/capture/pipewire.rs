@@ -111,6 +111,28 @@ pub fn run<F>(
     memory: Memory,
     timeout: Option<Duration>,
     running: Arc<AtomicUsize>,
+    on_frame: F,
+) -> Result<Vec<CapturedFormat>, CaptureError>
+where
+    F: FnMut(DmaBufFrame) + 'static,
+{
+    run_configured(
+        fd, node_id, memory, timeout, running, 1920, 1080, 30, on_frame,
+    )
+}
+
+/// Run PipeWire with a preferred capture size and frame rate. The compositor
+/// may negotiate a different supported mode; callers should use the actual
+/// dimensions reported by captured frames as the effective output size.
+pub fn run_configured<F>(
+    fd: RawFd,
+    node_id: u32,
+    memory: Memory,
+    timeout: Option<Duration>,
+    running: Arc<AtomicUsize>,
+    width: u32,
+    height: u32,
+    fps: u32,
     mut on_frame: F,
 ) -> Result<Vec<CapturedFormat>, CaptureError>
 where
@@ -300,7 +322,7 @@ where
         .register()
         .map_err(|e| CaptureError::Pipewire(e.to_string()))?;
 
-    let values = video_params(1920, 1080, memory);
+    let values = video_params(width.max(1), height.max(1), fps.clamp(1, 120), memory);
     let pod = spa::pod::Pod::from_bytes(&values).expect("valid video pod");
     let buffers = buffer_params(memory);
     let buffers = spa::pod::Pod::from_bytes(&buffers).expect("valid buffer pod");
@@ -385,7 +407,7 @@ fn plane_rows(format: DrmFormat, plane: usize, height: u32) -> u32 {
     }
 }
 
-fn video_params(width: u32, height: u32, memory: Memory) -> Vec<u8> {
+fn video_params(width: u32, height: u32, fps: u32, memory: Memory) -> Vec<u8> {
     use spa::pod::{ChoiceValue, Object, Property, PropertyFlags, Value};
     use spa::utils::{Choice, ChoiceEnum, ChoiceFlags};
 
@@ -446,7 +468,7 @@ fn video_params(width: u32, height: u32, memory: Memory) -> Vec<u8> {
             value: Value::Choice(ChoiceValue::Fraction(Choice(
                 ChoiceFlags::empty(),
                 ChoiceEnum::Range {
-                    default: spa::utils::Fraction { num: 30, denom: 1 },
+                    default: spa::utils::Fraction { num: fps, denom: 1 },
                     min: spa::utils::Fraction { num: 0, denom: 1 },
                     max: spa::utils::Fraction { num: 120, denom: 1 },
                 },
@@ -509,14 +531,14 @@ mod tests {
 
     #[test]
     fn dma_params_request_modifier() {
-        let values = video_params(1920, 1080, Memory::DmaBuf);
+        let values = video_params(1920, 1080, 30, Memory::DmaBuf);
         let key = spa::param::format::FormatProperties::VideoModifier.as_raw();
         assert!(has_prop(&values, key));
     }
 
     #[test]
     fn memfd_params_omit_modifier() {
-        let values = video_params(1920, 1080, Memory::MemFd);
+        let values = video_params(1920, 1080, 30, Memory::MemFd);
         let key = spa::param::format::FormatProperties::VideoModifier.as_raw();
         assert!(!has_prop(&values, key));
     }

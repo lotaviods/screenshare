@@ -4,6 +4,7 @@ mod text_input;
 
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use gpui::{
@@ -24,6 +25,8 @@ use text_input::{
 
 /// A `Write` sink shared by every log event so the log file stays open.
 struct LogFile(Arc<Mutex<std::fs::File>>);
+
+static CRASH_LOG_FD: AtomicI32 = AtomicI32::new(-1);
 
 impl Write for LogFile {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -96,8 +99,88 @@ fn init_logging() {
     }
 }
 
+#[cfg(unix)]
+extern "C" fn fatal_signal_reporter(signal: libc::c_int) {
+    let fd = CRASH_LOG_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        let message: &[u8] = match signal {
+            libc::SIGABRT => b"fatal signal SIGABRT (possible native abort or heap corruption)\n",
+            libc::SIGSEGV => b"fatal signal SIGSEGV (segmentation fault)\n",
+            libc::SIGBUS => b"fatal signal SIGBUS (invalid memory or device access)\n",
+            _ => b"fatal signal in Sharescreen\n",
+        };
+        unsafe {
+            // `write`, `signal`, and `raise` avoid allocation and locks in this
+            // handler; the process still terminates with the original signal.
+            libc::write(fd, message.as_ptr().cast(), message.len());
+        }
+    }
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
+    }
+}
+
+/// Add panic and fatal-signal records beside the normal app log. A fatal
+/// signal handler only writes a fixed message, since formatting or locking is
+/// unsafe after native heap corruption.
+fn init_crash_reporting() {
+    let Some(log_path) = sharescreen_config::default_log_path() else {
+        return;
+    };
+    let crash_path = log_path.with_file_name("crashes.log");
+    let Some(parent) = crash_path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&crash_path)
+    {
+        Ok(file) => Arc::new(Mutex::new(file)),
+        Err(error) => {
+            tracing::warn!(path = %crash_path.display(), %error, "crash log unavailable");
+            return;
+        }
+    };
+
+    let panic_file = file.clone();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Ok(mut file) = panic_file.lock() {
+            let _ = writeln!(
+                file,
+                "\n=== Rust panic ===\nTime: {:?}\nThread: {:?}\n{info}\nBacktrace:\n{}",
+                std::time::SystemTime::now(),
+                std::thread::current().name(),
+                std::backtrace::Backtrace::force_capture()
+            );
+            let _ = file.flush();
+        }
+    }));
+
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        CRASH_LOG_FD.store(
+            file.lock().map(|file| file.as_raw_fd()).unwrap_or(-1),
+            Ordering::Release,
+        );
+        unsafe {
+            let handler = fatal_signal_reporter as *const () as libc::sighandler_t;
+            libc::signal(libc::SIGABRT, handler);
+            libc::signal(libc::SIGSEGV, handler);
+            libc::signal(libc::SIGBUS, handler);
+        }
+    }
+    tracing::info!(path = %crash_path.display(), "crash reporting initialized");
+}
+
 fn main() {
     init_logging();
+    init_crash_reporting();
 
     let store = ConfigStore::load_or_default().unwrap_or_else(|error| {
         tracing::error!("failed to load configuration: {error}");

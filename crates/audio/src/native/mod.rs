@@ -17,7 +17,10 @@ use std::time::Duration;
 
 use sharescreen_core::{AudioError, Codec, EncodedSample, MediaKind};
 use sharescreen_native_media::encode::OpusEncoder;
-use sonora::config::{EchoCanceller, HighPassFilter, NoiseSuppression, NoiseSuppressionLevel};
+use sonora::config::{
+    EchoCanceller, HighPassFilter, NoiseSuppression,
+    NoiseSuppressionLevel as SonoraNoiseSuppressionLevel,
+};
 use sonora::{AudioProcessing, Config as DspConfig, StreamConfig};
 use tokio::sync::mpsc;
 
@@ -109,17 +112,25 @@ struct Framer {
 }
 
 impl Framer {
-    fn new(gain: Gain, process_voice: bool, noise_suppression: bool, echo_reference: bool) -> Self {
+    fn new(
+        gain: Gain,
+        process_voice: bool,
+        noise_suppression: bool,
+        noise_suppression_level: u8,
+        echo_reference: bool,
+    ) -> Self {
         let dsp = process_voice.then(|| {
             let mut dsp = AudioProcessing::builder()
                 .config(DspConfig {
                     high_pass_filter: Some(HighPassFilter::default()),
                     echo_canceller: echo_reference.then(EchoCanceller::default),
                     noise_suppression: noise_suppression.then(|| NoiseSuppression {
-                        // Moderate suppression is less likely to introduce
-                        // metallic artifacts on speech than the aggressive
-                        // high setting while still reducing steady noise.
-                        level: NoiseSuppressionLevel::Moderate,
+                        level: match noise_suppression_level {
+                            0 => SonoraNoiseSuppressionLevel::Low,
+                            1 => SonoraNoiseSuppressionLevel::Moderate,
+                            2 => SonoraNoiseSuppressionLevel::High,
+                            _ => SonoraNoiseSuppressionLevel::VeryHigh,
+                        },
                         ..NoiseSuppression::default()
                     }),
                     ..DspConfig::default()
@@ -212,6 +223,7 @@ pub fn spawn_mic(
     device: Option<String>,
     bitrate_kbps: u32,
     noise_suppression: bool,
+    noise_suppression_level: u8,
     echo_cancellation: bool,
     sink: mpsc::Sender<EncodedSample>,
 ) -> Result<Stream, AudioError> {
@@ -220,6 +232,7 @@ pub fn spawn_mic(
             device,
             bitrate_kbps,
             noise_suppression,
+            noise_suppression_level,
             echo_cancellation,
             running,
             gain,
@@ -307,6 +320,7 @@ fn run_mic(
     device: Option<String>,
     bitrate_kbps: u32,
     noise_suppression: bool,
+    noise_suppression_level: u8,
     echo_cancellation: bool,
     running: Arc<AtomicBool>,
     gain: Gain,
@@ -337,7 +351,13 @@ fn run_mic(
             None
         }
     };
-    let mut framer = Framer::new(gain, true, noise_suppression, reference.is_some());
+    let mut framer = Framer::new(
+        gain,
+        true,
+        noise_suppression,
+        noise_suppression_level,
+        reference.is_some(),
+    );
     tracing::info!("native microphone capture started");
     while running.load(Ordering::SeqCst) {
         capture.pump()?;
@@ -379,7 +399,7 @@ fn run_system(
     };
     let _ = ready.send(Ok(()));
 
-    let mut framer = Framer::new(gain, false, false, false);
+    let mut framer = Framer::new(gain, false, false, 1, false);
     tracing::info!("native system audio capture started");
     while running.load(Ordering::SeqCst) {
         capture.pump()?;

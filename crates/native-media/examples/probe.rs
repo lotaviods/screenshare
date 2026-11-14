@@ -51,6 +51,7 @@ impl Sink {
                 fps: 30,
                 bitrate_kbps: 6000,
                 codec: sharescreen_core::Codec::H264,
+                hardware_encoding: true,
             };
             match FfmpegEncoder::new(config) {
                 Ok(enc) => {

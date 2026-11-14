@@ -32,6 +32,11 @@ struct ActiveCapture {
 }
 
 impl WaylandCapture {
+    pub fn failure(&self) -> Option<String> {
+        self.active
+            .as_ref()
+            .and_then(|active| active.stream.failure())
+    }
     pub fn finished(&self) -> bool {
         self.active
             .as_ref()
@@ -62,6 +67,11 @@ impl ScreenCapture for WaylandCapture {
         options: CaptureOptions,
         sink: mpsc::Sender<EncodedSample>,
     ) -> Result<(), CaptureError> {
+        if !options.hardware_encoding {
+            return Err(CaptureError::Unavailable(
+                "software encoding is not supported by the Linux PipeWire backend; enable VAAPI hardware encoding".into(),
+            ));
+        }
         if !native::available(options.codec) {
             return Err(CaptureError::Unavailable(format!(
                 "native capture does not support {:?} on this system",

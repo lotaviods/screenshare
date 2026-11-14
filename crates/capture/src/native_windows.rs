@@ -130,6 +130,7 @@ fn run(
                 fps,
                 bitrate_kbps,
                 codec: options.codec,
+                hardware_encoding: options.hardware_encoding,
             };
             match FfmpegEncoder::new(config) {
                 Ok(created) => {

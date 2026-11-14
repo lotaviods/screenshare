@@ -65,6 +65,27 @@ pub struct TurnServer {
 
 // --- Audio -----------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NoiseSuppressionLevel {
+    Low,
+    #[default]
+    Moderate,
+    High,
+    VeryHigh,
+}
+
+impl NoiseSuppressionLevel {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Low => Self::Moderate,
+            Self::Moderate => Self::High,
+            Self::High => Self::VeryHigh,
+            Self::VeryHigh => Self::Low,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AudioConfig {
@@ -75,6 +96,7 @@ pub struct AudioConfig {
     pub system_volume: f32,
     pub echo_cancellation: bool,
     pub noise_suppression: bool,
+    pub noise_suppression_level: NoiseSuppressionLevel,
     /// Opus bitrate in kbps.
     pub bitrate_kbps: u32,
     /// Audio codec. Only [`Codec::Opus`] is supported for audio.
@@ -90,6 +112,7 @@ impl Default for AudioConfig {
             system_volume: 1.0,
             echo_cancellation: true,
             noise_suppression: true,
+            noise_suppression_level: NoiseSuppressionLevel::Moderate,
             bitrate_kbps: 96,
             codec: Codec::Opus,
         }

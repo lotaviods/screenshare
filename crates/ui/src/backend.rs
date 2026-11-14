@@ -10,6 +10,7 @@ use gpui::RenderImage;
 use sharescreen_audio::AudioEngine;
 use sharescreen_call::{CallConfig, CallSession};
 use sharescreen_capture::CaptureEngine;
+use sharescreen_config::NoiseSuppressionLevel;
 use sharescreen_config::{Config, ConfigStore};
 use sharescreen_core::{
     AudioCapture, CallEvent, CaptureBackend, CaptureOptions, CaptureSource, Device, DeviceKind,
@@ -180,6 +181,7 @@ impl Actor {
         audio.set_bitrate_kbps(config.audio.bitrate_kbps);
         audio.set_processing_options(
             config.audio.noise_suppression,
+            noise_suppression_level_id(config.audio.noise_suppression_level),
             config.audio.echo_cancellation,
         );
         Self {
@@ -499,8 +501,11 @@ impl Actor {
 
     async fn start_mic(&mut self, device: Option<String>) -> Result<(), String> {
         let settings = self.config().audio;
-        self.audio
-            .set_processing_options(settings.noise_suppression, settings.echo_cancellation);
+        self.audio.set_processing_options(
+            settings.noise_suppression,
+            noise_suppression_level_id(settings.noise_suppression_level),
+            settings.echo_cancellation,
+        );
         let sink = self.media_sink(Stream::Mic);
         self.audio
             .start_mic(device.as_deref(), sink)
@@ -723,8 +728,11 @@ impl Actor {
         drop(store);
         let _ = self.audio.set_mic_volume(saved.audio.mic_volume);
         let _ = self.audio.set_system_volume(saved.audio.system_volume);
-        self.audio
-            .set_processing_options(saved.audio.noise_suppression, saved.audio.echo_cancellation);
+        self.audio.set_processing_options(
+            saved.audio.noise_suppression,
+            noise_suppression_level_id(saved.audio.noise_suppression_level),
+            saved.audio.echo_cancellation,
+        );
         self.send(UiEvent::Config(saved));
         Ok(())
     }
@@ -736,6 +744,15 @@ enum Stream {
     Mic,
     System,
     Screen,
+}
+
+fn noise_suppression_level_id(level: NoiseSuppressionLevel) -> u8 {
+    match level {
+        NoiseSuppressionLevel::Low => 0,
+        NoiseSuppressionLevel::Moderate => 1,
+        NoiseSuppressionLevel::High => 2,
+        NoiseSuppressionLevel::VeryHigh => 3,
+    }
 }
 
 struct EnumerationGuard(Arc<AtomicBool>);

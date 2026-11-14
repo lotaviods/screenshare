@@ -5961,6 +5961,7 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "image",
+ "libc",
  "serde",
  "serde_json",
  "sharescreen-audio",

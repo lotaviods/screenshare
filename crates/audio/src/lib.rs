@@ -28,6 +28,7 @@ use tokio::sync::mpsc;
 pub struct AudioEngine {
     bitrate_kbps: u32,
     noise_suppression: bool,
+    noise_suppression_level: u8,
     echo_cancellation: bool,
     mic: Option<native::Stream>,
     system: Option<native::Stream>,
@@ -38,6 +39,7 @@ impl Default for AudioEngine {
         Self {
             bitrate_kbps: 96,
             noise_suppression: true,
+            noise_suppression_level: 1,
             echo_cancellation: true,
             mic: None,
             system: None,
@@ -51,8 +53,14 @@ impl AudioEngine {
         self.bitrate_kbps = kbps;
     }
 
-    pub fn set_processing_options(&mut self, noise_suppression: bool, echo_cancellation: bool) {
+    pub fn set_processing_options(
+        &mut self,
+        noise_suppression: bool,
+        noise_suppression_level: u8,
+        echo_cancellation: bool,
+    ) {
         self.noise_suppression = noise_suppression;
+        self.noise_suppression_level = noise_suppression_level.min(3);
         self.echo_cancellation = echo_cancellation;
     }
 
@@ -163,6 +171,7 @@ impl AudioCapture for AudioEngine {
             device_id.map(str::to_owned),
             self.bitrate_kbps,
             self.noise_suppression,
+            self.noise_suppression_level,
             self.echo_cancellation,
             sink,
         )?);

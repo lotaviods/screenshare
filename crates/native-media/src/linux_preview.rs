@@ -95,6 +95,7 @@ fn run(shared: Arc<Shared>) {
         fps: 30,
         bitrate_kbps: 2000,
         codec: Codec::H264,
+        hardware_encoding: true,
     };
     let mut jpeg = match JpegEncoder::new() {
         Ok(e) => e,

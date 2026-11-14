@@ -647,10 +647,12 @@ mod tests {
     fn decodes_h264_sample_into_jpeg() {
         let sample = include_bytes!("../fixtures/sample.h264");
         let decoder = Decoder::new(RemoteTrackKind::Video, Codec::H264).unwrap();
-        for nal in nals(sample) {
+        for (sequence, nal) in nals(sample).into_iter().enumerate() {
             let mut rtp = vec![0u8; 12];
             rtp[0] = 0x80;
             rtp[1] = 96;
+            rtp[2..4].copy_from_slice(&(sequence as u16).to_be_bytes());
+            rtp[4..8].copy_from_slice(&1u32.to_be_bytes());
             rtp.extend_from_slice(nal);
             decoder.push_rtp(rtp);
         }

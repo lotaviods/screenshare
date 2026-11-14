@@ -7,13 +7,23 @@ use ffmpeg_sys_next as ffi;
 
 /// Wrap a byte slice in a borrowed `AVPacket` and feed it to the decoder.
 fn send_packet(ctx: *mut ffi::AVCodecContext, packet: &[u8]) -> Result<(), String> {
+    if packet.len() > i32::MAX as usize {
+        return Err("encoded packet is too large".into());
+    }
     unsafe {
         let mut pkt = ffi::av_packet_alloc();
         if pkt.is_null() {
             return Err("av_packet_alloc failed".into());
         }
-        (*pkt).data = packet.as_ptr() as *mut u8;
-        (*pkt).size = packet.len() as i32;
+        // FFmpeg bitstream readers may read AV_INPUT_BUFFER_PADDING_SIZE bytes
+        // past packet data. Give FFmpeg an owned, padded packet instead of
+        // pointing it at a Rust Vec with no such padding.
+        let ret = ffi::av_new_packet(pkt, packet.len() as i32);
+        if ret < 0 {
+            ffi::av_packet_free(&mut pkt);
+            return Err(format!("av_new_packet failed: {ret}"));
+        }
+        ptr::copy_nonoverlapping(packet.as_ptr(), (*pkt).data, packet.len());
         let ret = ffi::avcodec_send_packet(ctx, pkt);
         ffi::av_packet_free(&mut pkt);
         if ret < 0 && ret != ffi::AVERROR(ffi::EAGAIN) {
@@ -30,6 +40,7 @@ pub struct VideoDecoder {
     sws: *mut ffi::SwsContext,
     width: u32,
     height: u32,
+    format: i32,
 }
 
 unsafe impl Send for VideoDecoder {}
@@ -62,6 +73,7 @@ impl VideoDecoder {
                 sws: ptr::null_mut(),
                 width: 0,
                 height: 0,
+                format: -1,
             })
         }
     }
@@ -87,16 +99,30 @@ impl VideoDecoder {
                 if width == 0 || height == 0 {
                     continue;
                 }
-                if width != self.width || height != self.height {
+                let pixels = (width as usize).checked_mul(height as usize);
+                if width > 16_384
+                    || height > 16_384
+                    || pixels.is_none_or(|pixels| pixels > 33_554_432)
+                {
+                    return Err(format!(
+                        "decoded video dimensions are unsafe: {width}x{height}"
+                    ));
+                }
+                let format = (*self.frame).format;
+                if format < 0 || format >= ffi::AVPixelFormat::AV_PIX_FMT_NB as i32 {
+                    return Err(format!("decoder returned invalid pixel format: {format}"));
+                }
+                if width != self.width || height != self.height || format != self.format {
                     self.width = width;
                     self.height = height;
+                    self.format = format;
                     if !self.sws.is_null() {
                         ffi::sws_freeContext(self.sws);
                     }
                     self.sws = ffi::sws_getContext(
                         width as i32,
                         height as i32,
-                        std::mem::transmute::<i32, ffi::AVPixelFormat>((*self.frame).format),
+                        std::mem::transmute::<i32, ffi::AVPixelFormat>(format),
                         width as i32,
                         height as i32,
                         ffi::AVPixelFormat::AV_PIX_FMT_RGB24,
@@ -109,7 +135,10 @@ impl VideoDecoder {
                         return Err("sws_getContext failed".into());
                     }
                 }
-                let mut rgb = vec![0u8; width as usize * height as usize * 3];
+                let rgb_len = pixels
+                    .and_then(|pixels| pixels.checked_mul(3))
+                    .ok_or_else(|| "decoded RGB frame size overflow".to_string())?;
+                let mut rgb = vec![0u8; rgb_len];
                 let src_data = [
                     (*self.frame).data[0] as *const u8,
                     (*self.frame).data[1] as *const u8,
@@ -138,8 +167,10 @@ impl VideoDecoder {
                     dst_data.as_ptr(),
                     dst_stride.as_ptr(),
                 );
-                if ret < 0 {
-                    return Err(format!("sws_scale failed: {ret}"));
+                if ret != height as i32 {
+                    return Err(format!(
+                        "sws_scale returned {ret} rows for {height}-row frame"
+                    ));
                 }
                 out.push(rgb);
             }
