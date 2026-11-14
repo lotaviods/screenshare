@@ -432,6 +432,15 @@ async fn handle_sfu_offer(
         "av1" => Codec::Av1,
         _ => return Err(format!("unsupported SFU video codec: {video_codec}")),
     };
+    {
+        // Pinning the codec is a room-level invariant: forwarding is a
+        // payload pass-through, so a viewer with another codec would receive
+        // an undecodable stream.
+        let mut rooms = state.sfu_rooms.lock().unwrap();
+        let room = rooms.get_mut(room_id).ok_or("SFU room not found")?;
+        room.negotiate_video_codec(codec)
+            .map_err(|error| error.to_string())?;
+    }
     let key = sfu_peer_key(room_id, peer_id);
 
     // Check whether a live WebRTC peer already exists for this client. If it

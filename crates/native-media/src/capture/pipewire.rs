@@ -124,6 +124,7 @@ where
 /// Run PipeWire with a preferred capture size and frame rate. The compositor
 /// may negotiate a different supported mode; callers should use the actual
 /// dimensions reported by captured frames as the effective output size.
+#[allow(clippy::too_many_arguments)]
 pub fn run_configured<F>(
     fd: RawFd,
     node_id: u32,

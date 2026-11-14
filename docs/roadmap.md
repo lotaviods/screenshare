@@ -19,12 +19,12 @@ Last updated: 2026-11-14.
 
 | Area | State |
 | --- | --- |
-| Crash on call end | Root cause proven; P0.1 code change implemented, runtime validation pending |
-| Audio stutter | Playback worker/cadence, queue/write reporting, adaptive prebuffer, libopus PLC/FEC and RTP gap recovery implemented; live session unverified |
-| Video decode | Nonblocking overload policy, IDR recovery and self-view JPEG cap implemented in working tree; runtime acceptance pending |
-| Scale to 6-8 | Room policy and WebSocket publish/focus signaling tested; WebRTC RTP pass-through and bounded fan-out primitives tested; peer lifecycle, subscription wiring and scale acceptance remain open |
+| Crash on call end | Root cause proven; P0.1 code landed in `5836c7b`, live PulseAudio lifecycle validation pending |
+| Audio stutter | Playback worker/cadence, queue/write reporting, adaptive prebuffer, libopus PLC/FEC and RTP gap recovery landed in `5836c7b`; live session unverified |
+| Video decode | Nonblocking overload policy, IDR recovery and self-view JPEG cap landed in `5836c7b`; runtime acceptance pending |
+| Scale to 6-8 | Relay SFU forwards real RTP end-to-end and focus switching works in automated 2-3 client tests; mesh remains the default, and subscription teardown, keyframe requests, thumbnails and measurements remain open |
 | Windows | Untested; release gate recorded (D11) |
-| Code changes | P0.1, P0.3-P0.8 foundations, P1.1-P1.4 foundations and SFU policy scaffolding in working tree; not committed |
+| Code changes | Inherited working tree committed as `5836c7b`; SFU media-path tests and the codec pin are in the follow-up commit |
 
 ## Context
 
@@ -76,9 +76,9 @@ A single relay (SFU) is required. This is a product-shaping decision, not an
 optimisation.
 
 ### D5 - The SFU is a relay-only forwarder in Rust
-**Proposed.** Forward already-encoded RTP without transcoding. Preferred
-implementation: `str0m` (Sans-I/O, designed for forwarding) inside the existing
-`server` crate, next to the current signaling and TURN code.
+**Accepted, amended by D18.** Forward already-encoded RTP without transcoding.
+The forwarder lives in the existing `server` crate next to signaling and TURN.
+The transport choice is recorded in D18.
 
 Existing groundwork, so a later reader does not start from zero:
 
@@ -86,8 +86,7 @@ Existing groundwork, so a later reader does not start from zero:
   (`livekit/livekit-server`, profile `sfu`, ports 7880/7881) next to
   `signaling` and `coturn`. It is off by default and no client code uses it.
 - `crates/core/src/types.rs` has `ConnectionMode::Sfu` and the settings UI has
-  an "SFU" button. It is wired to nothing: see `PLAN.md`, "Mesh vs SFU
-  connection-mode plumbing (SFU stub for now)".
+  an "SFU" button. It selects the single-peer SFU client path at runtime.
 - `PLAN.md` and `README.md` both state the intent to keep signaling and media
   decoupled so an SFU can replace the mesh without touching capture/audio.
 
@@ -95,8 +94,8 @@ Why not just use the LiveKit container that is already in the repo: the LiveKit
 Rust SDK takes raw frames (`NativeVideoSource`) and encodes them internally,
 which discards the VAAPI/DMA-BUF pipeline in D6 and changes the negotiated
 codec. LiveKit stays the fallback if running our own SFU turns out to dominate
-the work, but it is a pipeline change, not a drop-in. Decide after the Phase 2
-spike; record the outcome here before writing client code.
+the work, but it is a pipeline change, not a drop-in. The comparison in P2.3 is
+still open.
 
 ### D6 - The client keeps its own capture and encode pipeline
 **Accepted.** VAAPI/DMA-BUF H.264 on Linux and the Windows encoder path stay.
@@ -196,72 +195,127 @@ even when nobody subscribes. If that waste matters, pause the full-quality
 encode when the SFU reports no subscriber; do not build an adaptive layer
 controller before measuring.
 
+### D17 - One video codec per SFU room
+**Accepted.** The relay forwards payload bytes without transcoding (D5), so a
+viewer that negotiated a different video codec than the publisher would receive
+an undecodable stream. The first `SfuOffer` in a room pins the video codec and
+later offers with a different codec are rejected with an explicit signaling
+error. Speakers use Opus in every room, so only video needs the pin. Evidence:
+`SfuRoom::negotiate_video_codec` and
+`server/tests/signaling_integration.rs::sfu_rejects_a_second_video_codec_in_the_same_room`.
+
+### D18 - The relay transport is the shared webrtc-rs peer wrapper
+**Accepted.** The earlier plan preferred `str0m`, but the desktop client
+already relies on `WebRtcPeer` for ICE/DTLS/SRTP and packet pass-through (D2).
+Reusing that wrapper on the server gives one transport stack, one ICE
+implementation and one code path for both legs. The relay is still RTP
+pass-through: `RtpForwarder` copies payloads, sequence numbers and timestamps,
+and only payload type and SSRC are rewritten for the egress leg. The unused
+`str0m` scaffolding was removed. Evidence:
+`server/tests/sfu_relay.rs` (payload/sequence/timestamp survival) and
+`server/tests/sfu_media_e2e.rs` (two clients through live signaling, plus a
+third publisher added by a focus switch).
+
 ## Plan
 
 ### Phase 0 - Stability and audio correctness
 
 Target: no crash, no silent audio loss, no periodic underrun on a 1 h session.
 
-- [ ] P0.1 Reverse the drop order in `Recorder`, `PlaybackSink`, `Mixer`
+- [x] P0.1 Reverse the drop order in `Recorder`, `PlaybackSink`, `Mixer`
       (`crates/audio/src/pulse.rs`); add an explicit idempotent `Drop` and
-      remove the duplicate `disconnect()` in `stop()` + `Drop`.
-- [ ] P0.2 Audit `crates/audio/src/wasapi.rs` for the same class of bug
-      (native handle freed before its owner). Cannot be validated on this host.
-- [ ] P0.3 Playback cadence: schedule against an absolute `next_deadline`
+      remove the duplicate `disconnect()` in `stop()` + `Drop`. Landed
+      2026-11-14 in `5836c7b`; live PulseAudio close/reopen validation is still
+      outstanding.
+- [x] P0.2 Audit `crates/audio/src/wasapi.rs` for the same class of bug
+      (native handle freed before its owner). Landed 2026-11-14 in `5836c7b`
+      (source audit only; runtime validation is Windows-gated).
+- [x] P0.3 Playback cadence: schedule against an absolute `next_deadline`
       (`next_deadline += 20 ms`, loop while behind) instead of
-      `next_chunk = now + 20 ms`. The current form runs slower than the device
-      consumes and guarantees a periodic underrun.
-- [ ] P0.4 Give playback its own thread; do not pace a device from the decode
-      loop's `try_recv` + 5 ms sleep path (`crates/media/src/lib.rs`).
-- [ ] P0.5 Stop silent audio drops: `Framer::push` treats `TrySendError::Full`
+      `next_chunk = now + 20 ms`. Landed 2026-11-14 in `5836c7b`.
+- [x] P0.4 Give playback its own thread; do not pace a device from the decode
+      loop's `try_recv` + 5 ms sleep path (`crates/media/src/lib.rs`). Landed
+      2026-11-14 in `5836c7b`.
+- [x] P0.5 Stop silent audio drops: `Framer::push` treats `TrySendError::Full`
       as success (`crates/audio/src/native/mod.rs`); `PlaybackSink::play`
-      ignores `write_copy` errors. Count and log both.
-- [ ] P0.6 RTP timestamps from `EncodedSample::timestamp_micros` (D9).
-- [ ] P0.7 Adaptive jitter buffer with prebuffer, target and max derived from
+      ignores `write_copy` errors. Count and log both. Landed 2026-11-14 in
+      `5836c7b`.
+- [x] P0.6 RTP timestamps from `EncodedSample::timestamp_micros` (D9). Landed
+      2026-11-14 in `5836c7b`.
+- [x] P0.7 Adaptive jitter buffer with prebuffer, target and max derived from
       observed arrival jitter; remove the "silence + full re-prebuffer" stall
-      after an underrun.
-- [ ] P0.8 Opus: enable in-band FEC and PLC, keep DTX off until measured.
-- [ ] P0.9 Separate audio and video write paths so a video burst cannot delay
-      an audio packet (D7).
+      after an underrun. Landed 2026-11-14 in `5836c7b`; the one-chunk recovery
+      threshold still needs a live jitter measurement to tune.
+- [x] P0.8 Opus: enable in-band FEC and PLC, keep DTX off until measured.
+      Landed 2026-11-14 in `5836c7b`; live packet-loss behaviour is unverified.
+- [x] P0.9 Separate audio and video write paths so a video burst cannot delay
+      an audio packet (D7). Landed 2026-11-14 in `5836c7b` (per-stream hubs and
+      channels; audio waits for capacity, video does not).
 - [ ] P0.10 Lifecycle tests: open/use/close 100x for every audio handle; a
-      decode thread that exits while audio output is open.
+      decode thread that exits while audio output is open. Video and audio
+      decoder lifecycles are covered by `crates/media/tests/decoder_init.rs`
+      (`5836c7b`); audio-device handle cycling still needs a PulseAudio host.
 
 Acceptance: 1 h two-peer session, zero crashes, zero audio queue drops, zero
-playback underruns on a loopback test, counters exported.
+playback underruns on a loopback test, counters exported. `audio_metrics()` and
+`media_metrics()` export the counters; the session itself has not run.
 
 ### Phase 1 - Video resilience
 
-- [ ] P1.1 RTP reader never awaits the decoder queue; drop by policy, never by
-      blocking the track reader.
-- [ ] P1.2 Queue policy that keeps keyframes over stale P-frames.
-- [ ] P1.3 Decoder recovery: on repeated `AVERROR_INVALIDATA`, discard to the
-      next IDR and rebuild the context if it persists.
-- [ ] P1.4 Make the in-call self-view optional (it decodes the full stream
-      again) or cap it to 720p15.
+- [x] P1.1 RTP reader never awaits the decoder queue; drop by policy, never by
+      blocking the track reader. Landed 2026-11-14 in `5836c7b`.
+- [ ] P1.2 Queue policy that keeps keyframes over stale P-frames. The current
+      policy drops the newest packet when the queue is full and waits for the
+      next IDR, which bounds damage but does not prefer an incoming keyframe.
+- [x] P1.3 Decoder recovery: on repeated `AVERROR_INVALIDDATA`, discard to the
+      next IDR and rebuild the context if it persists. Landed 2026-11-14 in
+      `5836c7b`.
+- [x] P1.4 Make the in-call self-view optional (it decodes the full stream
+      again) or cap it to 720p15. The JPEG stage is capped at 15 fps; the
+      optional switch remains a UI decision (open question 4). Landed
+      2026-11-14 in `5836c7b`.
 
 Acceptance: 10 min share, first frame under 1 s after join, decode error rate
-under 1 %, no stuck decoder.
+under 1 %, no stuck decoder. Not measured.
 
 ### Phase 2 - SFU spike
 
-- [ ] P2.1 Relay one screen track plus two audio tracks between three clients
-      through the `server` crate; no transcoding.
+- [x] P2.1 Relay one screen track plus two audio tracks between three clients
+      through the `server` crate; no transcoding. Landed 2026-11-14 in the SFU
+      media-path commit:
+      `server/tests/sfu_relay.rs` proves payload/sequence/timestamp survival
+      through the forwarder, and `server/tests/sfu_media_e2e.rs` drives two
+      real clients through live signaling (screen + mic) and a third publisher
+      added by a focus switch. This is automated coverage, not a manual
+      multi-host session.
 - [ ] P2.2 Measure per-client CPU, memory and one-way latency at 3 peers.
 - [ ] P2.3 Compare against the LiveKit path on paper only: what we would lose
-      from D6, what we would gain in operability. Decide D5.
+      from D6, what we would gain in operability. Decide D5. D5 is accepted and
+      amended by D18 for the transport; the LiveKit comparison is still open.
 
-Acceptance: 3 clients, 10 min, no relay-induced decode errors, decision recorded.
+Acceptance: 3 clients, 10 min, no relay-induced decode errors, decision
+recorded. Media relay is proven in tests; duration, decode-error rate and the
+decision remain open.
 
 ### Phase 3 - Call layer rework
 
-- [ ] P3.1 Replace mesh in `crates/call` with publish/subscribe against the SFU.
+- [ ] P3.1 Replace mesh in `crates/call` with publish/subscribe against the
+      SFU. The SFU path exists and is selected by `ConnectionMode::Sfu`, but
+      mesh is still the default and both topologies coexist.
 - [ ] P3.2 Subscription API and roster integration; join/leave while sharing.
-- [ ] P3.3 Reconnect and keyframe request on subscribe.
-- [ ] P3.4 Keep `crates/webrtc` as the peer wrapper; the SFU changes the
-      topology, not the codec handling.
+      Subscription snapshots drive client renegotiation; join/leave while
+      sharing has only automated control-plane coverage.
+- [ ] P3.3 Reconnect and keyframe request on subscribe. Reconnect handling and
+      PLI/FIR upstream requests are not implemented; a late subscriber waits
+      for the encoder's next IDR.
+- [x] P3.4 Keep `crates/webrtc` as the peer wrapper; the SFU changes the
+      topology, not the codec handling. Confirmed 2026-11-14 (D18).
 - [ ] P3.5 Focus switching: `set_focus(peer_id)` swaps the full-quality
       subscription and requests a keyframe; everyone else stays on the
-      thumbnail track (D15).
+      thumbnail track (D15). The focus swap and the new egress track work in
+      `server/tests/sfu_media_e2e.rs`, but the old subscription keeps
+      forwarding until the publisher unpublishes (bandwidth waste) and no
+      keyframe is requested.
 
 Acceptance: 4 clients on one relay; a late joiner gets video without a manual
 keyframe; leaving mid-share does not disturb the others; focusing a different
@@ -317,86 +371,89 @@ continue without re-deriving the analysis belongs here.
 
 ### State as of 2026-11-14
 
-- P0.1 is implemented in the working tree in `crates/audio/src/pulse.rs`:
-  dependent stream fields drop before `Context`, `Mainloop` drops last, and
-  `PlaybackSink::stop`/`Drop` share an idempotent shutdown path. The crate
-  compiles with `cargo check -p sharescreen-audio`; no live PulseAudio lifecycle
-  test has run. The plan checkbox remains open until the change lands in a
-  commit, per the tracking rule above.
-- P0.3-P0.8 have partial implementation in `crates/audio/src/playback.rs`,
-  `crates/audio/src/native/mod.rs`, `crates/native-media/src/encode/audio.rs`
-  and `crates/webrtc/src/peer.rs`: playback has its own bounded worker and
-  absolute cadence, prebuffer target follows arrival variation and recovers
-  with a one-chunk threshold, queue/write failures are counted, RTP sample
-  timestamps follow encoder PTS, and libopus FEC is configured. PLC, exported
-  underrun/jitter metrics and audio/video scheduling priority remain open.
-- P1.1 is implemented in `crates/media/src/lib.rs`: video RTP enqueue uses
-  `try_send` with a cumulative drop counter; audio enqueue remains awaited to
-  preserve the no-audio-drop decision. On video overflow the decoder waits for
-  an H.264 IDR and recreates its context; after three decode errors it also
-  waits for an IDR before resuming. The self-view JPEG stage is capped at 15
-  fps. Queue stress and 10-minute share acceptance remain unverified.
+- The inherited working tree is committed as `5836c7b` ("feat(media):
+  stabilize audio/video pipelines and scaffold relay SFU"). That commit holds
+  P0.1, P0.2, P0.3-P0.9, P1.1, P1.3, P1.4, the RTP forwarder, the SFU control
+  plane and the initial client SFU path.
+- P0.1: dependent stream fields drop before `Context`, `Mainloop` drops last,
+  and `PlaybackSink::stop`/`Drop` share an idempotent shutdown path. No live
+  PulseAudio close/reopen loop has run.
+- P0.3-P0.9: playback has a bounded worker and absolute cadence, the prebuffer
+  target follows arrival variation and recovers with a one-chunk threshold,
+  queue/write failures are counted, RTP sample timestamps follow encoder PTS,
+  and libopus FEC/PLC is configured. `audio_metrics()` exports device underruns
+  and `media_metrics()` exports video queue drops plus Opus gap/FEC/PLC/silence
+  counters; neither is shown in the UI yet.
+- P1.1/P1.3/P1.4: video RTP enqueue uses `try_send` with a cumulative drop
+  counter; audio enqueue remains awaited. On video overflow the decoder waits
+  for an H.264 IDR and recreates its context; after three decode errors it also
+  waits for an IDR. The self-view JPEG stage is capped at 15 fps. Queue stress
+  and the 10-minute share acceptance remain unverified.
 - P0.2 audit: WASAPI declares the COM guard after the endpoint/client handles,
   so it is dropped last; capture and playback stop their clients in `Drop`.
-  This source inspection found no PulseAudio-style owner ordering defect, but
-  Windows build and device validation are unavailable here.
-- SFU foundation: `str0m` 0.23.1 is a server dependency; `server/src/sfu.rs`
-  configures `RelayPeer` in RTP mode and accepts an SDP offer. `SfuRoom` tracks
-  publications, focus and viewer subscriptions. The signaling protocol now
-  carries publish/unpublish/focus requests, and the server returns per-viewer
-  subscription snapshots; a WebSocket integration test covers the control
-  plane. The client currently ignores those snapshots. No UDP run loop, RTP
-  forwarding, SFU peer lifecycle, or call-layer use exists yet, so this is not
-  an operational SFU and P2/P3 remain open.
-- RTP transport groundwork: `TrackWriter::write_rtp` now sends packetized RTP
-  through a negotiated webrtc-rs track without decoding/repacketizing and
-  remaps payload type and SSRC to the egress leg. A WebRTC loopback test proves
-  payload, sequence and timestamp survive. The server also has bounded
-  `RtpForwarder` queues: audio awaits capacity, video uses nonblocking enqueue
-  and counts drops, with helper tasks for remote source tracks and egress
-  writers. These components are not yet connected to room subscriptions or
-  live WebRTC peers, so they do not make the SFU operational.
-- Client negotiation groundwork: `WebRtcPeer` can add receive-only transceivers
-  and named relay tracks; remote tracks expose their stream and track ids for
-  roster mapping. A unit test confirms a receive-only m-line is offered as
-  `recvonly`. The call layer does not use these APIs yet.
-- Audio loss recovery: `OpusDecoder` dynamically loads libopus for true PLC and
-  in-band FEC, with the FFmpeg decoder retained as a fallback when libopus is
-  unavailable. The media receive loop detects bounded forward RTP sequence
-  gaps, applies PLC for earlier missing packets and FEC from the next packet
-  for the final loss, then decodes that packet normally. Packet gaps, recovered
-  FEC frames, PLC frames and silence fallback frames are counted. Unit tests
-  validate libopus PLC/FEC and sequence wrap/reorder handling; runtime network
-  loss behavior remains unverified.
-- Latest validation: `cargo test --workspace` passed, including mesh/video
-  loopback tests. The added SFU signaling integration test passed separately
-  outside the sandbox (local sockets are blocked inside it). `cargo run -p
-  sharescreen-ui` compiled, initialized Vulkan and opened the UI; it was stopped
-  after startup. No live audio device, multi-client SFU, or long-running call
-  was exercised.
+  No PulseAudio-style owner ordering defect was found, but Windows build and
+  device validation are unavailable here.
+- SFU transport (D18): the server owns one `WebRtcPeer` answerer per
+  participant and forwards already packetized RTP. `server/src/sfu.rs` holds
+  the subscription policy, the codec pin (D17) and the bounded `RtpForwarder`.
+  `server/src/lib.rs` wires publications, focus, per-viewer snapshots, ingress
+  source tasks, egress writers, ICE buffering and cleanup.
+- Proven relay behaviour, 2026-11-14, SFU media-path commit:
+  - `server/tests/sfu_relay.rs` drives publisher -> ingress peer -> forwarder ->
+    egress peer -> subscriber and asserts the payload, sequence number and
+    timestamp survive, with the egress SSRC rewritten.
+  - `server/tests/sfu_media_e2e.rs` drives two real clients through the live
+    WebSocket server (screen + microphone) and a third publisher whose track
+    is added after a focus switch. Both tests run in under a second.
+  - `crates/webrtc/tests/loopback.rs` proves an answerer can pre-register
+    egress tracks and fill the offerer's reserved receive-only slots.
+- The unused `str0m` scaffolding (`RelayPeer`, `str0m` dependency) was removed
+  in the media-path commit; D18 records why.
+- Client negotiation: `WebRtcPeer` adds receive-only transceivers and named
+  relay tracks; remote tracks expose stream/track ids. The call layer now has
+  the `ConnectionMode::Sfu` path with publication, offer/answer, ICE,
+  subscription-driven renegotiation, focus signalling and track attachment.
+  Mesh remains the default.
+- Audio loss recovery: `OpusDecoder` dynamically loads libopus for PLC and FEC,
+  with FFmpeg as fallback. The receive loop detects bounded forward RTP gaps,
+  applies PLC for earlier losses and FEC from the next packet for the final
+  one, and counts gaps/FEC/PLC/silence. Unit tests cover PLC/FEC and sequence
+  wrap/reorder; live loss is unverified.
+- Latest validation: `cargo test --workspace` passes, including the six
+  signaling integration tests, the two SFU media-path tests and the WebRTC
+  loopback tests. `cargo clippy --workspace --all-targets -- -D warnings`
+  passes and `cargo fmt --all` is clean. `sharescreen-ui` starts and opens its
+  Vulkan window; `sharescreen-server` binds `0.0.0.0:8080`. No live audio
+  device, manual multi-host SFU session or long-running call was exercised.
 - The crash diagnosis is proven by core dumps, but the fix has not been checked
-  in a live PulseAudio close/reopen loop. The workspace tests pass.
+  in a live PulseAudio close/reopen loop.
 
 ### Start here (next actions, in order)
 
-1. Complete the SFU transport: drive ICE/DTLS/SRTP through str0m, forward RTP
-   to subscribed peers, and add keyframe requests and relay counters.
-2. Rework `crates/call` to use a single SFU connection, publish the two video
-   encodes and consume subscription snapshots; build the focus/thumbnail UI.
-3. Finish the open audio items (PLC, exported counters and lifecycle tests),
-   shared decode budgeting and capacity measurements.
-4. Run the 1 h and 8-peer acceptance sessions, then complete the Windows build
-   and real-device gates before describing the roadmap as complete.
+1. Make subscriptions shrink: when a viewer's snapshot drops a track, stop its
+   forwarder subscription (and count it). The current code only adds tracks, so
+   a focus swap keeps the old publisher's video flowing until it unpublishes.
+2. Request a keyframe on subscribe/focus (P3.3): send PLI/FIR upstream from the
+   ingress receiver when a new viewer is wired, so the first focused frame does
+   not wait for the encoder's periodic IDR.
+3. Show exported audio/media counters in the call sidebar and run the Phase 0
+   acceptance session on a machine with PulseAudio (1 h, two peers, zero drops).
+4. Measure P2.2 (CPU, memory, one-way latency at 3 peers) and write the P2.3
+   LiveKit comparison.
+5. Rework the call UI/default from mesh to SFU, then implement the two-encode
+   thumbnail track (D16) and the shared decode budget (P4.3).
+6. Run the 8-peer soak and complete the Windows build/device gates.
 
-Do not start Phase 2 before Phase 0 acceptance passes; the SFU would multiply
-the existing defects by the number of participants.
+Do not treat the SFU as production-ready before subscription teardown,
+keyframe requests and a multi-host session exist. The automated tests prove the
+media path, not call quality.
 
 ### Facts a new reader would otherwise re-discover
 
 - `crates/audio/src/pulse.rs` wraps `libpulse-binding`, whose standard
   `Mainloop` is `!Send` and must outlive the `Context` and every stream it
-  created. The P0.1 working-tree change declares dependent fields before the
-  mainloop; live lifecycle validation remains open.
+  created. The fix declares dependent fields before the mainloop; live
+  lifecycle validation remains open.
 - `crates/media/src/lib.rs` spawns one `sharescreen-media` thread per remote
   track. Device pacing now runs on its own bounded playback worker.
 - `crates/media/src/lib.rs` bounds remote RTP at 256 packets. Video uses
@@ -405,17 +462,31 @@ the existing defects by the number of participants.
   per-track monotonic anchor for `rtc::media::Sample.timestamp`.
 - `crates/call/src/hub.rs` broadcasts each sample to every peer sequentially
   (`join_all`), and `crates/call/src/lib.rs` uses 64-slot channels per stream.
+- In SFU mode the client registers its writers under the `__sfu__` key and
+  publishes stable ids (`<self>-mic`, `<self>-system`, `<self>-screen`). The
+  server keys source and forwarder routes by room + publication id.
+- `server/src/lib.rs` sends subscription snapshots only to viewers with an
+  established SFU peer, except while a room has publications. This keeps mesh
+  message ordering intact.
+- The server's answerer pre-registers egress tracks before setting the remote
+  offer; `rtc` maps them onto the receive-only m-lines the client reserved.
+  This is why the client must reserve enough audio/video slots up front.
+- The SFU only adds subscriptions today. A focus swap keeps the previous
+  publisher's track in the forwarder, which wastes bandwidth until unpublish.
 - `rtc` 0.21 exposes send-side simulcast metadata (`RTCRtpEncodingParameters`
   with `rid` and `scale_resolution_down_by`) but does not downscale pre-encoded
   samples, so simulcast would not save an encode for us (D16).
-- The settings UI already has an "SFU" button and `crates/core` has
-  `ConnectionMode::Sfu`; both are stubs with no behaviour behind them.
+- The settings UI has an "SFU" button and `crates/core` has
+  `ConnectionMode::Sfu`; both now select the single-peer SFU path. Mesh remains
+  the config default.
 - Deployment is one host via `deploy/compose.yaml` (signaling + coturn, plus a
   disabled LiveKit `sfu` profile). `/home/usr_jg` is the only validated
   platform.
 - Validation commands: `make test`, `make clippy`, `make fmt`, `make build`.
   Core dumps: `coredumpctl list`, `coredumpctl info <pid>`.
   Logs: `~/.config/sharescreen/sharescreen.log`.
+- Tests that need local sockets can fail inside a restricted sandbox; the full
+  suite (including `sfu_media_e2e`) passes outside it.
 
 ### Rules for continuing this document
 
@@ -591,12 +662,48 @@ the existing defects by the number of participants.
 - Ran both applications: `sharescreen-server` started and bound its listener, and
   `sharescreen-ui` initialized Vulkan and opened its GUI window.
 
+#### Continuation session (after the token-limit handoff)
+
+- Fixed the failing `sfu_renegotiation_reuses_peer_connection_on_new_tracks`
+  test: its offer was empty (no m-lines, therefore no ICE credentials) and it
+  did not tolerate interleaved `SfuIceCandidate`/`SfuSubscriptions` messages.
+  Added `recv_signaling` to the integration test.
+- Committed the inherited working tree as `5836c7b` after a full
+  `cargo test --workspace` pass.
+- Added `crates/webrtc/tests/loopback.rs::answerer_fills_pre_offered_receive_slots`
+  to prove the SFU mapping assumption: an answerer can pre-register send tracks
+  and they fill the offerer's reserved receive-only m-lines.
+- Added `server/tests/sfu_relay.rs`: publisher RTP -> ingress peer ->
+  `RtpForwarder` -> egress peer -> subscriber, asserting payload, sequence and
+  timestamp survive and the egress SSRC is rewritten.
+- Added `server/tests/sfu_media_e2e.rs`: two real clients through the live
+  WebSocket server exchange relayed screen + microphone RTP; a third publisher
+  is added to a viewer after `SetFocus`, and its payload arrives on a new egress
+  track. Both tests pass repeatedly (3 consecutive runs) and run in under a
+  second.
+- Added D17 (one video codec per room) and enforcement in
+  `SfuRoom::negotiate_video_codec`, plus a signaling integration test for a
+  mismatched second codec.
+- Removed the unused `str0m` `RelayPeer` scaffolding and dependency; recorded
+  D18 (relay transport is the shared webrtc-rs wrapper).
+- Added `#[allow(clippy::too_many_arguments)]` to three pre-existing FFI-shaped
+  helpers so `make clippy` (`-D warnings`) passes.
+- Re-ran `cargo test --workspace`, `cargo clippy --workspace --all-targets --
+  -D warnings`, `cargo fmt --all` and `git diff --check`; all pass. Started
+  `sharescreen-ui` (Vulkan window) and `sharescreen-server` (binds :8080).
+- Remaining gaps recorded above: subscription teardown on focus swap, keyframe
+  requests, metrics in the UI, CPU/latency measurements, thumbnail encode,
+  shared decode budget, 8-peer soak and Windows.
+
 ## Not validated
 
 - Windows: no build or runtime check on this host.
 - Multi-peer behaviour: the 3-peer and 8-peer targets are plans, not results.
+  The automated SFU tests cover two clients plus a third focused publisher, not
+  a manual multi-host call.
 - The Discord comparison: no captured session; differences are inferred.
 - Hardware capture/encode failure paths (DMA-BUF, VAAPI, WASAPI) under driver
   error conditions.
-- SFU signaling peers do not yet relay RTP, and candidate buffering still
-  needs flush-on-peer-ready handling.
+- Live PulseAudio close/reopen and audio-jitter measurements.
+- SFU subscription teardown after a focus swap, keyframe requests on subscribe,
+  and relay CPU/memory/latency measurements.

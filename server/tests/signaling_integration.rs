@@ -430,3 +430,64 @@ async fn sfu_renegotiation_reuses_peer_connection_on_new_tracks() {
 
     peer_a.close().await.unwrap();
 }
+
+/// Forwarding is a payload pass-through, so a room is pinned to the first
+/// video codec. A later participant with a different codec must be told why
+/// instead of receiving an undecodable stream.
+#[tokio::test]
+async fn sfu_rejects_a_second_video_codec_in_the_same_room() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let turn = TurnConfig {
+        urls: vec![],
+        secret: "secret".to_string(),
+        ttl_secs: 3600,
+        user: "user".to_string(),
+    };
+    tokio::spawn(async move {
+        axum::serve(listener, app_with(turn)).await.unwrap();
+    });
+
+    let base = format!("ws://{addr}/ws");
+    let mut a = SignalingClient::connect(&format!("{base}?id=a&name=Alice"))
+        .await
+        .unwrap();
+    let mut b = SignalingClient::connect(&format!("{base}?id=b&name=Bob"))
+        .await
+        .unwrap();
+    a.send(SignalMessage::CreateRoom).unwrap();
+    let room_id = match recv_msg(&mut a.incoming).await {
+        SignalMessage::RoomCreated { room_id } => room_id,
+        other => panic!("expected RoomCreated, got {other:?}"),
+    };
+    b.send(SignalMessage::JoinRoom { room_id }).unwrap();
+    let _ = recv_msg(&mut b.incoming).await; // Joined
+    let _ = recv_msg(&mut a.incoming).await; // PeerJoined
+
+    // The malformed SDP is rejected after the codec is pinned, which is the
+    // ordering under test here.
+    a.send(SignalMessage::SfuOffer {
+        sdp: "not-sdp".into(),
+        video_codec: "h264".into(),
+    })
+    .unwrap();
+    match recv_signaling(&mut a.incoming, true).await {
+        SignalMessage::Error { .. } => {}
+        other => panic!("expected an SDP error, got {other:?}"),
+    }
+
+    b.send(SignalMessage::SfuOffer {
+        sdp: "not-sdp".into(),
+        video_codec: "vp8".into(),
+    })
+    .unwrap();
+    match recv_signaling(&mut b.incoming, true).await {
+        SignalMessage::Error { message } => {
+            assert!(
+                message.contains("codec mismatch"),
+                "unexpected error: {message}"
+            );
+        }
+        other => panic!("expected a codec mismatch error, got {other:?}"),
+    }
+}

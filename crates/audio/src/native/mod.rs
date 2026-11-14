@@ -331,6 +331,7 @@ trait Capture {
     fn next(&mut self) -> Option<Vec<i16>>;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_mic(
     device: Option<String>,
     bitrate_kbps: u32,

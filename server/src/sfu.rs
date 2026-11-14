@@ -1,53 +1,15 @@
-//! Subscription policy for the relay SFU.
+//! Subscription policy and bounded fan-out for the relay SFU.
 //!
-//! This module is independent of the network driver so its routing contract
-//! can be tested before the str0m transport is wired in.
+//! The network transport is the same `WebRtcPeer` wrapper the desktop client
+//! uses (D18): the server owns one answerer peer per participant and forwards
+//! already packetized RTP between them.
 
+use sharescreen_core::Codec;
 use sharescreen_webrtc::{RemoteTrack, RtpPacket, TrackWriter};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
-use std::time::Instant;
 use tokio::sync::mpsc;
-
-/// str0m peer configured to accept and emit RTP packets without transcoding.
-/// The signaling and UDP driver attach to this handle in the SFU phase.
-pub struct RelayPeer {
-    pub rtc: str0m::Rtc,
-    pub publications: Vec<PublishedTrack>,
-}
-
-impl RelayPeer {
-    pub fn new() -> Self {
-        let rtc = str0m::Rtc::builder()
-            .set_rtp_mode(true)
-            .build(Instant::now());
-        Self {
-            rtc,
-            publications: Vec::new(),
-        }
-    }
-
-    /// Accept a standards-shaped WebRTC SDP offer from the desktop client.
-    /// The returned SDP is an answer; UDP/ICE polling is driven by the server
-    /// actor that owns this peer.
-    pub fn accept_offer(&mut self, offer_sdp: &str) -> Result<String, String> {
-        let offer = str0m::change::SdpOffer::from_sdp_string(offer_sdp)
-            .map_err(|error| format!("invalid WebRTC offer: {error}"))?;
-        let answer = self
-            .rtc
-            .sdp_api()
-            .accept_offer(offer)
-            .map_err(|error| format!("str0m rejected WebRTC offer: {error}"))?;
-        Ok(answer.to_sdp_string())
-    }
-}
-
-impl Default for RelayPeer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SubscriptionError {
@@ -57,6 +19,8 @@ pub enum SubscriptionError {
     UnknownScreenPublisher,
     #[error("participant is not in this room")]
     UnknownViewer,
+    #[error("video codec mismatch: room uses {expected:?}, client offered {actual:?}")]
+    CodecMismatch { expected: Codec, actual: Codec },
 }
 
 /// Room-scoped publication roster and per-viewer focus selections.
@@ -65,11 +29,34 @@ pub struct SfuRoom {
     publications: BTreeMap<String, PublishedTrack>,
     focus_by_viewer: BTreeMap<String, String>,
     participants: BTreeSet<String>,
+    /// The RTP payload is forwarded without transcoding, so every participant
+    /// must negotiate the same video codec. The first SFU offer fixes it.
+    video_codec: Option<Codec>,
 }
 
 impl SfuRoom {
     pub fn join(&mut self, participant: impl Into<String>) {
         self.participants.insert(participant.into());
+    }
+
+    /// Pin the room to the first offered video codec. A different codec would
+    /// make forwarded payloads undecodable for existing viewers.
+    pub fn negotiate_video_codec(&mut self, codec: Codec) -> Result<(), SubscriptionError> {
+        match self.video_codec {
+            Some(expected) if expected != codec => Err(SubscriptionError::CodecMismatch {
+                expected,
+                actual: codec,
+            }),
+            Some(_) => Ok(()),
+            None => {
+                self.video_codec = Some(codec);
+                Ok(())
+            }
+        }
+    }
+
+    pub fn video_codec(&self) -> Option<Codec> {
+        self.video_codec
     }
 
     pub fn publish(&mut self, track: PublishedTrack) -> Result<(), SubscriptionError> {
@@ -574,21 +561,18 @@ mod tests {
     }
 
     #[test]
-    fn relay_peer_accepts_a_str0m_webrtc_offer() {
-        use std::time::Instant;
-        use str0m::media::{Direction, MediaKind};
-
-        let mut publisher = str0m::Rtc::new(Instant::now());
-        let mut changes = publisher.sdp_api();
-        changes.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
-        let (offer, _) = changes.apply().expect("offer");
-
-        let mut relay = RelayPeer::new();
-        let answer = relay
-            .accept_offer(&offer.to_sdp_string())
-            .expect("str0m should answer the offer");
-        assert!(answer.contains("m=audio"));
-        assert!(answer.starts_with("v=0"));
+    fn room_pins_the_first_video_codec_and_rejects_others() {
+        let mut room = SfuRoom::default();
+        assert_eq!(room.negotiate_video_codec(Codec::H264), Ok(()));
+        assert_eq!(room.negotiate_video_codec(Codec::H264), Ok(()));
+        assert_eq!(
+            room.negotiate_video_codec(Codec::Vp8),
+            Err(SubscriptionError::CodecMismatch {
+                expected: Codec::H264,
+                actual: Codec::Vp8,
+            })
+        );
+        assert_eq!(room.video_codec(), Some(Codec::H264));
     }
 
     #[tokio::test]

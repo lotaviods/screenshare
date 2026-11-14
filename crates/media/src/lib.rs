@@ -162,6 +162,7 @@ impl Decoder {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     kind: RemoteTrackKind,
     codec: Codec,

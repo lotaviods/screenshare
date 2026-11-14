@@ -409,3 +409,120 @@ async fn video_track_uses_the_codec_it_was_created_with() {
     a.close().await.unwrap();
     b.close().await.unwrap();
 }
+
+/// An SFU answers an offer after pre-registering egress tracks. Those tracks
+/// must map onto the receive-only slots the offerer reserved before the offer,
+/// which is what lets the relay start forwarding without a renegotiation.
+#[tokio::test]
+async fn answerer_fills_pre_offered_receive_slots() {
+    let (s_tx, mut s_rx) = mpsc::unbounded_channel::<PeerEvent>();
+    let subscriber = WebRtcPeer::new(
+        PeerConfig::default(),
+        Codec::H264,
+        Arc::new(move |e: PeerEvent| {
+            let _ = s_tx.send(e);
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Subscriber reserves one audio and one video slot before offering.
+    subscriber
+        .add_recvonly_transceiver(RemoteTrackKind::Audio)
+        .await
+        .unwrap();
+    subscriber
+        .add_recvonly_transceiver(RemoteTrackKind::Video)
+        .await
+        .unwrap();
+    let offer = subscriber.create_offer().await.unwrap();
+    subscriber.set_local_description(&offer).await.unwrap();
+    wait_for_gathering(&mut s_rx).await;
+
+    // Relay registers its egress tracks, then answers the offer.
+    let (r_tx, mut r_rx) = mpsc::unbounded_channel::<PeerEvent>();
+    let relay = WebRtcPeer::new(
+        PeerConfig::default(),
+        Codec::H264,
+        Arc::new(move |e: PeerEvent| {
+            let _ = r_tx.send(e);
+        }),
+    )
+    .await
+    .unwrap();
+    let audio = relay
+        .add_relay_track("publisher", "publisher-audio", Codec::Opus)
+        .await
+        .unwrap();
+    let video = relay
+        .add_relay_track("publisher", "publisher-screen", Codec::H264)
+        .await
+        .unwrap();
+    relay
+        .set_remote_description(&subscriber.local_description().await.unwrap())
+        .await
+        .unwrap();
+    let answer = relay.create_answer().await.unwrap();
+    eprintln!("ANSWER SDP:\n{}", answer.sdp);
+    relay.set_local_description(&answer).await.unwrap();
+    wait_for_gathering(&mut r_rx).await;
+
+    subscriber
+        .set_remote_description(&relay.local_description().await.unwrap())
+        .await
+        .unwrap();
+    wait_for_connected(&mut s_rx).await;
+
+    // Both pre-registered tracks must now be deliverable RTP-only streams.
+    let expected_audio = vec![0x11; 16];
+    let expected_video = vec![0x22; 32];
+    let writer_audio = expected_audio.clone();
+    let writer_video = expected_video.clone();
+    tokio::spawn(async move {
+        for tick in 0..50u16 {
+            let _ = audio
+                .write_rtp(RtpPacket {
+                    payload: writer_audio.clone(),
+                    marker: false,
+                    payload_type: 111,
+                    sequence_number: tick,
+                    timestamp: u32::from(tick) * 960,
+                    ssrc: 1,
+                })
+                .await;
+            let _ = video
+                .write_rtp(RtpPacket {
+                    payload: writer_video.clone(),
+                    marker: true,
+                    payload_type: 96,
+                    sequence_number: tick,
+                    timestamp: u32::from(tick) * 3000,
+                    ssrc: 2,
+                })
+                .await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+
+    let mut audio_track = None;
+    let mut video_track_count = 0;
+    while audio_track.is_none() || video_track_count == 0 {
+        match timeout(Duration::from_secs(15), s_rx.recv()).await {
+            Ok(Some(PeerEvent::TrackReceived { track })) => match track.kind().await {
+                RemoteTrackKind::Audio => audio_track = Some(track),
+                RemoteTrackKind::Video => video_track_count += 1,
+            },
+            Ok(Some(_)) => continue,
+            other => panic!("expected two remote tracks, got {other:?}"),
+        }
+    }
+    let audio_track = audio_track.expect("audio slot");
+    let received = timeout(Duration::from_secs(5), audio_track.next_packet())
+        .await
+        .expect("relayed audio packet should arrive")
+        .expect("audio track should stay open");
+    assert_eq!(received.payload, expected_audio);
+
+    subscriber.close().await.unwrap();
+    relay.close().await.unwrap();
+}
