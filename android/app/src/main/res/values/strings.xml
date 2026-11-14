@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">Sharescreen</string>
+    <string name="screen_capture_notification_title">Screen sharing active</string>
+    <string name="screen_capture_notification_text">Sharescreen is broadcasting your screen</string>
+    <string name="screen_capture_channel_name">Screen Capture</string>
+    <string name="screen_capture_channel_description">Used while sharing your screen</string>
+</resources>
