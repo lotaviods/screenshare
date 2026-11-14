@@ -29,7 +29,6 @@ use sharescreen_core::{
 use tokio::sync::mpsc;
 
 /// Deliver ordered video packets without trapping the capture thread during stop.
-#[cfg(test)]
 fn send_while_running(
     sink: &mpsc::Sender<EncodedSample>,
     mut sample: EncodedSample,
