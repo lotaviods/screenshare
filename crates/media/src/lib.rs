@@ -11,10 +11,12 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio::sync::watch;
 
 use sharescreen_audio::Output;
 use sharescreen_core::{Codec, EncodedSample, MediaKind};
@@ -41,7 +43,13 @@ pub struct Decoder {
     frames: Option<Arc<Mutex<Option<Vec<u8>>>>>,
     volume: Arc<Mutex<f64>>,
     tx: mpsc::Sender<Vec<u8>>,
+    stop: watch::Sender<bool>,
 }
+
+/// Caps queued remote RTP at roughly 256 packets per track (about 5 seconds
+/// for 20 ms audio, less for video). `attach` awaits capacity, keeping packet
+/// memory bounded while allowing the WebRTC reader to apply backpressure.
+const REMOTE_RTP_QUEUE: usize = 256;
 
 impl Decoder {
     /// Create a decoder for a remote track of the given kind/codec.
@@ -60,15 +68,28 @@ impl Decoder {
         };
         let running = Arc::new(AtomicBool::new(true));
         let volume = Arc::new(Mutex::new(1.0));
-        let (tx, rx) = mpsc::channel();
+        let (tx, mut rx) = mpsc::channel(REMOTE_RTP_QUEUE);
+        let (stop, _) = watch::channel(false);
 
         let flag = running.clone();
         let volume_slot = volume.clone();
         let frames_slot = frames.clone();
+        let thread_flag = flag.clone();
+        let thread_stop = stop.clone();
         let thread = std::thread::Builder::new()
             .name("sharescreen-media".into())
             .spawn(move || {
-                run(kind, codec, rtp_kind, rx, flag, volume_slot, frames_slot);
+                run(
+                    kind,
+                    codec,
+                    rtp_kind,
+                    &mut rx,
+                    flag,
+                    volume_slot,
+                    frames_slot,
+                );
+                thread_flag.store(false, Ordering::SeqCst);
+                thread_stop.send_replace(true);
             })
             .map_err(|e| MediaError::Pipeline(format!("failed to spawn media thread: {e}")))?;
 
@@ -78,12 +99,17 @@ impl Decoder {
             frames,
             volume,
             tx,
+            stop,
         })
     }
 
     /// Push a full RTP packet into the decoder.
     pub fn push_rtp(&self, bytes: Vec<u8>) {
-        let _ = self.tx.send(bytes);
+        if let Err(error) = self.tx.try_send(bytes) {
+            tracing::debug!(
+                "dropping RTP packet because the decoder queue is full or closed: {error}"
+            );
+        }
     }
 
     /// The latest decoded video frame (JPEG), if any.
@@ -101,6 +127,7 @@ impl Decoder {
     /// Stop the pipeline and release its resources.
     pub fn stop(self) {
         self.running.store(false, Ordering::SeqCst);
+        self.stop.send_replace(true);
         let _ = self.thread.join();
     }
 }
@@ -109,7 +136,7 @@ fn run(
     kind: RemoteTrackKind,
     codec: Codec,
     rtp_kind: RtpKind,
-    rx: Receiver<Vec<u8>>,
+    rx: &mut mpsc::Receiver<Vec<u8>>,
     running: Arc<AtomicBool>,
     volume: Arc<Mutex<f64>>,
     frames: Option<Arc<Mutex<Option<Vec<u8>>>>>,
@@ -209,30 +236,25 @@ fn run(
         }
     };
 
-    // Audio needs a short poll so the playback buffer can emit silence on an
-    // underrun; video only needs to drain the depacketizer promptly.
-    let poll_interval = if kind == RemoteTrackKind::Audio {
-        Duration::from_millis(10)
-    } else {
-        Duration::from_millis(100)
-    };
-
     while running.load(Ordering::SeqCst) {
-        let packet = match rx.recv_timeout(poll_interval) {
-            Ok(packet) => packet,
-            Err(RecvTimeoutError::Timeout) => {
+        match rx.try_recv() {
+            Ok(packet) => {
+                for frame in depacketizer.push(&packet) {
+                    process(&frame, &mut output);
+                }
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => break,
+            Err(mpsc::error::TryRecvError::Empty) => {
                 for frame in depacketizer.flush() {
                     process(&frame, &mut output);
                 }
                 if let Some(output) = output.as_mut() {
                     output.tick();
                 }
-                continue;
+                // Keep stop responsive while still servicing audio during
+                // packet gaps. The media queue itself remains bounded.
+                std::thread::sleep(Duration::from_millis(5));
             }
-            Err(RecvTimeoutError::Disconnected) => break,
-        };
-        for frame in depacketizer.push(&packet) {
-            process(&frame, &mut output);
         }
     }
 }
@@ -259,7 +281,7 @@ fn codec_name(codec: Codec) -> &'static str {
 /// cannot be queued resets the decoder and lets it resynchronize.
 pub struct LocalPreview {
     running: Arc<AtomicBool>,
-    tx: mpsc::SyncSender<EncodedSample>,
+    tx: std_mpsc::SyncSender<EncodedSample>,
     frames: Arc<Mutex<Option<Vec<u8>>>>,
     /// Set by every poll, cleared when the worker produces a frame: keeps the
     /// JPEG stage from outrunning the UI.
@@ -286,7 +308,7 @@ impl LocalPreview {
         let frames = Arc::new(Mutex::new(None));
         let consumed = Arc::new(AtomicBool::new(true));
         let demand = Arc::new(Demand::new());
-        let (tx, rx) = mpsc::sync_channel(PREVIEW_QUEUE);
+        let (tx, rx) = std_mpsc::sync_channel(PREVIEW_QUEUE);
 
         let flag = running.clone();
         let slot = frames.clone();
@@ -344,7 +366,7 @@ impl Drop for LocalPreview {
 }
 
 fn preview_loop(
-    rx: mpsc::Receiver<EncodedSample>,
+    rx: std_mpsc::Receiver<EncodedSample>,
     running: Arc<AtomicBool>,
     frames: Arc<Mutex<Option<Vec<u8>>>>,
     consumed: Arc<AtomicBool>,
@@ -365,8 +387,8 @@ fn preview_loop(
     while running.load(Ordering::SeqCst) {
         let sample = match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(sample) => sample,
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => break,
+            Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
         };
         if !demand.wanted() {
             // Nobody is looking: drop the decoder so a later request starts
@@ -440,6 +462,10 @@ fn preview_loop(
 
 /// Decodes remote tracks and exposes the results to the UI.
 pub struct RemoteMedia {
+    inner: Arc<RemoteMediaInner>,
+}
+
+struct RemoteMediaInner {
     tracks: RwLock<HashMap<String, TrackHandle>>,
     frames: RwLock<HashMap<String, SharedFrame>>,
     counter: std::sync::atomic::AtomicU64,
@@ -462,9 +488,11 @@ impl Default for RemoteMedia {
 impl RemoteMedia {
     pub fn new() -> Self {
         Self {
-            tracks: RwLock::new(HashMap::new()),
-            frames: RwLock::new(HashMap::new()),
-            counter: std::sync::atomic::AtomicU64::new(0),
+            inner: Arc::new(RemoteMediaInner {
+                tracks: RwLock::new(HashMap::new()),
+                frames: RwLock::new(HashMap::new()),
+                counter: std::sync::atomic::AtomicU64::new(0),
+            }),
         }
     }
 
@@ -473,11 +501,15 @@ impl RemoteMedia {
         let kind = track.kind().await;
         let codec = track.codec().await.unwrap_or(Codec::Opus);
         tracing::info!("remote track from {peer_id}: kind={kind:?} codec={codec:?}");
-        let key = format!("{peer_id}#{}", self.counter.fetch_add(1, Ordering::Relaxed));
+        let key = format!(
+            "{peer_id}#{}",
+            self.inner.counter.fetch_add(1, Ordering::Relaxed)
+        );
 
         let decoder = Decoder::new(kind, codec)?;
         if let Some(slot) = decoder.frames.clone() {
-            self.frames
+            self.inner
+                .frames
                 .write()
                 .unwrap()
                 .insert(peer_id.to_string(), slot);
@@ -485,16 +517,29 @@ impl RemoteMedia {
 
         let running = decoder.running.clone();
         let tx = decoder.tx.clone();
+        let mut stop = decoder.stop.subscribe();
+        let inner = Arc::downgrade(&self.inner);
+        let cleanup_key = key.clone();
         tokio::spawn(async move {
-            while running.load(Ordering::SeqCst) {
-                let Some(packet) = track.next_packet().await else {
-                    break;
+            loop {
+                let packet = tokio::select! {
+                    _ = stop.changed() => break,
+                    packet = track.next_packet() => packet,
                 };
-                let _ = tx.send(packet.to_bytes());
+                let Some(packet) = packet else { break };
+                if !running.load(Ordering::SeqCst) {
+                    break;
+                }
+                if tx.send(packet.to_bytes()).await.is_err() {
+                    break;
+                }
+            }
+            if let Some(inner) = inner.upgrade() {
+                stop_track(&inner, &cleanup_key);
             }
         });
 
-        self.tracks.write().unwrap().insert(
+        self.inner.tracks.write().unwrap().insert(
             key,
             TrackHandle {
                 peer_id: peer_id.to_string(),
@@ -508,6 +553,7 @@ impl RemoteMedia {
     /// Stop and drop every track belonging to a peer.
     pub fn detach(&self, peer_id: &str) {
         let keys: Vec<String> = self
+            .inner
             .tracks
             .read()
             .unwrap()
@@ -517,16 +563,13 @@ impl RemoteMedia {
             .collect();
 
         for key in keys {
-            if let Some(handle) = self.tracks.write().unwrap().remove(&key) {
-                handle.decoder.stop();
-            }
+            stop_track(&self.inner, &key);
         }
-        self.frames.write().unwrap().remove(peer_id);
     }
 
     /// The latest decoded video frame (JPEG) for a peer, if any.
     pub fn latest_frame(&self, peer_id: &str) -> Option<Vec<u8>> {
-        let frames = self.frames.read().unwrap();
+        let frames = self.inner.frames.read().unwrap();
         let slot = frames.get(peer_id)?;
         let guard = slot.lock().unwrap();
         guard.clone()
@@ -534,7 +577,7 @@ impl RemoteMedia {
 
     /// Set the playback volume (0.0..=2.0) for a peer's audio.
     pub fn set_peer_volume(&self, peer_id: &str, volume: f64) {
-        for handle in self.tracks.read().unwrap().values() {
+        for handle in self.inner.tracks.read().unwrap().values() {
             if handle.peer_id != peer_id || handle.kind != RemoteTrackKind::Audio {
                 continue;
             }
@@ -544,7 +587,31 @@ impl RemoteMedia {
 
     /// Number of attached tracks.
     pub fn track_count(&self) -> usize {
-        self.tracks.read().unwrap().len()
+        self.inner.tracks.read().unwrap().len()
+    }
+}
+
+fn stop_track(inner: &RemoteMediaInner, key: &str) {
+    let handle = inner.tracks.write().unwrap().remove(key);
+    let Some(handle) = handle else { return };
+    let peer_id = handle.peer_id.clone();
+    let removed_frame = handle.decoder.frames.clone();
+    handle.decoder.stop();
+    let has_video = inner
+        .tracks
+        .read()
+        .unwrap()
+        .values()
+        .any(|track| track.peer_id == peer_id && track.kind == RemoteTrackKind::Video);
+    if !has_video {
+        let mut frames = inner.frames.write().unwrap();
+        let is_removed_track_frame = frames
+            .get(&peer_id)
+            .zip(removed_frame.as_ref())
+            .is_some_and(|(current, removed)| Arc::ptr_eq(current, removed));
+        if is_removed_track_frame {
+            frames.remove(&peer_id);
+        }
     }
 }
 
