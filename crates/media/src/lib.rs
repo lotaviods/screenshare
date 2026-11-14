@@ -44,12 +44,20 @@ pub struct Decoder {
     volume: Arc<Mutex<f64>>,
     tx: mpsc::Sender<Vec<u8>>,
     stop: watch::Sender<bool>,
+    /// Set while the video decoder has not produced a frame since the last
+    /// failure. `attach` asks the sender for a keyframe while it is set.
+    needs_keyframe: Arc<AtomicBool>,
 }
 
 /// Caps queued remote RTP at roughly 256 packets per track (about 5 seconds
 /// for 20 ms audio, less for video). `attach` awaits capacity, keeping packet
 /// memory bounded while allowing the WebRTC reader to apply backpressure.
 const REMOTE_RTP_QUEUE: usize = 256;
+
+/// How often a stalled video track asks the sender for a keyframe. The first
+/// request goes out with the track bind; this is the retry while nothing is
+/// decodable yet.
+const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(500);
 
 impl Decoder {
     /// Create a decoder for a remote track of the given kind/codec.
@@ -68,12 +76,15 @@ impl Decoder {
         };
         let running = Arc::new(AtomicBool::new(true));
         let volume = Arc::new(Mutex::new(1.0));
+        // A video decoder starts out unable to decode until it sees SPS/PPS.
+        let needs_keyframe = Arc::new(AtomicBool::new(kind == RemoteTrackKind::Video));
         let (tx, mut rx) = mpsc::channel(REMOTE_RTP_QUEUE);
         let (stop, _) = watch::channel(false);
 
         let flag = running.clone();
         let volume_slot = volume.clone();
         let frames_slot = frames.clone();
+        let keyframe_slot = needs_keyframe.clone();
         let thread_flag = flag.clone();
         let thread_stop = stop.clone();
         let thread = std::thread::Builder::new()
@@ -87,6 +98,7 @@ impl Decoder {
                     flag,
                     volume_slot,
                     frames_slot,
+                    keyframe_slot,
                 );
                 thread_flag.store(false, Ordering::SeqCst);
                 thread_stop.send_replace(true);
@@ -100,6 +112,7 @@ impl Decoder {
             volume,
             tx,
             stop,
+            needs_keyframe,
         })
     }
 
@@ -140,6 +153,7 @@ fn run(
     running: Arc<AtomicBool>,
     volume: Arc<Mutex<f64>>,
     frames: Option<Arc<Mutex<Option<Vec<u8>>>>>,
+    needs_keyframe: Arc<AtomicBool>,
 ) {
     let mut depacketizer = RtpDepacketizer::new(rtp_kind);
     let mut video = if kind == RemoteTrackKind::Video {
@@ -185,6 +199,7 @@ fn run(
     };
 
     let mut decoded = 0u64;
+    let mut warned_keyframe = false;
     // `output` is passed in instead of captured so the receive timeout can
     // also pump the playback buffer while no packets arrive.
     let mut process = |frame: &[u8], output: &mut Option<Output>| match kind {
@@ -194,6 +209,12 @@ fn run(
             };
             match video.decode(frame) {
                 Ok(rgb_frames) => {
+                    if rgb_frames.is_empty() {
+                        return;
+                    }
+                    // Decoding again proves the reference frames are in sync.
+                    needs_keyframe.store(false, Ordering::Release);
+                    warned_keyframe = false;
                     for rgb in rgb_frames {
                         match jpeg.encode(&rgb, video.width(), video.height()) {
                             Ok(jpeg) => {
@@ -212,7 +233,18 @@ fn run(
                         }
                     }
                 }
-                Err(e) => tracing::warn!("video decode failed: {e}"),
+                Err(e) => {
+                    // Without a decodable reference the decoder is stuck; ask
+                    // the sender for a fresh IDR (SPS/PPS included) instead of
+                    // log-spamming one warning per slice.
+                    needs_keyframe.store(true, Ordering::Release);
+                    if warned_keyframe {
+                        tracing::debug!("video decode failed: {e}");
+                    } else {
+                        warned_keyframe = true;
+                        tracing::warn!("video decode failed, requesting a keyframe: {e}");
+                    }
+                }
             }
         }
         RemoteTrackKind::Audio => {
@@ -517,16 +549,35 @@ impl RemoteMedia {
 
         let running = decoder.running.clone();
         let tx = decoder.tx.clone();
+        // Video starts undecodable until SPS/PPS arrive; ask again while it is.
+        let needs_keyframe = decoder.needs_keyframe.clone();
         let mut stop = decoder.stop.subscribe();
         let inner = Arc::downgrade(&self.inner);
         let cleanup_key = key.clone();
         tokio::spawn(async move {
+            // SSRC of this stream, taken from RTP as soon as it arrives so a
+            // PLI does not depend on the SDP carrying SSRC attributes.
+            let mut media_ssrc = None;
+            let mut retry = tokio::time::interval_at(
+                tokio::time::Instant::now() + KEYFRAME_REQUEST_INTERVAL,
+                KEYFRAME_REQUEST_INTERVAL,
+            );
+            retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 let packet = tokio::select! {
                     _ = stop.changed() => break,
+                    _ = retry.tick() => {
+                        if needs_keyframe.load(Ordering::Acquire) {
+                            if let Err(e) = track.request_keyframe(media_ssrc).await {
+                                tracing::debug!("keyframe request failed: {e}");
+                            }
+                        }
+                        continue;
+                    }
                     packet = track.next_packet() => packet,
                 };
                 let Some(packet) = packet else { break };
+                media_ssrc = Some(packet.ssrc);
                 if !running.load(Ordering::SeqCst) {
                     break;
                 }
@@ -666,6 +717,23 @@ mod tests {
         }
         let frame = frame.expect("a decoded JPEG frame");
         assert_eq!(&frame[0..2], &[0xff, 0xd8], "not a JPEG");
+        // A decoded frame proves the decoder resynchronized, so the keyframe
+        // retry loop must stop asking the sender.
+        assert!(!decoder.needs_keyframe.load(Ordering::Acquire));
+        decoder.stop();
+    }
+
+    #[test]
+    fn undecodable_video_asks_for_a_keyframe() {
+        let decoder = Decoder::new(RemoteTrackKind::Video, Codec::H264).unwrap();
+        assert!(decoder.needs_keyframe.load(Ordering::Acquire));
+        let mut rtp = vec![0u8; 12];
+        rtp[1] = 96;
+        // Slice NAL without SPS/PPS, the shape a mid-GOP join sees.
+        rtp.extend_from_slice(&[0x65, 0x88, 0x84, 0x00]);
+        decoder.push_rtp(rtp);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(decoder.needs_keyframe.load(Ordering::Acquire));
         decoder.stop();
     }
 }

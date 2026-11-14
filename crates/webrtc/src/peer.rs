@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use rtc::interceptor::Registry;
+use rtc::interceptor::{IntervalPliInterceptor, Registry, Slot};
 use rtc::media::Sample;
 use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
@@ -14,6 +14,7 @@ use rtc::peer_connection::configuration::media_engine::MediaEngine;
 use rtc::peer_connection::configuration::RTCConfigurationBuilder;
 use rtc::peer_connection::sdp::RTCSessionDescription;
 use rtc::peer_connection::transport::{RTCIceCandidateInit, RTCIceServer};
+use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use rtc::rtp_transceiver::rtp_sender::{
     RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind,
 };
@@ -145,6 +146,38 @@ impl RemoteTrack {
             }
         }
     }
+
+    /// Ask the remote sender for a keyframe (RTCP PLI).
+    ///
+    /// A receiver that joins mid-GOP, or loses the initial keyframe before
+    /// DTLS is up, cannot decode until the sender emits another IDR with its
+    /// SPS/PPS. Senders such as Android only do that when asked.
+    ///
+    /// `media_ssrc` is the SSRC of the RTP stream already seen on this track;
+    /// it is preferred over the negotiated coding because some peers omit SSRC
+    /// attributes from the SDP.
+    pub async fn request_keyframe(&self, media_ssrc: Option<u32>) -> Result<()> {
+        let media_ssrc = match media_ssrc {
+            Some(ssrc) => ssrc,
+            None => match self
+                .inner
+                .codings()
+                .await
+                .first()
+                .and_then(|coding| coding.rtp_coding_parameters.ssrc)
+            {
+                Some(ssrc) => ssrc,
+                None => return Ok(()),
+            },
+        };
+        self.inner
+            .write_rtcp(vec![Box::new(PictureLossIndication {
+                sender_ssrc: 0,
+                media_ssrc,
+            })])
+            .await?;
+        Ok(())
+    }
 }
 
 /// Map an RTP codec mime type onto the crate's codec vocabulary.
@@ -249,6 +282,23 @@ impl PeerConnectionEventHandler for Handler {
     }
 }
 
+/// Build the codec set and interceptor chain for a peer connection.
+fn media_and_registry(video_codec: Codec) -> Result<(MediaEngine, Registry)> {
+    let mut media_engine = MediaEngine::default();
+    codec::register_default_codecs(&mut media_engine, video_codec)?;
+    let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
+    // The default chain never asks the remote for a keyframe. Senders that
+    // only emit an IDR on request (Android) would then be undecodable when
+    // their first keyframe is dropped before DTLS is up. A zero interval
+    // sends one PLI as soon as a video stream is bound, without forcing
+    // periodic keyframes; the media crate asks again if decoding stalls.
+    let registry = registry.with(
+        Slot::IntervalPli,
+        IntervalPliInterceptor::new(Duration::ZERO),
+    );
+    Ok((media_engine, registry))
+}
+
 impl WebRtcPeer {
     /// Most recent STUN round-trip time for the selected ICE pair, in milliseconds.
     /// This is network RTT to this peer, not one-way audio or video latency.
@@ -278,9 +328,7 @@ impl WebRtcPeer {
         video_codec: Codec,
         events: Arc<dyn Fn(PeerEvent) + Send + Sync>,
     ) -> Result<Self> {
-        let mut media_engine = MediaEngine::default();
-        codec::register_default_codecs(&mut media_engine, video_codec)?;
-        let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
+        let (media_engine, registry) = media_and_registry(video_codec)?;
 
         let ice_servers = config
             .ice_servers
@@ -506,4 +554,21 @@ fn next_ssrc() -> u32 {
         AtomicU32::new(seed)
     });
     counter.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interceptor_chain_requests_a_keyframe_on_bind() {
+        let (_, registry) = media_and_registry(Codec::H264).unwrap();
+        let slots = registry.slots();
+        assert!(
+            slots
+                .iter()
+                .any(|(slot, name)| *slot == Slot::IntervalPli && name == "IntervalPliInterceptor"),
+            "PLI interceptor missing from {slots:?}"
+        );
+    }
 }
