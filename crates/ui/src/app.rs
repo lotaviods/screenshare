@@ -30,6 +30,9 @@ const DANGER: u32 = 0xe05561;
 const OK: u32 = 0x46c18a;
 const AMBER: u32 = 0xd8a24a;
 
+/// Frames waiting for a render to release their GPUI atlas tile.
+const MAX_STALE_FRAMES: usize = 8;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Home,
@@ -111,6 +114,11 @@ pub struct AppView {
 
     remote_frames: HashMap<String, Arc<RenderImage>>,
     local_frame: Option<Arc<RenderImage>>,
+    /// Frames that are no longer drawn. GPUI keeps one sprite-atlas tile per
+    /// `RenderImage` id until `drop_image`, so without this every decoded frame
+    /// would leak a full-resolution texture. Drained in `render`, where the
+    /// window handle needed to release the tile is available.
+    stale_frames: Vec<Arc<RenderImage>>,
     focused_share: Option<ShareId>,
     pip_window: Option<WindowHandle<PipView>>,
     pip_entity: Option<Entity<PipView>>,
@@ -166,6 +174,7 @@ impl AppView {
             monitors: Vec::new(),
             remote_frames: HashMap::new(),
             local_frame: None,
+            stale_frames: Vec::new(),
             focused_share: None,
             pip_window: None,
             pip_entity: None,
@@ -318,11 +327,37 @@ impl AppView {
     }
 
     fn forget_remote_share(&mut self, peer: &str) {
-        self.remote_frames.remove(peer);
+        if let Some(frame) = self.remote_frames.remove(peer) {
+            self.queue_stale(frame);
+        }
         if self.focused_share == Some(ShareId::Remote(peer.to_owned())) {
             self.focused_share = None;
         }
         self.backend.send(Command::ForgetRemote(peer.to_owned()));
+    }
+
+    /// Release every remote frame still held by the UI.
+    fn retire_remote_frames(&mut self) {
+        for frame in std::mem::take(&mut self.remote_frames).into_values() {
+            self.queue_stale(frame);
+        }
+    }
+
+    /// Release the local self-view frame, if any.
+    fn retire_local_frame(&mut self) {
+        if let Some(frame) = self.local_frame.take() {
+            self.queue_stale(frame);
+        }
+    }
+
+    /// Hold a frame until the next render can release its atlas tile.
+    fn queue_stale(&mut self, frame: Arc<RenderImage>) {
+        if self.stale_frames.len() >= MAX_STALE_FRAMES {
+            // shortcut: a window that stops rendering keeps its atlas tiles;
+            // evicting the oldest frame bounds CPU memory in that case.
+            self.stale_frames.remove(0);
+        }
+        self.stale_frames.push(frame);
     }
 
     fn toggle_share_focus(&mut self, share: ShareId, cx: &mut Context<Self>) {
@@ -553,9 +588,9 @@ impl AppView {
                     }
                     self.room_id = None;
                     self.participants.clear();
-                    self.remote_frames.clear();
+                    self.retire_remote_frames();
                     self.focused_share = None;
-                    self.local_frame = None;
+                    self.retire_local_frame();
                 }
             }
             UiEvent::Call(event) => self.handle_call_event(event, cx),
@@ -596,7 +631,7 @@ impl AppView {
             UiEvent::Sharing(on) => {
                 self.sharing = on;
                 if !on {
-                    self.local_frame = None;
+                    self.retire_local_frame();
                     self.encoder_notice = None;
                     if self.focused_share == Some(ShareId::Local) {
                         self.focused_share = None;
@@ -608,17 +643,24 @@ impl AppView {
                     // Accept the frame even if the participant update has not
                     // arrived yet; the map is only read for peers that are
                     // currently sharing, and cleared when sharing stops.
-                    if let Some(frame) = frame {
-                        self.remote_frames.insert(peer, frame);
-                    } else {
-                        self.remote_frames.remove(&peer);
+                    let stale = match frame {
+                        Some(frame) => self.remote_frames.insert(peer, frame),
+                        None => self.remote_frames.remove(&peer),
+                    };
+                    if let Some(stale) = stale {
+                        self.queue_stale(stale);
                     }
                 }
-                FrameKind::Local => self.local_frame = frame,
+                FrameKind::Local => {
+                    if let Some(stale) = std::mem::replace(&mut self.local_frame, frame) {
+                        self.queue_stale(stale);
+                    }
+                }
                 FrameKind::Pip => {
                     if let Some(pip) = &self.pip_entity {
                         pip.update(cx, |pip, cx| {
-                            pip.frame = frame;
+                            let stale = std::mem::replace(&mut pip.frame, frame);
+                            pip.retire(stale);
                             cx.notify();
                         });
                     }
@@ -644,9 +686,9 @@ impl AppView {
                 self.peer_rtt.clear();
                 self.rtt_history.clear();
                 self.participants.clear();
-                self.remote_frames.clear();
+                self.retire_remote_frames();
                 self.focused_share = None;
-                self.local_frame = None;
+                self.retire_local_frame();
                 self.screen = Screen::Home;
             }
             CallEvent::ParticipantJoined { participant }
@@ -720,9 +762,9 @@ impl AppView {
         self.resume_system = false;
         self.resume_share = false;
         self.participants.clear();
-        self.remote_frames.clear();
+        self.retire_remote_frames();
         self.focused_share = None;
-        self.local_frame = None;
+        self.retire_local_frame();
         self.screen = Screen::Home;
         cx.notify();
     }
@@ -827,7 +869,7 @@ impl AppView {
         if self.sharing {
             self.backend.send(Command::StopShare);
             self.sharing = false;
-            self.local_frame = None;
+            self.retire_local_frame();
         }
         if self.mic_on {
             self.backend.send(Command::StopMic);
@@ -953,9 +995,9 @@ impl AppView {
         self.peer_rtt.clear();
         self.rtt_history.clear();
         self.participants.clear();
-        self.remote_frames.clear();
+        self.retire_remote_frames();
         self.focused_share = None;
-        self.local_frame = None;
+        self.retire_local_frame();
         self.screen = Screen::Home;
         cx.notify();
     }
@@ -966,9 +1008,9 @@ impl AppView {
         self.peer_rtt.clear();
         self.rtt_history.clear();
         self.participants.clear();
-        self.remote_frames.clear();
+        self.retire_remote_frames();
         self.focused_share = None;
-        self.local_frame = None;
+        self.retire_local_frame();
         self.screen = Screen::Home;
         cx.notify();
     }
@@ -1050,7 +1092,11 @@ impl AppView {
             return;
         }
         let app = cx.entity().downgrade();
-        let pip = cx.new(|_| PipView { frame: None, app });
+        let pip = cx.new(|_| PipView {
+            frame: None,
+            stale_frames: Vec::new(),
+            app,
+        });
         let bounds = Bounds::centered(None, size(px(480.), px(270.)), cx);
         let handle = cx
             .open_window(
@@ -2274,7 +2320,12 @@ impl AppView {
 }
 
 impl Render for AppView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Frames replaced or cleared since the last paint are no longer in the
+        // scene; release their atlas tiles before drawing the new ones.
+        for frame in std::mem::take(&mut self.stale_frames) {
+            cx.drop_image(frame, Some(window));
+        }
         let mut root = div()
             .size_full()
             .flex()
@@ -2304,11 +2355,25 @@ impl Render for AppView {
 
 pub struct PipView {
     frame: Option<Arc<RenderImage>>,
+    /// Frames replaced before they could be released; drained in `render`.
+    stale_frames: Vec<Arc<RenderImage>>,
     app: WeakEntity<AppView>,
 }
 
+impl PipView {
+    /// Queue a frame for atlas release on the next render.
+    fn retire(&mut self, frame: Option<Arc<RenderImage>>) {
+        if let Some(frame) = frame {
+            self.stale_frames.push(frame);
+        }
+    }
+}
+
 impl Render for PipView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        for frame in std::mem::take(&mut self.stale_frames) {
+            cx.drop_image(frame, Some(window));
+        }
         let content = match &self.frame {
             Some(frame) => img(frame.clone())
                 .object_fit(ObjectFit::Contain)
