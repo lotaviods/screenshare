@@ -1896,7 +1896,7 @@ impl AppView {
                             div()
                                 .text_sm()
                                 .text_color(rgb(MUTED))
-                                .child("Noise suppression uses WebRTC DSP (high). Echo cancellation uses the system output as its reference."),
+                                .child("Noise suppression uses WebRTC DSP (moderate). Echo cancellation uses the system output as its reference."),
                         )
                         .child(
                             div()

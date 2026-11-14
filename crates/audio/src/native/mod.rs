@@ -116,7 +116,10 @@ impl Framer {
                     high_pass_filter: Some(HighPassFilter::default()),
                     echo_canceller: echo_reference.then(EchoCanceller::default),
                     noise_suppression: noise_suppression.then(|| NoiseSuppression {
-                        level: NoiseSuppressionLevel::High,
+                        // Moderate suppression is less likely to introduce
+                        // metallic artifacts on speech than the aggressive
+                        // high setting while still reducing steady noise.
+                        level: NoiseSuppressionLevel::Moderate,
                         ..NoiseSuppression::default()
                     }),
                     ..DspConfig::default()
