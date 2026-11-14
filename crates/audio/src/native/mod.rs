@@ -24,6 +24,12 @@ use sonora::config::{
 use sonora::{AudioProcessing, Config as DspConfig, StreamConfig};
 use tokio::sync::mpsc;
 
+static AUDIO_QUEUE_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn queue_drops() -> u64 {
+    AUDIO_QUEUE_DROPS.load(Ordering::Relaxed)
+}
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(windows)]
@@ -207,7 +213,16 @@ impl Framer {
                     keyframe: false,
                 };
                 match sink.try_send(sample) {
-                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        let drops = AUDIO_QUEUE_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
+                        if drops == 1 || drops.is_multiple_of(100) {
+                            tracing::warn!(
+                                drops,
+                                "dropping encoded audio frame: call queue is full"
+                            );
+                        }
+                    }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         return Err("audio consumer disconnected".into())
                     }

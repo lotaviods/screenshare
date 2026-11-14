@@ -15,6 +15,7 @@ const CHANNELS: usize = 2;
 fn sine_frame(phase: &mut f64) -> Vec<i16> {
     let step = 2.0 * std::f64::consts::PI * FREQUENCY / SAMPLE_RATE;
     let mut pcm = vec![0i16; FRAMES_PER_PACKET * CHANNELS];
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     for frame in pcm.chunks_exact_mut(CHANNELS) {
         let sample = (*phase).sin() * AMPLITUDE * i16::MAX as f64;
         frame.fill(sample as i16);
@@ -82,4 +83,36 @@ fn decoded_opus_packets_have_plausible_pcm_levels() {
         "decoded PCM RMS {level:.0} is not a plausible sine level; \
          the decoder output is probably not converted to S16"
     );
+}
+
+#[test]
+fn libopus_decoder_conceals_a_missing_packet_and_decodes_fec() {
+    let mut encoder = OpusEncoder::new(96).expect("FFmpeg has an Opus encoder");
+    if !encoder.fec_enabled() {
+        eprintln!("FFmpeg selected an encoder without libopus FEC; skipping");
+        return;
+    }
+    let mut decoder = OpusDecoder::new().expect("Opus decoder");
+    if !decoder.supports_loss_recovery() {
+        eprintln!("standalone libopus was unavailable; FFmpeg fallback has no PLC API");
+        return;
+    }
+
+    let mut phase = 0.0;
+    let first = encoder.encode(&sine_frame(&mut phase)).unwrap().unwrap();
+    let lost = encoder.encode(&sine_frame(&mut phase)).unwrap().unwrap();
+    let following = encoder.encode(&sine_frame(&mut phase)).unwrap().unwrap();
+
+    decoder.decode(&first.data).expect("prime decoder");
+    let concealed = decoder.conceal(FRAMES_PER_PACKET).expect("PLC");
+    assert_eq!(concealed.len(), FRAMES_PER_PACKET * CHANNELS);
+    let recovered = decoder
+        .decode_fec(&following.data, FRAMES_PER_PACKET)
+        .expect("decode in-band FEC");
+    assert_eq!(recovered.len(), FRAMES_PER_PACKET * CHANNELS);
+    let normal = decoder
+        .decode(&following.data)
+        .expect("decode following packet normally");
+    assert_eq!(normal.len(), FRAMES_PER_PACKET * CHANNELS);
+    assert!(!lost.data.is_empty());
 }

@@ -286,9 +286,12 @@ fn record(
 
 /// A recording stream owned by one capture thread.
 pub(crate) struct Recorder {
-    mainloop: Mainloop,
-    context: Context,
     input: Input,
+    context: Context,
+    stopped: bool,
+    // Must be declared after every object that borrows the mainloop API:
+    // Rust drops fields in declaration order, so this is destroyed last.
+    mainloop: Mainloop,
 }
 
 impl Recorder {
@@ -335,9 +338,10 @@ impl Recorder {
     ) -> Result<Self, String> {
         let input = record(&mut context, device.as_deref(), monitor)?;
         Ok(Self {
-            mainloop,
-            context,
             input,
+            context,
+            mainloop,
+            stopped: false,
         })
     }
 
@@ -355,16 +359,22 @@ impl Recorder {
 
 impl Drop for Recorder {
     fn drop(&mut self) {
+        if self.stopped {
+            return;
+        }
         let _ = self.input.stream.borrow_mut().disconnect();
         self.context.disconnect();
+        self.stopped = true;
     }
 }
 
 /// Plays remote audio on a PulseAudio output device.
 pub(crate) struct PlaybackSink {
-    mainloop: Mainloop,
-    context: Context,
     stream: PulseStream,
+    context: Context,
+    stopped: bool,
+    // Mainloop owns the API borrowed by context and stream; keep it last.
+    mainloop: Mainloop,
 }
 
 impl PlaybackSink {
@@ -410,40 +420,53 @@ impl PlaybackSink {
             )
             .map_err(|e| format!("failed to connect playback: {e}"))?;
         Ok(Self {
-            mainloop,
-            context,
             stream,
+            context,
+            mainloop,
+            stopped: false,
         })
     }
 
     /// Write interleaved 16-bit stereo samples. The stream is drained on the
     /// next call, so a burst is bounded by the server's buffer.
-    pub(crate) fn play(&mut self, samples: &[i16]) {
+    pub(crate) fn play(&mut self, samples: &[i16]) -> Result<(), String> {
         let bytes = samples
             .iter()
             .flat_map(|s| s.to_le_bytes())
             .collect::<Vec<u8>>();
-        let _ = self
+        let result = self
             .stream
             .write_copy(&bytes, 0, pulse::stream::SeekMode::Relative);
         self.mainloop.iterate(false);
+        result.map_err(|e| format!("PulseAudio write failed: {e:?}"))
     }
 
     pub(crate) fn stop(&mut self) {
+        if self.stopped {
+            return;
+        }
         let _ = self.stream.disconnect();
         self.context.disconnect();
+        self.stopped = true;
+    }
+}
+
+impl Drop for PlaybackSink {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
 /// A live mix of every non-call playback stream on one monitor sink.
 pub(crate) struct Mixer {
-    mainloop: Mainloop,
+    inputs: HashMap<u32, Input>,
     context: Context,
     monitor: String,
     sink_index: u32,
-    inputs: HashMap<u32, Input>,
     last_refresh: Instant,
     last_mix: Instant,
+    // Keep the borrowed PulseAudio API alive until all dependent fields drop.
+    mainloop: Mainloop,
 }
 
 impl Mixer {
@@ -473,13 +496,13 @@ impl Mixer {
         let sink_index = monitor.monitor_of_sink.unwrap();
 
         Ok(Self {
-            mainloop,
+            inputs: HashMap::new(),
             context,
             monitor: monitor.name,
             sink_index,
-            inputs: HashMap::new(),
             last_refresh: Instant::now() - Duration::from_secs(1),
             last_mix: Instant::now(),
+            mainloop,
         })
     }
 

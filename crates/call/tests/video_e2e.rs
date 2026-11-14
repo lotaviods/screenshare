@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use sharescreen_call::{CallConfig, CallSession};
-use sharescreen_core::{Codec, EncodedSample, MediaKind};
+use sharescreen_core::{Codec, ConnectionMode, EncodedSample, MediaKind};
 use sharescreen_server::app_with;
 use sharescreen_server::turn::TurnConfig;
 
@@ -43,6 +43,7 @@ async fn full_call_video_reaches_viewer() {
             signaling_url: format!("{ws_url}?id=alice&name=Alice"),
             peer_config: peer_config.clone(),
             video_codec: Codec::H264,
+            connection_mode: ConnectionMode::Mesh,
         },
         a_events,
     )
@@ -71,6 +72,7 @@ async fn full_call_video_reaches_viewer() {
             signaling_url: format!("{ws_url}?id=bob&name=Bob"),
             peer_config: peer_config.clone(),
             video_codec: Codec::H264,
+            connection_mode: ConnectionMode::Mesh,
         },
         b_events,
     )

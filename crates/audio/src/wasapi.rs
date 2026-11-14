@@ -218,28 +218,35 @@ impl Playback {
     }
 
     /// Write only complete interleaved 16-bit stereo frames that fit.
-    pub(crate) fn play(&mut self, samples: &[i16]) {
+    pub(crate) fn play(&mut self, samples: &[i16]) -> Result<(), String> {
         // WASAPI's ReleaseBuffer count is in audio frames, not samples. Never
         // release the entire available region after initializing only a
         // prefix: the uninitialized tail is audible garbage.
         unsafe {
-            let padding = self.client.GetCurrentPadding().unwrap_or(0);
+            let padding = self
+                .client
+                .GetCurrentPadding()
+                .map_err(|e| format!("WASAPI GetCurrentPadding failed: {e}"))?;
             let available = self.buffer_size.saturating_sub(padding);
             if available == 0 {
-                return;
+                return Ok(());
             }
             let frames = (samples.len() / 2).min(available as usize) as u32;
             if frames == 0 {
-                return;
+                return Ok(());
             }
-            let Ok(buffer) = self.render.GetBuffer(available) else {
-                return;
-            };
+            let buffer = self
+                .render
+                .GetBuffer(available)
+                .map_err(|e| format!("WASAPI GetBuffer failed: {e}"))?;
             let bytes = std::slice::from_raw_parts_mut(buffer, available as usize * 4);
             let pcm_bytes =
                 std::slice::from_raw_parts(samples.as_ptr() as *const u8, frames as usize * 4);
             bytes[..pcm_bytes.len()].copy_from_slice(pcm_bytes);
-            let _ = self.render.ReleaseBuffer(frames, 0);
+            self.render
+                .ReleaseBuffer(frames, 0)
+                .map_err(|e| format!("WASAPI ReleaseBuffer failed: {e}"))?;
+            Ok(())
         }
     }
 

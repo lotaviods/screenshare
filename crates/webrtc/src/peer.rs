@@ -18,6 +18,7 @@ use rtc::rtp_transceiver::rtp_sender::{
     RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind,
 };
 use rtc::rtp_transceiver::PayloadType;
+use rtc::rtp_transceiver::{RTCRtpTransceiverDirection, RTCRtpTransceiverInit};
 use rtc::statistics::{report::RTCStatsReportEntry, StatsSelector};
 use serde::{Deserialize, Serialize};
 use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
@@ -118,6 +119,18 @@ impl RemoteTrack {
         }
     }
 
+    /// Stream id carried by the remote track. An SFU can set this to the
+    /// publisher id so received tracks can be associated with the roster.
+    pub async fn stream_id(&self) -> String {
+        self.inner.stream_id().await
+    }
+
+    /// Track id carried by the remote track, suitable for mapping a media
+    /// section back to the SFU publication roster.
+    pub async fn track_id(&self) -> String {
+        self.inner.track_id().await
+    }
+
     /// The negotiated codec, if known.
     pub async fn codec(&self) -> Option<Codec> {
         self.inner
@@ -208,6 +221,9 @@ pub struct TrackWriter {
     /// so it is resolved by mime type rather than by list position.
     codec: Codec,
     payload_type: tokio::sync::OnceCell<Option<PayloadType>>,
+    /// Converts the encoder's media clock to the monotonic clock expected by
+    /// `rtc::media::Sample`, preserving sample spacing instead of write jitter.
+    sample_clock: OnceLock<(u64, Instant)>,
 }
 
 #[derive(Clone)]
@@ -278,6 +294,9 @@ impl WebRtcPeer {
         video_codec: Codec,
         events: Arc<dyn Fn(PeerEvent) + Send + Sync>,
     ) -> Result<Self> {
+        if !matches!(video_codec, Codec::Vp8 | Codec::Vp9 | Codec::H264) {
+            return Err(WebRtcError::UnsupportedCodec(video_codec));
+        }
         let mut media_engine = MediaEngine::default();
         codec::register_default_codecs(&mut media_engine, video_codec)?;
         let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
@@ -316,14 +335,6 @@ impl WebRtcPeer {
     /// Add a local track and return a writer for it. `codec` selects the
     /// encoding (Opus for audio, VP8/VP9/H264 for video).
     pub async fn add_track(&self, id: TrackId, codec: Codec) -> Result<TrackWriter> {
-        let kind = if codec::is_audio(codec) {
-            RtpCodecKind::Audio
-        } else {
-            RtpCodecKind::Video
-        };
-        let rtp_codec = codec::codec_to_rtp(codec);
-        let ssrc = next_ssrc();
-
         let (stream_id, track_id, label) = match id {
             TrackId::Mic => ("sharescreen-mic-stream", "sharescreen-mic-track", "mic"),
             TrackId::System => (
@@ -337,6 +348,38 @@ impl WebRtcPeer {
                 "screen",
             ),
         };
+
+        self.add_named_track(stream_id, track_id, label, codec)
+            .await
+    }
+
+    /// Add a named egress track for an SFU publication. The stream id should
+    /// identify the publisher and the track id should identify the published
+    /// audio/video layer so receivers can associate it with roster metadata.
+    pub async fn add_relay_track(
+        &self,
+        publisher_id: &str,
+        publication_id: &str,
+        codec: Codec,
+    ) -> Result<TrackWriter> {
+        self.add_named_track(publisher_id, publication_id, publication_id, codec)
+            .await
+    }
+
+    async fn add_named_track(
+        &self,
+        stream_id: &str,
+        track_id: &str,
+        label: &str,
+        codec: Codec,
+    ) -> Result<TrackWriter> {
+        let kind = if codec::is_audio(codec) {
+            RtpCodecKind::Audio
+        } else {
+            RtpCodecKind::Video
+        };
+        let rtp_codec = codec::codec_to_rtp(codec);
+        let ssrc = next_ssrc();
 
         let track = Arc::new(TrackLocalStaticSample::new(
             Instant::now(),
@@ -367,7 +410,28 @@ impl WebRtcPeer {
             ssrc,
             codec,
             payload_type: tokio::sync::OnceCell::new(),
+            sample_clock: OnceLock::new(),
         })
+    }
+
+    /// Add a receive-only transceiver before creating an offer. SFU clients
+    /// reserve these m-lines for subscribed remote tracks; the publisher's
+    /// existing send tracks remain on their own send-only m-lines.
+    pub async fn add_recvonly_transceiver(&self, kind: RemoteTrackKind) -> Result<()> {
+        let kind = match kind {
+            RemoteTrackKind::Audio => RtpCodecKind::Audio,
+            RemoteTrackKind::Video => RtpCodecKind::Video,
+        };
+        self.pc
+            .add_transceiver_from_kind(
+                kind,
+                Some(RTCRtpTransceiverInit {
+                    direction: RTCRtpTransceiverDirection::Recvonly,
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn create_offer(&self) -> Result<SessionDescription> {
@@ -440,10 +504,8 @@ fn from_session_description(desc: &SessionDescription) -> Result<RTCSessionDescr
 }
 
 impl TrackWriter {
-    /// Write one encoded sample to the track. The payload type is resolved
-    /// lazily after negotiation completes.
-    pub async fn write(&self, sample: EncodedSample) -> Result<()> {
-        let pt = *self
+    async fn negotiated_payload_type(&self) -> Result<u8> {
+        let payload_type = *self
             .payload_type
             .get_or_init(|| async {
                 let params = self.sender.get_parameters().await.ok()?;
@@ -452,23 +514,25 @@ impl TrackWriter {
                     .rtp_parameters
                     .codecs
                     .iter()
-                    // The negotiated codec list is ordered by the remote
-                    // description, so match on the mime type instead of
-                    // taking the first entry.
                     .find(|c| c.rtp_codec.mime_type.eq_ignore_ascii_case(mime))
                     .map(|c| c.payload_type)
             })
             .await;
+        payload_type.ok_or(WebRtcError::NoMatchingCodec(self.codec))
+    }
 
-        let Some(pt) = pt else {
-            return Err(WebRtcError::NoMatchingCodec(self.codec));
-        };
+    /// Write one encoded sample to the track. The payload type is resolved
+    /// lazily after negotiation completes.
+    pub async fn write(&self, sample: EncodedSample) -> Result<()> {
+        let pt = self.negotiated_payload_type().await?;
 
+        let timestamp = encoder_timestamp(&self.sample_clock, sample.timestamp_micros);
         let data = Bytes::from(sample.data);
         let rtc_sample = Sample {
             data,
             duration: Duration::from_micros(sample.duration_micros.max(1)),
-            ..Sample::new(Instant::now())
+            timestamp,
+            ..Sample::new(timestamp)
         };
 
         self.track
@@ -477,6 +541,37 @@ impl TrackWriter {
             .await?;
         Ok(())
     }
+
+    /// Forward an already packetized RTP payload without decoding or
+    /// repacketizing it. The negotiated track's payload type and SSRC replace
+    /// the source leg's values; codec payload bytes, sequence and timestamp
+    /// are preserved.
+    pub async fn write_rtp(&self, packet: RtpPacket) -> Result<()> {
+        let payload_type = self.negotiated_payload_type().await?;
+        let packet = rtc::rtp::Packet {
+            header: rtc::rtp::header::Header {
+                version: 2,
+                marker: packet.marker,
+                payload_type,
+                sequence_number: packet.sequence_number,
+                timestamp: packet.timestamp,
+                ssrc: self.ssrc,
+                ..Default::default()
+            },
+            payload: Bytes::from(packet.payload),
+        };
+        self.track.write_rtp(packet).await?;
+        Ok(())
+    }
+}
+
+fn encoder_timestamp(clock: &OnceLock<(u64, Instant)>, pts_micros: u64) -> Instant {
+    let anchor = clock.get_or_init(|| (pts_micros, Instant::now()));
+    let offset = pts_micros.saturating_sub(anchor.0);
+    anchor
+        .1
+        .checked_add(Duration::from_micros(offset))
+        .unwrap_or_else(Instant::now)
 }
 
 fn map_state(state: RTCPeerConnectionState) -> ConnectionState {
@@ -506,4 +601,41 @@ fn next_ssrc() -> u32 {
         AtomicU32::new(seed)
     });
     counter.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{encoder_timestamp, PeerConfig, PeerEvent, RemoteTrackKind, WebRtcPeer};
+    use sharescreen_core::Codec;
+    use std::sync::Arc;
+    use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn sample_timestamps_follow_encoder_pts_spacing() {
+        let base = Instant::now();
+        let clock = OnceLock::from((10_000, base));
+        assert_eq!(
+            encoder_timestamp(&clock, 30_000).duration_since(base),
+            Duration::from_millis(20)
+        );
+        assert_eq!(encoder_timestamp(&clock, 5_000), base);
+    }
+
+    #[tokio::test]
+    async fn receive_only_transceiver_is_offered_as_recvonly() {
+        let peer = WebRtcPeer::new(
+            PeerConfig::default(),
+            Codec::H264,
+            Arc::new(|_: PeerEvent| {}),
+        )
+        .await
+        .expect("peer");
+        peer.add_recvonly_transceiver(RemoteTrackKind::Video)
+            .await
+            .expect("receive-only transceiver");
+        let offer = peer.create_offer().await.expect("offer");
+        assert!(offer.sdp.contains("a=recvonly"));
+        peer.close().await.expect("close");
+    }
 }

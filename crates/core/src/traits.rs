@@ -34,6 +34,12 @@ pub struct CaptureOptions {
     pub bitrate_kbps: u32,
     /// Prefer a hardware encoder when one is available.
     pub hardware_encoding: bool,
+    /// Optional channel for a low-resolution thumbnail stream (best-effort,
+    /// never blocks the capture path). When `Some`, the backend encodes a
+    /// second stream at ≤854×480 / 5 fps / 300 kbps and sends samples here
+    /// via `try_send`; failures are silently dropped.
+    #[serde(skip)]
+    pub thumbnail_sender: Option<tokio::sync::mpsc::Sender<EncodedSample>>,
 }
 
 /// Platform screen-capture backend. Implementations live in

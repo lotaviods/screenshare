@@ -3,6 +3,7 @@
 
 use std::time::Duration;
 
+use sharescreen_core::{PublishedTrackKind, PublishedVideoLayer};
 use sharescreen_server::app_with;
 use sharescreen_server::turn::TurnConfig;
 use sharescreen_signaling::{Incoming, PeerInfo, PeerPayload, SignalMessage, SignalingClient};
@@ -15,6 +16,22 @@ async fn recv_msg(rx: &mut UnboundedReceiver<Incoming>) -> SignalMessage {
         Ok(Some(Incoming::Disconnected)) => panic!("unexpected disconnect"),
         Ok(None) => panic!("channel closed"),
         Err(_) => panic!("timed out waiting for signaling message"),
+    }
+}
+
+/// Receive the next message that is not one of the asynchronous
+/// `SfuIceCandidate`/`SfuSubscriptions` updates. ICE gathering and
+/// subscription snapshots interleave with the answers a test waits for.
+async fn recv_signaling(
+    rx: &mut UnboundedReceiver<Incoming>,
+    ignore_subscriptions: bool,
+) -> SignalMessage {
+    loop {
+        match recv_msg(rx).await {
+            SignalMessage::SfuIceCandidate { .. } => continue,
+            SignalMessage::SfuSubscriptions { .. } if ignore_subscriptions => continue,
+            other => return other,
+        }
     }
 }
 
@@ -206,4 +223,210 @@ async fn server_issues_turn_credentials() {
         }
         other => panic!("expected TurnCredentials, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn sfu_publications_and_focus_produce_viewer_subscriptions() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let turn = TurnConfig {
+        urls: vec![],
+        secret: "secret".to_string(),
+        ttl_secs: 3600,
+        user: "user".to_string(),
+    };
+    tokio::spawn(async move {
+        axum::serve(listener, app_with(turn)).await.unwrap();
+    });
+
+    let base = format!("ws://{addr}/ws");
+    let mut a = SignalingClient::connect(&format!("{base}?id=a&name=Alice"))
+        .await
+        .unwrap();
+    let mut b = SignalingClient::connect(&format!("{base}?id=b&name=Bob"))
+        .await
+        .unwrap();
+    a.send(SignalMessage::CreateRoom).unwrap();
+    let room_id = match recv_msg(&mut a.incoming).await {
+        SignalMessage::RoomCreated { room_id } => room_id,
+        other => panic!("expected RoomCreated, got {other:?}"),
+    };
+    b.send(SignalMessage::JoinRoom { room_id }).unwrap();
+    assert!(matches!(
+        recv_msg(&mut b.incoming).await,
+        SignalMessage::Joined { .. }
+    ));
+    assert!(matches!(
+        recv_msg(&mut a.incoming).await,
+        SignalMessage::PeerJoined { .. }
+    ));
+
+    for (track_id, kind, layer) in [
+        ("a-audio", PublishedTrackKind::Audio, None),
+        (
+            "a-full",
+            PublishedTrackKind::Screen,
+            Some(PublishedVideoLayer::Full),
+        ),
+        (
+            "a-thumb",
+            PublishedTrackKind::Screen,
+            Some(PublishedVideoLayer::Thumbnail),
+        ),
+    ] {
+        a.send(SignalMessage::PublishTrack {
+            track_id: track_id.into(),
+            kind,
+            layer,
+        })
+        .unwrap();
+    }
+    let mut last_subscriptions = None;
+    for _ in 0..3 {
+        if let SignalMessage::SfuSubscriptions { focus, tracks } = recv_msg(&mut b.incoming).await {
+            last_subscriptions = Some((focus, tracks));
+        }
+    }
+    let (focus, tracks) = last_subscriptions.unwrap();
+    assert_eq!(focus, None);
+    assert_eq!(tracks, vec!["a-audio", "a-thumb"]);
+
+    b.send(SignalMessage::SetFocus {
+        publisher: Some("a".into()),
+    })
+    .unwrap();
+    match recv_msg(&mut b.incoming).await {
+        SignalMessage::SfuSubscriptions { focus, tracks } => {
+            assert_eq!(focus.as_deref(), Some("a"));
+            assert_eq!(tracks, vec!["a-audio", "a-full"]);
+        }
+        other => panic!("expected SfuSubscriptions, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn sfu_renegotiation_reuses_peer_connection_on_new_tracks() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let turn = TurnConfig {
+        urls: vec![],
+        secret: "secret".to_string(),
+        ttl_secs: 3600,
+        user: "user".to_string(),
+    };
+    tokio::spawn(async move {
+        axum::serve(listener, app_with(turn)).await.unwrap();
+    });
+
+    let base = format!("ws://{addr}/ws");
+    let mut a = SignalingClient::connect(&format!("{base}?id=a&name=Alice"))
+        .await
+        .unwrap();
+    let mut b = SignalingClient::connect(&format!("{base}?id=b&name=Bob"))
+        .await
+        .unwrap();
+
+    a.send(SignalMessage::CreateRoom).unwrap();
+    let room_id = match recv_msg(&mut a.incoming).await {
+        SignalMessage::RoomCreated { room_id } => room_id,
+        other => panic!("expected RoomCreated, got {other:?}"),
+    };
+
+    b.send(SignalMessage::JoinRoom { room_id }).unwrap();
+    let _ = recv_msg(&mut b.incoming).await; // Joined
+    let _ = recv_msg(&mut a.incoming).await; // PeerJoined
+
+    // Client A creates initial WebRTC peer and sends initial SfuOffer
+    let peer_a = std::sync::Arc::new(
+        sharescreen_webrtc::WebRtcPeer::new(
+            sharescreen_webrtc::PeerConfig::default(),
+            sharescreen_core::Codec::H264,
+            std::sync::Arc::new(|_| {}),
+        )
+        .await
+        .unwrap(),
+    );
+    // Mirror the desktop client: reserve receive slots and publish one track,
+    // so the offer carries ICE credentials and real media sections.
+    peer_a
+        .add_relay_track("a", "a-mic", sharescreen_core::Codec::Opus)
+        .await
+        .unwrap();
+    peer_a
+        .add_recvonly_transceiver(sharescreen_webrtc::RemoteTrackKind::Audio)
+        .await
+        .unwrap();
+    peer_a
+        .add_recvonly_transceiver(sharescreen_webrtc::RemoteTrackKind::Video)
+        .await
+        .unwrap();
+    a.send(SignalMessage::PublishTrack {
+        track_id: "a-mic".into(),
+        kind: PublishedTrackKind::Audio,
+        layer: None,
+    })
+    .unwrap();
+    let initial_offer = peer_a.create_offer().await.unwrap();
+    peer_a.set_local_description(&initial_offer).await.unwrap();
+
+    a.send(SignalMessage::SfuOffer {
+        sdp: serde_json::to_string(&initial_offer).unwrap(),
+        video_codec: "h264".into(),
+    })
+    .unwrap();
+
+    // A publish can produce an empty subscription snapshot before the answer.
+    let initial_answer_sdp = match recv_signaling(&mut a.incoming, true).await {
+        SignalMessage::SfuAnswer { sdp } => sdp,
+        other => panic!("expected SfuAnswer, got {other:?}"),
+    };
+    let initial_answer: sharescreen_webrtc::SessionDescription =
+        serde_json::from_str(&initial_answer_sdp).unwrap();
+    peer_a
+        .set_remote_description(&initial_answer)
+        .await
+        .unwrap();
+
+    // Now B publishes a track
+    b.send(SignalMessage::PublishTrack {
+        track_id: "b-audio".into(),
+        kind: PublishedTrackKind::Audio,
+        layer: None,
+    })
+    .unwrap();
+
+    // A receives SfuSubscriptions with b-audio
+    match recv_signaling(&mut a.incoming, false).await {
+        SignalMessage::SfuSubscriptions { tracks, .. } => {
+            assert!(tracks.contains(&"b-audio".to_string()));
+        }
+        other => panic!("expected SfuSubscriptions, got {other:?}"),
+    }
+
+    // Now A renegotiates: sends a second SfuOffer on the existing peer connection!
+    let renegotiate_offer = peer_a.create_offer().await.unwrap();
+    peer_a
+        .set_local_description(&renegotiate_offer)
+        .await
+        .unwrap();
+
+    a.send(SignalMessage::SfuOffer {
+        sdp: serde_json::to_string(&renegotiate_offer).unwrap(),
+        video_codec: "h264".into(),
+    })
+    .unwrap();
+
+    // Server must respond with SfuAnswer without dropping or disconnecting
+    let renegotiate_answer_sdp = match recv_signaling(&mut a.incoming, true).await {
+        SignalMessage::SfuAnswer { sdp } => sdp,
+        other => panic!("expected SfuAnswer on renegotiation, got {other:?}"),
+    };
+    let renegotiate_answer: sharescreen_webrtc::SessionDescription =
+        serde_json::from_str(&renegotiate_answer_sdp).unwrap();
+    peer_a
+        .set_remote_description(&renegotiate_answer)
+        .await
+        .unwrap();
+
+    peer_a.close().await.unwrap();
 }

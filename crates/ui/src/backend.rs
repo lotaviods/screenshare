@@ -75,6 +75,7 @@ pub enum Command {
         peer_id: String,
         volume: f64,
     },
+    SetFocus(Option<String>),
     Poll(FrameRequest),
     ForgetRemote(String),
     PollLatency,
@@ -253,6 +254,14 @@ impl Actor {
                 }
                 Ok(())
             }
+            Command::SetFocus(publisher) => {
+                if let Some(session) = self.call.as_ref()
+                    && let Err(error) = session.set_focus(publisher)
+                {
+                    self.send(UiEvent::Error(error.to_string()));
+                }
+                Ok(())
+            }
             Command::Poll(request) => {
                 self.check_hotplug().await;
                 self.poll_frames(request);
@@ -358,6 +367,7 @@ impl Actor {
             ),
             peer_config: network::peer_config(&config.network),
             video_codec: config.video.codec,
+            connection_mode: config.network.connection_mode,
         };
 
         let (tx, mut rx) = mpsc::unbounded_channel::<CallEvent>();

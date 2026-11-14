@@ -16,9 +16,11 @@ path = "src/main.rs"
 
 [dependencies]
 sharescreen-core = { path = "../crates/core" }
+sharescreen-webrtc = { path = "../crates/webrtc" }
 
 axum.workspace = true
 tokio.workspace = true
+futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -27,6 +29,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hmac = "0.12"
 sha1 = "0.10"
 base64 = "0.22"
+str0m = "0.23.1"
 
 [dev-dependencies]
 sharescreen-signaling = { path = "../crates/signaling" }

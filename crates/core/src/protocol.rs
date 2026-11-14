@@ -53,6 +53,31 @@ pub enum SignalMessage {
         to: String,
         payload: PeerPayload,
     },
+    /// Register one encoded track with the room's SFU control plane.
+    PublishTrack {
+        track_id: String,
+        kind: PublishedTrackKind,
+        layer: Option<PublishedVideoLayer>,
+    },
+    UnpublishTrack {
+        track_id: String,
+    },
+    /// Select the participant whose full resolution screen track is shown.
+    SetFocus {
+        publisher: Option<String>,
+    },
+    /// WebRTC offer/answer signaling for the single SFU peer connection.
+    /// Offers and answers may flow in either direction during renegotiation.
+    SfuOffer {
+        sdp: String,
+        video_codec: String,
+    },
+    SfuAnswer {
+        sdp: String,
+    },
+    SfuIceCandidate {
+        candidate: String,
+    },
 
     // --- server → client ---
     RoomCreated {
@@ -85,6 +110,25 @@ pub enum SignalMessage {
     Error {
         message: String,
     },
+    /// Current publication roster and viewer-specific track subscription.
+    SfuSubscriptions {
+        focus: Option<String>,
+        tracks: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublishedTrackKind {
+    Audio,
+    Screen,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublishedVideoLayer {
+    Full,
+    Thumbnail,
 }
 
 #[cfg(test)]
@@ -133,6 +177,29 @@ mod tests {
                     mic_on: true,
                     screen_on: false,
                 },
+            },
+            SignalMessage::PublishTrack {
+                track_id: "peer-screen-thumb".into(),
+                kind: PublishedTrackKind::Screen,
+                layer: Some(PublishedVideoLayer::Thumbnail),
+            },
+            SignalMessage::UnpublishTrack {
+                track_id: "peer-audio".into(),
+            },
+            SignalMessage::SetFocus {
+                publisher: Some("peer-2".into()),
+            },
+            SignalMessage::SfuOffer {
+                sdp: "v=0".into(),
+                video_codec: "h264".into(),
+            },
+            SignalMessage::SfuAnswer { sdp: "v=0".into() },
+            SignalMessage::SfuIceCandidate {
+                candidate: "candidate:1".into(),
+            },
+            SignalMessage::SfuSubscriptions {
+                focus: Some("peer-2".into()),
+                tracks: vec!["peer-2-full".into(), "peer-3-thumb".into()],
             },
         ];
 

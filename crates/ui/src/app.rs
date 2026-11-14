@@ -327,6 +327,11 @@ impl AppView {
 
     fn toggle_share_focus(&mut self, share: ShareId, cx: &mut Context<Self>) {
         self.focused_share = next_share_focus(self.focused_share.as_ref(), share);
+        let publisher = match self.focused_share.as_ref() {
+            Some(ShareId::Remote(peer)) => Some(peer.clone()),
+            Some(ShareId::Local) | None => None,
+        };
+        self.backend.send(Command::SetFocus(publisher));
         cx.notify();
     }
 
@@ -1019,6 +1024,7 @@ impl AppView {
             codec: self.config.video.codec,
             bitrate_kbps: self.share.bitrate,
             hardware_encoding: cfg!(target_os = "linux") || self.share.hardware,
+            thumbnail_sender: None,
         };
         tracing::info!(
             source = %source.id,

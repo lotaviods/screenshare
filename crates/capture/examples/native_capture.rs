@@ -34,6 +34,7 @@ async fn main() {
         codec: Codec::H264,
         bitrate_kbps: 6000,
         hardware_encoding: true,
+        thumbnail_sender: None,
     };
     let source = capture
         .list_sources()

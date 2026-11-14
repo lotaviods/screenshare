@@ -19,6 +19,24 @@ mod wasapi;
 pub mod playback;
 pub use playback::Output;
 
+/// Cumulative audio failures observed by this process.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AudioMetrics {
+    pub capture_queue_drops: u64,
+    pub playback_write_errors: u64,
+    pub playback_underruns: u64,
+    pub playback_buffer_dropped_frames: u64,
+}
+
+pub fn audio_metrics() -> AudioMetrics {
+    AudioMetrics {
+        capture_queue_drops: native::queue_drops(),
+        playback_write_errors: playback::write_errors(),
+        playback_underruns: playback::underruns(),
+        playback_buffer_dropped_frames: playback::buffer_drops(),
+    }
+}
+
 use async_trait::async_trait;
 use sharescreen_core::{AudioCapture, AudioError, Device, DeviceKind, EncodedSample};
 use tokio::sync::mpsc;

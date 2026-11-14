@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 
@@ -44,12 +44,38 @@ pub struct Decoder {
     volume: Arc<Mutex<f64>>,
     tx: mpsc::Sender<Vec<u8>>,
     stop: watch::Sender<bool>,
+    video_recovery: Arc<AtomicBool>,
 }
 
 /// Caps queued remote RTP at roughly 256 packets per track (about 5 seconds
 /// for 20 ms audio, less for video). `attach` awaits capacity, keeping packet
 /// memory bounded while allowing the WebRTC reader to apply backpressure.
 const REMOTE_RTP_QUEUE: usize = 256;
+static VIDEO_RTP_QUEUE_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static OPUS_PACKET_GAPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static OPUS_FEC_RECOVERIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static OPUS_PLC_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static OPUS_SILENCE_FALLBACK_FRAMES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MediaMetrics {
+    pub video_rtp_queue_drops: u64,
+    pub opus_packet_gaps: u64,
+    pub opus_fec_recoveries: u64,
+    pub opus_plc_frames: u64,
+    pub opus_silence_fallback_frames: u64,
+}
+
+pub fn media_metrics() -> MediaMetrics {
+    MediaMetrics {
+        video_rtp_queue_drops: VIDEO_RTP_QUEUE_DROPS.load(Ordering::Relaxed),
+        opus_packet_gaps: OPUS_PACKET_GAPS.load(Ordering::Relaxed),
+        opus_fec_recoveries: OPUS_FEC_RECOVERIES.load(Ordering::Relaxed),
+        opus_plc_frames: OPUS_PLC_FRAMES.load(Ordering::Relaxed),
+        opus_silence_fallback_frames: OPUS_SILENCE_FALLBACK_FRAMES.load(Ordering::Relaxed),
+    }
+}
 
 impl Decoder {
     /// Create a decoder for a remote track of the given kind/codec.
@@ -70,12 +96,14 @@ impl Decoder {
         let volume = Arc::new(Mutex::new(1.0));
         let (tx, mut rx) = mpsc::channel(REMOTE_RTP_QUEUE);
         let (stop, _) = watch::channel(false);
+        let video_recovery = Arc::new(AtomicBool::new(false));
 
         let flag = running.clone();
         let volume_slot = volume.clone();
         let frames_slot = frames.clone();
         let thread_flag = flag.clone();
         let thread_stop = stop.clone();
+        let thread_recovery = video_recovery.clone();
         let thread = std::thread::Builder::new()
             .name("sharescreen-media".into())
             .spawn(move || {
@@ -87,6 +115,7 @@ impl Decoder {
                     flag,
                     volume_slot,
                     frames_slot,
+                    thread_recovery,
                 );
                 thread_flag.store(false, Ordering::SeqCst);
                 thread_stop.send_replace(true);
@@ -100,6 +129,7 @@ impl Decoder {
             volume,
             tx,
             stop,
+            video_recovery,
         })
     }
 
@@ -140,6 +170,7 @@ fn run(
     running: Arc<AtomicBool>,
     volume: Arc<Mutex<f64>>,
     frames: Option<Arc<Mutex<Option<Vec<u8>>>>>,
+    video_recovery: Arc<AtomicBool>,
 ) {
     let mut depacketizer = RtpDepacketizer::new(rtp_kind);
     let mut video = if kind == RemoteTrackKind::Video {
@@ -185,68 +216,156 @@ fn run(
     };
 
     let mut decoded = 0u64;
+    let mut consecutive_decode_errors = 0u32;
+    let mut waiting_for_keyframe = false;
     // `output` is passed in instead of captured so the receive timeout can
     // also pump the playback buffer while no packets arrive.
-    let mut process = |frame: &[u8], output: &mut Option<Output>| match kind {
-        RemoteTrackKind::Video => {
-            let (Some(video), Some(jpeg)) = (video.as_mut(), jpeg.as_mut()) else {
-                return;
-            };
-            match video.decode(frame) {
-                Ok(rgb_frames) => {
-                    for rgb in rgb_frames {
-                        match jpeg.encode(&rgb, video.width(), video.height()) {
-                            Ok(jpeg) => {
-                                if decoded == 0 {
-                                    tracing::info!(
-                                        "decoded first video frame ({} bytes)",
-                                        jpeg.len()
-                                    );
-                                }
-                                decoded += 1;
-                                if let Some(slot) = frames.as_ref() {
-                                    *slot.lock().unwrap() = Some(jpeg);
-                                }
-                            }
-                            Err(e) => tracing::warn!("JPEG encode failed: {e}"),
+    let mut process =
+        |frame: &[u8], output: &mut Option<Output>, missing_audio_packets: u16| match kind {
+            RemoteTrackKind::Video => {
+                if video_recovery.load(Ordering::Acquire) {
+                    if codec == Codec::H264 && !contains_h264_idr(frame) {
+                        return;
+                    }
+                    video = None;
+                    waiting_for_keyframe = false;
+                    video_recovery.store(false, Ordering::Release);
+                }
+                if video.is_none() {
+                    if waiting_for_keyframe && codec == Codec::H264 && !contains_h264_idr(frame) {
+                        return;
+                    }
+                    match VideoDecoder::new(codec_name(codec)) {
+                        Ok(decoder) => {
+                            video = Some(decoder);
+                            waiting_for_keyframe = false;
+                            consecutive_decode_errors = 0;
+                            tracing::info!("recreated video decoder at recovery boundary");
+                        }
+                        Err(error) => {
+                            tracing::error!("video decoder recreation failed: {error}");
+                            return;
                         }
                     }
                 }
-                Err(e) => tracing::warn!("video decode failed: {e}"),
-            }
-        }
-        RemoteTrackKind::Audio => {
-            let (Some(audio), Some(output)) = (audio.as_mut(), output.as_mut()) else {
-                return;
-            };
-            match audio.decode(frame) {
-                Ok(pcm) => {
-                    let gain = *volume.lock().unwrap();
-                    let scaled: Vec<i16> = pcm
-                        .iter()
-                        .map(|sample| (*sample as f64 * gain).clamp(-32768.0, 32767.0) as i16)
-                        .collect();
-                    // Queue decoded audio; the jitter buffer releases it on the
-                    // 20 ms playback cadence instead of writing every packet
-                    // straight to the device.
-                    output.push(&scaled);
+                let Some(jpeg) = jpeg.as_mut() else {
+                    return;
+                };
+                let Some(decoder) = video.as_mut() else {
+                    return;
+                };
+                let result = decoder.decode(frame);
+                match result {
+                    Ok(rgb_frames) => {
+                        consecutive_decode_errors = 0;
+                        let (width, height) = video
+                            .as_ref()
+                            .map(|decoder| (decoder.width(), decoder.height()))
+                            .unwrap_or_default();
+                        for rgb in rgb_frames {
+                            match jpeg.encode(&rgb, width, height) {
+                                Ok(jpeg) => {
+                                    if decoded == 0 {
+                                        tracing::info!(
+                                            "decoded first video frame ({} bytes)",
+                                            jpeg.len()
+                                        );
+                                    }
+                                    decoded += 1;
+                                    if let Some(slot) = frames.as_ref() {
+                                        *slot.lock().unwrap() = Some(jpeg);
+                                    }
+                                }
+                                Err(e) => tracing::warn!("JPEG encode failed: {e}"),
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        consecutive_decode_errors += 1;
+                        tracing::warn!(consecutive_decode_errors, "video decode failed: {error}");
+                        if consecutive_decode_errors >= 3 {
+                            video = None;
+                            waiting_for_keyframe = true;
+                            consecutive_decode_errors = 0;
+                        }
+                    }
                 }
-                Err(e) => tracing::warn!("Opus decode failed: {e}"),
             }
-        }
-    };
+            RemoteTrackKind::Audio => {
+                let (Some(audio), Some(output)) = (audio.as_mut(), output.as_mut()) else {
+                    return;
+                };
+                if missing_audio_packets > 0 {
+                    let missing = missing_audio_packets.min(5);
+                    OPUS_PACKET_GAPS.fetch_add(missing_audio_packets as u64, Ordering::Relaxed);
+                    let fec_available = audio.supports_loss_recovery();
+                    let plc_count = if fec_available {
+                        missing.saturating_sub(1)
+                    } else {
+                        missing
+                    };
+                    for _ in 0..plc_count {
+                        match audio.conceal(960) {
+                            Ok(pcm) => {
+                                if fec_available {
+                                    OPUS_PLC_FRAMES.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    OPUS_SILENCE_FALLBACK_FRAMES.fetch_add(1, Ordering::Relaxed);
+                                }
+                                output.push(&pcm);
+                            }
+                            Err(error) => tracing::warn!(%error, "Opus PLC failed"),
+                        }
+                    }
+                    if fec_available {
+                        match audio.decode_fec(frame, 960) {
+                            Ok(pcm) => {
+                                OPUS_FEC_RECOVERIES.fetch_add(1, Ordering::Relaxed);
+                                output.push(&pcm);
+                            }
+                            Err(error) => tracing::warn!(%error, "Opus FEC recovery failed"),
+                        }
+                    }
+                }
+                match audio.decode(frame) {
+                    Ok(pcm) => {
+                        let gain = *volume.lock().unwrap();
+                        let scaled: Vec<i16> = pcm
+                            .iter()
+                            .map(|sample| (*sample as f64 * gain).clamp(-32768.0, 32767.0) as i16)
+                            .collect();
+                        // Queue decoded audio; the jitter buffer releases it on the
+                        // 20 ms playback cadence instead of writing every packet
+                        // straight to the device.
+                        output.push(&scaled);
+                    }
+                    Err(e) => tracing::warn!("Opus decode failed: {e}"),
+                }
+            }
+        };
 
+    let mut last_audio_sequence = None;
     while running.load(Ordering::SeqCst) {
         match rx.try_recv() {
             Ok(packet) => {
-                for frame in depacketizer.push(&packet) {
-                    process(&frame, &mut output);
+                let missing = if kind == RemoteTrackKind::Audio && packet.len() >= 4 {
+                    let sequence = u16::from_be_bytes([packet[2], packet[3]]);
+                    let lost = last_audio_sequence
+                        .map(|previous| rtp_sequence_gap(previous, sequence))
+                        .unwrap_or(0);
+                    last_audio_sequence = Some(sequence);
+                    lost
+                } else {
+                    0
+                };
+                for (index, frame) in depacketizer.push(&packet).into_iter().enumerate() {
+                    process(&frame, &mut output, if index == 0 { missing } else { 0 });
                 }
             }
             Err(mpsc::error::TryRecvError::Disconnected) => break,
             Err(mpsc::error::TryRecvError::Empty) => {
                 for frame in depacketizer.flush() {
-                    process(&frame, &mut output);
+                    process(&frame, &mut output, 0);
                 }
                 if let Some(output) = output.as_mut() {
                     output.tick();
@@ -257,6 +376,40 @@ fn run(
             }
         }
     }
+}
+
+fn rtp_sequence_gap(previous: u16, current: u16) -> u16 {
+    let distance = current.wrapping_sub(previous);
+    if (2..=32).contains(&distance) {
+        distance - 1
+    } else {
+        // Ignore duplicates, reordering and large discontinuities. Those need
+        // a stream reset rather than speculative PLC on an arbitrary duration.
+        0
+    }
+}
+
+fn contains_h264_idr(access_unit: &[u8]) -> bool {
+    let mut i = 0;
+    while i < access_unit.len() {
+        let start_code = if i + 4 < access_unit.len() && access_unit[i..].starts_with(&[0, 0, 0, 1])
+        {
+            Some(4)
+        } else if i + 3 < access_unit.len() && access_unit[i..].starts_with(&[0, 0, 1]) {
+            Some(3)
+        } else {
+            None
+        };
+        if let Some(len) = start_code {
+            if access_unit[i + len] & 0x1f == 5 {
+                return true;
+            }
+            i += len;
+        } else {
+            i += 1;
+        }
+    }
+    false
 }
 
 fn codec_name(codec: Codec) -> &'static str {
@@ -383,6 +536,7 @@ fn preview_loop(
     let mut codec: Option<Codec> = None;
     let mut waiting_keyframe = true;
     let mut waited = 0u32;
+    let mut last_jpeg = Instant::now() - Duration::from_millis(66);
 
     while running.load(Ordering::SeqCst) {
         let sample = match rx.recv_timeout(Duration::from_millis(100)) {
@@ -437,6 +591,10 @@ fn preview_loop(
                 if !consumed.swap(false, Ordering::AcqRel) {
                     continue;
                 }
+                if last_jpeg.elapsed() < Duration::from_millis(66) {
+                    continue;
+                }
+                last_jpeg = Instant::now();
                 for rgb in pixels {
                     let (width, height) = (video.width(), video.height());
                     let (dst_width, dst_height) = preview_size(width, height, MAX_PREVIEW_WIDTH);
@@ -517,6 +675,7 @@ impl RemoteMedia {
 
         let running = decoder.running.clone();
         let tx = decoder.tx.clone();
+        let recovery = decoder.video_recovery.clone();
         let mut stop = decoder.stop.subscribe();
         let inner = Arc::downgrade(&self.inner);
         let cleanup_key = key.clone();
@@ -530,7 +689,19 @@ impl RemoteMedia {
                 if !running.load(Ordering::SeqCst) {
                     break;
                 }
-                if tx.send(packet.to_bytes()).await.is_err() {
+                let bytes = packet.to_bytes();
+                if kind == RemoteTrackKind::Video {
+                    if let Err(error) = tx.try_send(bytes) {
+                        if matches!(error, mpsc::error::TrySendError::Closed(_)) {
+                            break;
+                        }
+                        let drops = VIDEO_RTP_QUEUE_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
+                        recovery.store(true, Ordering::Release);
+                        if drops == 1 || drops.is_multiple_of(100) {
+                            tracing::warn!(drops, "dropping video RTP packet: decoder queue full");
+                        }
+                    }
+                } else if tx.send(bytes).await.is_err() {
                     break;
                 }
             }
@@ -618,6 +789,22 @@ fn stop_track(inner: &RemoteMediaInner, key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opus_sequence_gaps_handle_wrap_and_ignore_reordering() {
+        assert_eq!(rtp_sequence_gap(10, 11), 0);
+        assert_eq!(rtp_sequence_gap(10, 13), 2);
+        assert_eq!(rtp_sequence_gap(u16::MAX, 1), 1);
+        assert_eq!(rtp_sequence_gap(10, 9), 0);
+        assert_eq!(rtp_sequence_gap(1, 100), 0);
+    }
+
+    #[test]
+    fn h264_recovery_waits_for_an_idr_access_unit() {
+        assert!(contains_h264_idr(&[0, 0, 0, 1, 0x65, 0x88]));
+        assert!(contains_h264_idr(&[0, 0, 1, 0x67, 0x42, 0, 0, 1, 0x65]));
+        assert!(!contains_h264_idr(&[0, 0, 0, 1, 0x41, 0x88]));
+    }
 
     fn nals(sample: &[u8]) -> Vec<&[u8]> {
         let mut out = Vec::new();

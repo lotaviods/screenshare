@@ -3,6 +3,9 @@
 What exists, and what is missing, in backend and UI. Tracks the full
 spec against the current code. Checkboxes are off until implemented.
 
+> Decision log and phased work order: [`docs/roadmap.md`](docs/roadmap.md).
+> This file tracks features; that one records why and in what order.
+
 ## Status snapshot
 
 | Area | Status |

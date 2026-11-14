@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use sharescreen_core::{Codec, EncodedSample, MediaKind};
 use sharescreen_webrtc::{
-    PeerConfig, PeerEvent, RemoteTrackKind, TrackId, TrackWriter, WebRtcPeer,
+    PeerConfig, PeerEvent, RemoteTrack, RemoteTrackKind, RtpPacket, TrackId, TrackWriter,
+    WebRtcPeer,
 };
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -31,6 +32,17 @@ async fn wait_for_track(rx: &mut mpsc::UnboundedReceiver<PeerEvent>) -> RemoteTr
                 continue;
             }
             Ok(None) => panic!("event channel closed before a track arrived"),
+            Err(_) => panic!("timed out waiting for the remote track"),
+        }
+    }
+}
+
+async fn wait_for_remote_track(rx: &mut mpsc::UnboundedReceiver<PeerEvent>) -> RemoteTrack {
+    loop {
+        match timeout(Duration::from_secs(20), rx.recv()).await {
+            Ok(Some(PeerEvent::TrackReceived { track })) => return track,
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("event channel closed before a remote track arrived"),
             Err(_) => panic!("timed out waiting for the remote track"),
         }
     }
@@ -123,7 +135,7 @@ async fn two_peers_connect_and_exchange_media() {
     let (a_tx, mut a_rx) = mpsc::unbounded_channel::<PeerEvent>();
     let a = WebRtcPeer::new(
         PeerConfig::default(),
-        Codec::Opus,
+        Codec::Vp8,
         Arc::new(move |e: PeerEvent| {
             let _ = a_tx.send(e);
         }),
@@ -134,7 +146,7 @@ async fn two_peers_connect_and_exchange_media() {
     let (b_tx, mut b_rx) = mpsc::unbounded_channel::<PeerEvent>();
     let b = WebRtcPeer::new(
         PeerConfig::default(),
-        Codec::Opus,
+        Codec::Vp8,
         Arc::new(move |e: PeerEvent| {
             let _ = b_tx.send(e);
         }),
@@ -183,6 +195,75 @@ async fn two_peers_connect_and_exchange_media() {
     b.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn packetized_rtp_forwards_without_reencoding() {
+    let (a_tx, mut a_rx) = mpsc::unbounded_channel::<PeerEvent>();
+    let a = WebRtcPeer::new(
+        PeerConfig::default(),
+        Codec::Vp8,
+        Arc::new(move |e| {
+            let _ = a_tx.send(e);
+        }),
+    )
+    .await
+    .unwrap();
+    let (b_tx, mut b_rx) = mpsc::unbounded_channel::<PeerEvent>();
+    let b = WebRtcPeer::new(
+        PeerConfig::default(),
+        Codec::Vp8,
+        Arc::new(move |e| {
+            let _ = b_tx.send(e);
+        }),
+    )
+    .await
+    .unwrap();
+
+    let writer = a.add_track(TrackId::Mic, Codec::Opus).await.unwrap();
+    let offer = a.create_offer().await.unwrap();
+    a.set_local_description(&offer).await.unwrap();
+    wait_for_gathering(&mut a_rx).await;
+    b.set_remote_description(&a.local_description().await.unwrap())
+        .await
+        .unwrap();
+    let answer = b.create_answer().await.unwrap();
+    b.set_local_description(&answer).await.unwrap();
+    wait_for_gathering(&mut b_rx).await;
+    a.set_remote_description(&b.local_description().await.unwrap())
+        .await
+        .unwrap();
+    wait_for_connected(&mut a_rx).await;
+
+    let expected_payload = vec![0xAA; 32];
+    writer
+        .write_rtp(RtpPacket {
+            payload: expected_payload.clone(),
+            marker: false,
+            payload_type: 111,
+            sequence_number: 3210,
+            timestamp: 77_760,
+            ssrc: 1234,
+        })
+        .await
+        .expect("forward RTP packet");
+    let remote = wait_for_remote_track(&mut b_rx).await;
+    let received = timeout(Duration::from_secs(5), remote.next_packet())
+        .await
+        .expect("RTP packet should arrive")
+        .expect("track should remain open");
+    assert_eq!(received.payload, expected_payload);
+    assert!(!received.marker);
+    assert_eq!(received.payload_type, 111);
+    assert_ne!(
+        received.ssrc, 1234,
+        "egress SSRC must be owned by the sending peer"
+    );
+    assert_eq!(received.sequence_number, 3210);
+    assert_eq!(received.timestamp, 77_760);
+
+    a.close().await.unwrap();
+    b.close().await.unwrap();
+}
+
 /// Mute/unmute: audio sent before and after a pause must both arrive. The
 /// receiver must keep getting packets after the sender goes silent.
 #[tokio::test]
@@ -190,7 +271,7 @@ async fn audio_resumes_after_a_pause() {
     let (a_tx, mut a_rx) = mpsc::unbounded_channel::<PeerEvent>();
     let a = WebRtcPeer::new(
         PeerConfig::default(),
-        Codec::Opus,
+        Codec::Vp8,
         Arc::new(move |e: PeerEvent| {
             let _ = a_tx.send(e);
         }),
@@ -201,7 +282,7 @@ async fn audio_resumes_after_a_pause() {
     let (b_tx, mut b_rx) = mpsc::unbounded_channel::<PeerEvent>();
     let b = WebRtcPeer::new(
         PeerConfig::default(),
-        Codec::Opus,
+        Codec::Vp8,
         Arc::new(move |e: PeerEvent| {
             let _ = b_tx.send(e);
         }),

@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use sharescreen_call::{CallConfig, CallSession};
-use sharescreen_core::{CallEvent, Codec};
+use sharescreen_core::{CallEvent, Codec, ConnectionMode};
 use sharescreen_server::{app_with, turn::TurnConfig};
 use sharescreen_webrtc::PeerConfig;
 use tokio::sync::mpsc;
@@ -31,6 +31,7 @@ fn config(base: &str, id: &str, codec: Codec) -> CallConfig {
         signaling_url: format!("{base}?id={id}&name={id}"),
         peer_config: PeerConfig::default(),
         video_codec: codec,
+        connection_mode: ConnectionMode::Mesh,
     }
 }
 

@@ -114,6 +114,16 @@ impl RoomManager {
             None => false,
         }
     }
+
+    /// Snapshot the ids currently connected to a room.
+    pub fn peer_ids(&self, room_id: &str) -> Vec<String> {
+        self.rooms
+            .lock()
+            .unwrap()
+            .get(room_id)
+            .map(|room| room.peers.keys().cloned().collect())
+            .unwrap_or_default()
+    }
 }
 
 /// Length of a room code. Six base-36 characters ≈ 2.1 billion codes.

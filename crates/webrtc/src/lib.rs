@@ -30,6 +30,8 @@ pub enum WebRtcError {
     NoRuntime,
     #[error("the negotiated codec list does not contain {0:?}")]
     NoMatchingCodec(sharescreen_core::Codec),
+    #[error("video codec {0:?} is not registered by the WebRTC transport")]
+    UnsupportedCodec(sharescreen_core::Codec),
 }
 
 pub type Result<T> = std::result::Result<T, WebRtcError>;

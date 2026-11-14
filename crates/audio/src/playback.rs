@@ -1,6 +1,9 @@
 //! Native audio playback for remote call audio.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, SyncSender};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
@@ -21,6 +24,21 @@ pub(crate) const PLAYBACK_TARGET_FRAMES: usize = 2_880;
 /// a stalled consumer cannot grow latency without limit (~200 ms).
 pub(crate) const PLAYBACK_MAX_MS: u64 = 200;
 pub(crate) const PLAYBACK_MAX_FRAMES: usize = 9_600;
+static PLAYBACK_WRITE_ERRORS: AtomicU64 = AtomicU64::new(0);
+static PLAYBACK_UNDERRUNS: AtomicU64 = AtomicU64::new(0);
+static PLAYBACK_BUFFER_DROPS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn write_errors() -> u64 {
+    PLAYBACK_WRITE_ERRORS.load(Ordering::Relaxed)
+}
+
+pub(crate) fn underruns() -> u64 {
+    PLAYBACK_UNDERRUNS.load(Ordering::Relaxed)
+}
+
+pub(crate) fn buffer_drops() -> u64 {
+    PLAYBACK_BUFFER_DROPS.load(Ordering::Relaxed)
+}
 
 /// Bytes of stereo S16LE for `ms` milliseconds.
 pub(crate) fn playback_bytes_for_ms(ms: u64) -> u32 {
@@ -44,6 +62,7 @@ pub(crate) struct JitterBuffer {
     target_frames: usize,
     max_frames: usize,
     playing: bool,
+    underruns: u64,
 }
 
 impl JitterBuffer {
@@ -61,6 +80,7 @@ impl JitterBuffer {
             target_frames,
             max_frames: max_frames.max(target_frames).max(chunk_frames),
             playing: false,
+            underruns: 0,
         }
     }
 
@@ -69,8 +89,12 @@ impl JitterBuffer {
         self.pending.len() / self.channels
     }
 
+    fn set_target_frames(&mut self, frames: usize) {
+        self.target_frames = frames.max(self.chunk_frames).min(self.max_frames);
+    }
+
     /// Queue interleaved PCM, discarding the oldest frames on overflow.
-    pub(crate) fn push(&mut self, samples: &[i16]) {
+    pub(crate) fn push(&mut self, samples: &[i16]) -> usize {
         self.pending.extend(samples.iter().copied());
         let max_samples = self.max_frames.saturating_mul(self.channels);
         if self.pending.len() > max_samples {
@@ -78,7 +102,9 @@ impl JitterBuffer {
             let excess_frames = (self.pending.len() - max_samples).div_ceil(self.channels);
             let excess = (excess_frames * self.channels).min(self.pending.len());
             self.pending.drain(..excess);
+            return excess_frames;
         }
+        0
     }
 
     /// Release the next full chunk, or `None` while waiting for the prebuffer.
@@ -102,42 +128,142 @@ impl JitterBuffer {
         if chunk.len() < wanted {
             chunk.resize(wanted, 0);
             self.playing = false;
+            self.underruns += 1;
+            // Recover with one packet instead of imposing the full initial
+            // prebuffer again after a short network gap.
+            self.target_frames = self.chunk_frames;
         }
         Some(chunk)
-    }
-
-    pub(crate) fn clear(&mut self) {
-        self.pending.clear();
-        self.playing = false;
     }
 }
 
 /// A playback sink on the default output device with network-jitter buffering.
 pub struct Output {
-    inner: Playback,
-    buffer: JitterBuffer,
-    next_chunk: Instant,
+    sender: SyncSender<PlaybackCommand>,
+    thread: Option<JoinHandle<()>>,
+}
+
+enum PlaybackCommand {
+    Samples(Vec<i16>),
+    Stop,
 }
 
 impl Output {
     /// Open the default output. `device` is reserved for the settings picker.
     pub fn open(_device: Option<String>) -> Result<Self, String> {
-        Ok(Self {
-            inner: Playback::open(None)?,
-            buffer: JitterBuffer::new(
-                PLAYBACK_CHANNELS,
-                PLAYBACK_CHUNK_FRAMES,
-                PLAYBACK_TARGET_FRAMES,
-                PLAYBACK_MAX_FRAMES,
-            ),
-            next_chunk: Instant::now(),
-        })
+        const QUEUE: usize = 16;
+        let (sender, receiver) = mpsc::sync_channel(QUEUE);
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let thread = thread::Builder::new()
+            .name("sharescreen-audio-playback".into())
+            .spawn(move || {
+                let mut inner = match Playback::open(None) {
+                    Ok(inner) => {
+                        let _ = ready_tx.send(Ok(()));
+                        inner
+                    }
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                        return;
+                    }
+                };
+                let mut buffer = JitterBuffer::new(
+                    PLAYBACK_CHANNELS,
+                    PLAYBACK_CHUNK_FRAMES,
+                    PLAYBACK_TARGET_FRAMES,
+                    PLAYBACK_MAX_FRAMES,
+                );
+                let cadence = Duration::from_millis(PLAYBACK_CHUNK_MS);
+                let mut next_deadline = Instant::now();
+                let mut last_packet = None;
+                let mut jitter_ms = 0.0f64;
+                let mut stopping = false;
+                while !stopping {
+                    let wait = next_deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(5));
+                    match receiver.recv_timeout(wait) {
+                        Ok(PlaybackCommand::Samples(samples)) => {
+                            let now = Instant::now();
+                            if let Some(previous) = last_packet {
+                                let actual = now.duration_since(previous).as_secs_f64() * 1000.0;
+                                let deviation = (actual - PLAYBACK_CHUNK_MS as f64).abs();
+                                jitter_ms += (deviation - jitter_ms) / 16.0;
+                                let target_ms = (40.0 + 4.0 * jitter_ms).clamp(40.0, 120.0);
+                                buffer.set_target_frames(
+                                    (target_ms * PLAYBACK_RATE as f64 / 1000.0) as usize,
+                                );
+                            }
+                            last_packet = Some(now);
+                            let dropped = buffer.push(&samples);
+                            if dropped > 0 {
+                                PLAYBACK_BUFFER_DROPS.fetch_add(dropped as u64, Ordering::Relaxed);
+                            }
+                        }
+                        Ok(PlaybackCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            stopping = true
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    let now = Instant::now();
+                    if now >= next_deadline {
+                        let underruns_before = buffer.underruns;
+                        if let Some(chunk) = buffer.next_chunk() {
+                            let underruns = buffer.underruns - underruns_before;
+                            if underruns > 0 {
+                                PLAYBACK_UNDERRUNS.fetch_add(underruns, Ordering::Relaxed);
+                            }
+                            if let Err(error) = inner.play(&chunk) {
+                                let errors =
+                                    PLAYBACK_WRITE_ERRORS.fetch_add(1, Ordering::Relaxed) + 1;
+                                if errors == 1 || errors.is_multiple_of(100) {
+                                    tracing::warn!(errors, %error, "audio playback write failed");
+                                }
+                            }
+                            next_deadline += cadence;
+                            if next_deadline + cadence < now {
+                                next_deadline = now + cadence;
+                            }
+                        } else {
+                            next_deadline = now + Duration::from_millis(5);
+                        }
+                    }
+                }
+                inner.stop();
+            })
+            .map_err(|e| format!("failed to spawn playback thread: {e}"))?;
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                sender,
+                thread: Some(thread),
+            }),
+            Ok(Err(error)) => {
+                let _ = thread.join();
+                Err(error)
+            }
+            Err(_) => {
+                let _ = thread.join();
+                Err("playback thread stopped during initialization".into())
+            }
+        }
     }
 
     /// Queue interleaved 16-bit stereo PCM and write a due chunk.
     pub fn push(&mut self, samples: &[i16]) {
-        self.buffer.push(samples);
-        self.tick();
+        if !samples.is_empty()
+            && self
+                .sender
+                .send(PlaybackCommand::Samples(samples.to_vec()))
+                .is_err()
+        {
+            let errors = PLAYBACK_WRITE_ERRORS.fetch_add(1, Ordering::Relaxed) + 1;
+            if errors == 1 || errors.is_multiple_of(100) {
+                tracing::error!(
+                    errors,
+                    "audio playback worker is unavailable; PCM was not queued"
+                );
+            }
+        }
     }
 
     /// Write the next chunk if the 20 ms cadence is due.
@@ -145,20 +271,7 @@ impl Output {
     /// Call this from the decode loop even when no packet arrived, so an
     /// underrun becomes silence instead of a device underrun/click.
     pub fn tick(&mut self) {
-        let now = Instant::now();
-        if now < self.next_chunk {
-            return;
-        }
-        match self.buffer.next_chunk() {
-            Some(chunk) => {
-                self.inner.play(&chunk);
-                self.next_chunk = now + Duration::from_millis(PLAYBACK_CHUNK_MS);
-            }
-            None => {
-                // Still prebuffering. Re-check soon without spinning.
-                self.next_chunk = now + Duration::from_millis(5);
-            }
-        }
+        // The worker owns device pacing and services it during packet gaps.
     }
 
     /// Play interleaved 16-bit stereo PCM. Kept as a queueing alias for callers
@@ -168,8 +281,16 @@ impl Output {
     }
 
     pub fn stop(&mut self) {
-        self.buffer.clear();
-        self.inner.stop();
+        let _ = self.sender.send(PlaybackCommand::Stop);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for Output {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 

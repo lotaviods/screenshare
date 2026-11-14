@@ -205,13 +205,164 @@ impl Drop for VideoDecoder {
 const OPUS_OUT_RATE: i32 = 48_000;
 const OPUS_OUT_CHANNELS: i32 = 2;
 
-/// Decodes Opus packets into interleaved 16-bit PCM.
-///
-/// FFmpeg's native `opus` decoder emits planar float (`FLTP`), not S16.
-/// `swresample` converts whatever the decoder actually produces (format, rate
-/// and channel layout included) into the interleaved S16 the playback path
-/// expects.
+type OpusCreate = unsafe extern "C" fn(i32, i32, *mut i32) -> *mut std::ffi::c_void;
+type OpusDecode =
+    unsafe extern "C" fn(*mut std::ffi::c_void, *const u8, i32, *mut i16, i32, i32) -> i32;
+type OpusDestroy = unsafe extern "C" fn(*mut std::ffi::c_void);
+
+struct NativeOpus {
+    // The decoder function pointers are valid only while this library remains loaded.
+    _library: libloading::Library,
+    state: *mut std::ffi::c_void,
+    decode_fn: OpusDecode,
+    destroy_fn: OpusDestroy,
+}
+
+unsafe impl Send for NativeOpus {}
+
+impl Drop for NativeOpus {
+    fn drop(&mut self) {
+        unsafe { (self.destroy_fn)(self.state) };
+    }
+}
+
+enum OpusBackend {
+    Native(NativeOpus),
+    Ffmpeg(FfmpegOpusDecoder),
+}
+
+/// Decodes Opus packets into interleaved 16-bit PCM. Loads libopus when
+/// available to expose its packet-loss concealment and in-band FEC controls;
+/// otherwise it falls back to FFmpeg's Opus decoder.
 pub struct OpusDecoder {
+    backend: OpusBackend,
+}
+
+impl OpusDecoder {
+    pub fn new() -> Result<Self, String> {
+        if let Some(native) = NativeOpus::load()? {
+            return Ok(Self {
+                backend: OpusBackend::Native(native),
+            });
+        }
+        Ok(Self {
+            backend: OpusBackend::Ffmpeg(FfmpegOpusDecoder::new()?),
+        })
+    }
+
+    pub fn supports_loss_recovery(&self) -> bool {
+        matches!(&self.backend, OpusBackend::Native(_))
+    }
+
+    pub fn decode(&mut self, packet: &[u8]) -> Result<Vec<i16>, String> {
+        match &mut self.backend {
+            OpusBackend::Native(native) => native.decode(packet, 0, 5_760),
+            OpusBackend::Ffmpeg(ffmpeg) => ffmpeg.decode(packet),
+        }
+    }
+
+    /// Reconstruct a missing packet using the following packet's in-band FEC.
+    /// The decoder is advanced to the recovered packet's end; the caller must
+    /// then decode the same input packet normally.
+    pub fn decode_fec(
+        &mut self,
+        following_packet: &[u8],
+        frame_samples: usize,
+    ) -> Result<Vec<i16>, String> {
+        match &mut self.backend {
+            OpusBackend::Native(native) => native.decode(following_packet, 1, frame_samples),
+            OpusBackend::Ffmpeg(_) => Ok(vec![0; frame_samples * OPUS_OUT_CHANNELS as usize]),
+        }
+    }
+
+    /// Generate packet-loss concealment for one missing packet.
+    pub fn conceal(&mut self, frame_samples: usize) -> Result<Vec<i16>, String> {
+        match &mut self.backend {
+            OpusBackend::Native(native) => native.decode(&[], 0, frame_samples),
+            OpusBackend::Ffmpeg(_) => Ok(vec![0; frame_samples * OPUS_OUT_CHANNELS as usize]),
+        }
+    }
+}
+
+impl NativeOpus {
+    fn load() -> Result<Option<Self>, String> {
+        #[cfg(target_os = "linux")]
+        const NAMES: &[&str] = &["libopus.so.0", "libopus.so"];
+        #[cfg(target_os = "windows")]
+        const NAMES: &[&str] = &["opus.dll", "libopus-0.dll"];
+        #[cfg(not(any(target_os = "linux", windows)))]
+        const NAMES: &[&str] = &[];
+
+        let Some(library) = NAMES
+            .iter()
+            .find_map(|name| unsafe { libloading::Library::new(name).ok() })
+        else {
+            return Ok(None);
+        };
+        unsafe {
+            let create: OpusCreate = *library
+                .get::<OpusCreate>(b"opus_decoder_create\0")
+                .map_err(|error| format!("libopus missing opus_decoder_create: {error}"))?;
+            let decode_fn: OpusDecode = *library
+                .get::<OpusDecode>(b"opus_decode\0")
+                .map_err(|error| format!("libopus missing opus_decode: {error}"))?;
+            let destroy_fn: OpusDestroy = *library
+                .get::<OpusDestroy>(b"opus_decoder_destroy\0")
+                .map_err(|error| format!("libopus missing opus_decoder_destroy: {error}"))?;
+            let mut error = 0;
+            let state = create(OPUS_OUT_RATE, OPUS_OUT_CHANNELS, &mut error);
+            if state.is_null() || error != 0 {
+                return Err(format!("opus_decoder_create failed: {error}"));
+            }
+            Ok(Some(Self {
+                _library: library,
+                state,
+                decode_fn,
+                destroy_fn,
+            }))
+        }
+    }
+
+    fn decode(
+        &mut self,
+        packet: &[u8],
+        decode_fec: i32,
+        frame_samples: usize,
+    ) -> Result<Vec<i16>, String> {
+        if frame_samples == 0 || frame_samples > 5_760 || !frame_samples.is_multiple_of(120) {
+            return Err(format!("invalid Opus frame size: {frame_samples}"));
+        }
+        if packet.len() > i32::MAX as usize {
+            return Err("Opus packet is too large".into());
+        }
+        let mut pcm = vec![0_i16; frame_samples * OPUS_OUT_CHANNELS as usize];
+        let data = if packet.is_empty() {
+            std::ptr::null()
+        } else {
+            packet.as_ptr()
+        };
+        let samples = unsafe {
+            (self.decode_fn)(
+                self.state,
+                data,
+                packet.len() as i32,
+                pcm.as_mut_ptr(),
+                frame_samples as i32,
+                decode_fec,
+            )
+        };
+        if samples < 0 {
+            return Err(format!("opus_decode failed: {samples}"));
+        }
+        pcm.truncate(samples as usize * OPUS_OUT_CHANNELS as usize);
+        Ok(pcm)
+    }
+}
+
+/// FFmpeg fallback for systems where a standalone libopus cannot be loaded.
+/// FFmpeg's native `opus` decoder emits planar float (`FLTP`), not S16.
+/// `swresample` converts whatever the decoder actually produces.
+struct FfmpegOpusDecoder {
     ctx: *mut ffi::AVCodecContext,
     frame: *mut ffi::AVFrame,
     swr: *mut ffi::SwrContext,
@@ -223,8 +374,8 @@ pub struct OpusDecoder {
 
 unsafe impl Send for OpusDecoder {}
 
-impl OpusDecoder {
-    pub fn new() -> Result<Self, String> {
+impl FfmpegOpusDecoder {
+    fn new() -> Result<Self, String> {
         let name = CString::new("opus").map_err(|e| e.to_string())?;
         let codec = unsafe { ffi::avcodec_find_decoder_by_name(name.as_ptr()) };
         if codec.is_null() {
@@ -393,7 +544,7 @@ impl OpusDecoder {
     }
 }
 
-impl Drop for OpusDecoder {
+impl Drop for FfmpegOpusDecoder {
     fn drop(&mut self) {
         unsafe {
             if !self.swr.is_null() {

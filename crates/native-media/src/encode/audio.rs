@@ -42,6 +42,7 @@ pub struct OpusEncoder {
     frame_len: usize,
     pts: i64,
     bitrate_kbps: u32,
+    fec_enabled: bool,
 }
 
 // The context is only touched from the owning capture thread.
@@ -67,6 +68,22 @@ impl OpusEncoder {
                 den: SAMPLE_RATE as i32,
             };
             ffi::av_channel_layout_default(&mut (*ctx).ch_layout, CHANNELS as i32);
+            if !experimental && !(*ctx).priv_data.is_null() {
+                // libopus supports in-band FEC only when an expected loss
+                // rate is supplied. Keep DTX disabled so every 20 ms packet
+                // remains available to the receiver's concealment path.
+                for (key, value) in [("packet_loss", "5"), ("fec", "1")] {
+                    let key = CString::new(key).expect("static option name");
+                    let value = CString::new(value).expect("static option value");
+                    let ret = ffi::av_opt_set((*ctx).priv_data, key.as_ptr(), value.as_ptr(), 0);
+                    if ret < 0 {
+                        ffi::avcodec_free_context(&mut { ctx });
+                        return Err(EncodeError::Ffmpeg(format!(
+                            "failed to enable Opus {key:?}: {ret}"
+                        )));
+                    }
+                }
+            }
             if experimental {
                 (*ctx).strict_std_compliance = ffi::FF_COMPLIANCE_EXPERIMENTAL;
             }
@@ -104,6 +121,7 @@ impl OpusEncoder {
                 frame_len: frame_size * CHANNELS,
                 pts: 0,
                 bitrate_kbps,
+                fec_enabled: !experimental,
             })
         }
     }
@@ -179,6 +197,11 @@ impl OpusEncoder {
     pub fn bitrate_kbps(&self) -> u32 {
         self.bitrate_kbps
     }
+
+    /// Whether this encoder has in-band FEC enabled.
+    pub fn fec_enabled(&self) -> bool {
+        self.fec_enabled
+    }
 }
 
 impl Drop for OpusEncoder {
@@ -201,6 +224,8 @@ mod tests {
             return;
         }
         let mut encoder = OpusEncoder::new(96).expect("encoder");
+        let (_, experimental) = find_codec().expect("Opus encoder");
+        assert_eq!(encoder.fec_enabled(), !experimental);
         assert_eq!(encoder.frame_len() % CHANNELS, 0);
         let pcm = vec![0i16; encoder.frame_len()];
         let packet = encoder.encode(&pcm).expect("encode").expect("one packet");
