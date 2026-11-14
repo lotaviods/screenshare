@@ -314,7 +314,8 @@ decision remain open.
       subscription and requests a keyframe; everyone else stays on the
       thumbnail track (D15). The swap, the new egress track and pausing the
       previous subscription are proven in `server/tests/sfu_media_e2e.rs`
-      (2026-11-14, `95a09d2`); keyframe requests and thumbnail tracks are still
+      (2026-11-14, `95a09d2` and `27619bb`); keyframe requests and thumbnail
+      tracks are still
       missing, and the 500 ms time is not asserted.
 
 Acceptance: 4 clients on one relay; a late joiner gets video without a manual
