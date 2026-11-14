@@ -22,6 +22,7 @@ auth remain.
 - `crates/network` — ICE / STUN / TURN configuration.
 - `crates/ui` — GPUI desktop UI (binary `sharescreen`).
 - `server/` — axum signaling server.
+- `android/` — native Android client (Kotlin + Jetpack Compose + Google WebRTC).
 - `ARCHITECTURE.md` — full design decisions and roadmap.
 
 ## Build and test
