@@ -1,6 +1,7 @@
 package com.sharescreen.android.call
 
 import android.app.Application
+import android.content.Context
 import android.content.Intent
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
@@ -37,12 +38,22 @@ class CallViewModel(application: Application) : AndroidViewModel(application) {
 
     companion object {
         private const val TAG = "CallViewModel"
+        private const val PREFS_NAME = "sharescreen"
+        private const val KEY_NAME = "display_name"
+        private const val KEY_SERVER_URL = "server_url"
     }
 
     private val context = application.applicationContext
     private var callSession: CallSession? = null
 
-    private val _uiState = MutableStateFlow(CallUiState())
+    private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    private val _uiState = MutableStateFlow(
+        CallUiState(
+            selfName = prefs.getString(KEY_NAME, null).orEmpty(),
+            serverUrl = prefs.getString(KEY_SERVER_URL, null) ?: CallUiState().serverUrl,
+        )
+    )
     val uiState: StateFlow<CallUiState> = _uiState.asStateFlow()
 
     /** Emitted when the UI should launch the MediaProjection permission dialog. */
@@ -55,8 +66,15 @@ class CallViewModel(application: Application) : AndroidViewModel(application) {
 
     // --- Input setters ---
 
-    fun updateName(value: String) = _uiState.update { it.copy(selfName = value) }
-    fun updateServerUrl(value: String) = _uiState.update { it.copy(serverUrl = value) }
+    fun updateName(value: String) {
+        _uiState.update { it.copy(selfName = value) }
+        prefs.edit().putString(KEY_NAME, value).apply()
+    }
+
+    fun updateServerUrl(value: String) {
+        _uiState.update { it.copy(serverUrl = value) }
+        prefs.edit().putString(KEY_SERVER_URL, value).apply()
+    }
     fun updateRoomIdInput(value: String) = _uiState.update { it.copy(roomIdInput = value) }
     fun clearError() = _uiState.update { it.copy(error = null) }
 
