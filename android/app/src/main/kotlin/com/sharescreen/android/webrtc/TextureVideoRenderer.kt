@@ -46,7 +46,9 @@ class TextureVideoRenderer(
     }
 
     override fun onSurfaceTextureDestroyed(surfaceTexture: SurfaceTexture): Boolean {
-        renderer.releaseEglSurface(null)
+        // EglRenderer runs this callback unconditionally on its EglThread; a
+        // null completion crashes with NPE there.
+        renderer.releaseEglSurface { }
         return true
     }
 
