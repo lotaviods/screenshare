@@ -67,6 +67,8 @@ impl JpegEncoder {
             (*ctx).height = height as i32;
             (*ctx).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_YUVJ420P;
             (*ctx).time_base = ffi::AVRational { num: 1, den: 30 };
+            // Remote shares each own an encoder; avoid one CPU-sized pool per tile.
+            (*ctx).thread_count = 1;
             let ret = ffi::avcodec_open2(ctx, self.codec, ptr::null_mut());
             if ret < 0 {
                 ffi::avcodec_free_context(&mut { ctx });

@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use rtc::interceptor::Registry;
+use rtc::interceptor::{IntervalPliInterceptor, Registry, Slot};
 use rtc::media::Sample;
 use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
@@ -150,6 +150,24 @@ impl RemoteTrack {
             .iter()
             .find_map(|coding| coding.rtp_coding_parameters.ssrc)
             .ok_or(WebRtcError::RemoteSsrcUnavailable)?;
+        self.request_keyframe_for_ssrc(Some(media_ssrc)).await
+    }
+
+    /// Request an IDR using the SSRC observed on RTP when SDP omitted it.
+    /// Without an observed or negotiated SSRC there is nobody to address yet.
+    pub async fn request_keyframe_for_ssrc(&self, media_ssrc: Option<u32>) -> Result<()> {
+        let media_ssrc = match media_ssrc {
+            Some(ssrc) => Some(ssrc),
+            None => self
+                .inner
+                .codings()
+                .await
+                .iter()
+                .find_map(|coding| coding.rtp_coding_parameters.ssrc),
+        };
+        let Some(media_ssrc) = media_ssrc else {
+            return Ok(());
+        };
         self.inner
             .write_rtcp(vec![Box::new(
                 rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication {
@@ -286,6 +304,18 @@ impl PeerConnectionEventHandler for Handler {
     }
 }
 
+/// Build codecs and send one PLI as soon as a video stream binds.
+fn media_and_registry(video_codec: Codec) -> Result<(MediaEngine, Registry)> {
+    let mut media_engine = MediaEngine::default();
+    codec::register_default_codecs(&mut media_engine, video_codec)?;
+    let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
+    let registry = registry.with(
+        Slot::IntervalPli,
+        IntervalPliInterceptor::new(Duration::ZERO),
+    );
+    Ok((media_engine, registry))
+}
+
 impl WebRtcPeer {
     /// Most recent STUN round-trip time for the selected ICE pair, in milliseconds.
     /// This is network RTT to this peer, not one-way audio or video latency.
@@ -318,9 +348,7 @@ impl WebRtcPeer {
         if !matches!(video_codec, Codec::Vp8 | Codec::Vp9 | Codec::H264) {
             return Err(WebRtcError::UnsupportedCodec(video_codec));
         }
-        let mut media_engine = MediaEngine::default();
-        codec::register_default_codecs(&mut media_engine, video_codec)?;
-        let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
+        let (media_engine, registry) = media_and_registry(video_codec)?;
 
         let ice_servers = config
             .ice_servers
@@ -626,7 +654,10 @@ fn next_ssrc() -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{encoder_timestamp, PeerConfig, PeerEvent, RemoteTrackKind, WebRtcPeer};
+    use super::{
+        encoder_timestamp, media_and_registry, PeerConfig, PeerEvent, RemoteTrackKind, WebRtcPeer,
+    };
+    use rtc::interceptor::Slot;
     use sharescreen_core::Codec;
     use std::sync::Arc;
     use std::sync::OnceLock;
@@ -641,6 +672,15 @@ mod tests {
             Duration::from_millis(20)
         );
         assert_eq!(encoder_timestamp(&clock, 5_000), base);
+    }
+
+    #[test]
+    fn interceptor_chain_requests_a_keyframe_on_bind() {
+        let (_, registry) = media_and_registry(Codec::H264).unwrap();
+        let slots = registry.slots();
+        assert!(slots
+            .iter()
+            .any(|(slot, name)| *slot == Slot::IntervalPli && name == "IntervalPliInterceptor"));
     }
 
     #[tokio::test]

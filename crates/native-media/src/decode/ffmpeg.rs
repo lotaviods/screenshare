@@ -38,6 +38,8 @@ pub struct VideoDecoder {
     ctx: *mut ffi::AVCodecContext,
     frame: *mut ffi::AVFrame,
     sws: *mut ffi::SwsContext,
+    src_width: u32,
+    src_height: u32,
     width: u32,
     height: u32,
     format: i32,
@@ -57,6 +59,9 @@ impl VideoDecoder {
             if ctx.is_null() {
                 return Err("avcodec_alloc_context3 failed".into());
             }
+            // Each remote track owns a decoder. Letting every context create a
+            // CPU-sized thread pool exhausts memory when several shares arrive.
+            (*ctx).thread_count = 1;
             let ret = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
             if ret < 0 {
                 ffi::avcodec_free_context(&mut { ctx });
@@ -71,6 +76,8 @@ impl VideoDecoder {
                 ctx,
                 frame,
                 sws: ptr::null_mut(),
+                src_width: 0,
+                src_height: 0,
                 width: 0,
                 height: 0,
                 format: -1,
@@ -80,13 +87,21 @@ impl VideoDecoder {
 
     /// Decode one packet. Returns RGB24 frames, one per decoded picture.
     pub fn decode(&mut self, packet: &[u8]) -> Result<Vec<Vec<u8>>, String> {
-        if packet.is_empty() {
+        self.decode_scaled(packet, u32::MAX)
+    }
+
+    /// Decode one packet, downscaling pictures wider than `max_width` before
+    /// allocating their RGB buffers. `width` and `height` report the output size.
+    pub fn decode_scaled(&mut self, packet: &[u8], max_width: u32) -> Result<Vec<Vec<u8>>, String> {
+        if packet.is_empty() || max_width == 0 {
             return Ok(Vec::new());
         }
         unsafe {
             send_packet(self.ctx, packet)?;
             let mut out = Vec::new();
             loop {
+                // Release the previous picture before FFmpeg reuses the frame.
+                ffi::av_frame_unref(self.frame);
                 let ret = ffi::avcodec_receive_frame(self.ctx, self.frame);
                 if ret == ffi::AVERROR(ffi::EAGAIN) || ret == ffi::AVERROR_EOF {
                     break;
@@ -94,25 +109,34 @@ impl VideoDecoder {
                 if ret < 0 {
                     return Err(format!("avcodec_receive_frame failed: {ret}"));
                 }
-                let width = (*self.frame).width as u32;
-                let height = (*self.frame).height as u32;
-                if width == 0 || height == 0 {
+                let src_width = (*self.frame).width as u32;
+                let src_height = (*self.frame).height as u32;
+                if src_width == 0 || src_height == 0 {
                     continue;
                 }
-                let pixels = (width as usize).checked_mul(height as usize);
-                if width > 16_384
-                    || height > 16_384
-                    || pixels.is_none_or(|pixels| pixels > 33_554_432)
+                let src_pixels = (src_width as usize).checked_mul(src_height as usize);
+                if src_width > 16_384
+                    || src_height > 16_384
+                    || src_pixels.is_none_or(|pixels| pixels > 33_554_432)
                 {
                     return Err(format!(
-                        "decoded video dimensions are unsafe: {width}x{height}"
+                        "decoded video dimensions are unsafe: {src_width}x{src_height}"
                     ));
                 }
+                let (width, height) =
+                    crate::preview::preview_size(src_width, src_height, max_width);
                 let format = (*self.frame).format;
                 if format < 0 || format >= ffi::AVPixelFormat::AV_PIX_FMT_NB as i32 {
                     return Err(format!("decoder returned invalid pixel format: {format}"));
                 }
-                if width != self.width || height != self.height || format != self.format {
+                if src_width != self.src_width
+                    || src_height != self.src_height
+                    || width != self.width
+                    || height != self.height
+                    || format != self.format
+                {
+                    self.src_width = src_width;
+                    self.src_height = src_height;
                     self.width = width;
                     self.height = height;
                     self.format = format;
@@ -120,8 +144,8 @@ impl VideoDecoder {
                         ffi::sws_freeContext(self.sws);
                     }
                     self.sws = ffi::sws_getContext(
-                        width as i32,
-                        height as i32,
+                        src_width as i32,
+                        src_height as i32,
                         std::mem::transmute::<i32, ffi::AVPixelFormat>(format),
                         width as i32,
                         height as i32,
@@ -135,7 +159,8 @@ impl VideoDecoder {
                         return Err("sws_getContext failed".into());
                     }
                 }
-                let rgb_len = pixels
+                let rgb_len = (width as usize)
+                    .checked_mul(height as usize)
                     .and_then(|pixels| pixels.checked_mul(3))
                     .ok_or_else(|| "decoded RGB frame size overflow".to_string())?;
                 let mut rgb = vec![0u8; rgb_len];
@@ -163,13 +188,13 @@ impl VideoDecoder {
                     src_data.as_ptr(),
                     src_stride.as_ptr(),
                     0,
-                    height as i32,
+                    src_height as i32,
                     dst_data.as_ptr(),
                     dst_stride.as_ptr(),
                 );
                 if ret != height as i32 {
                     return Err(format!(
-                        "sws_scale returned {ret} rows for {height}-row frame"
+                        "sws_scale returned {ret} rows for {height}-row output frame"
                     ));
                 }
                 out.push(rgb);
@@ -553,6 +578,46 @@ impl Drop for FfmpegOpusDecoder {
             ffi::av_channel_layout_uninit(&mut self.swr_layout);
             ffi::av_frame_free(&mut self.frame);
             ffi::avcodec_free_context(&mut self.ctx);
+        }
+    }
+}
+
+#[cfg(test)]
+mod video_tests {
+    use super::VideoDecoder;
+
+    const H264_SAMPLE: &[u8] = include_bytes!("../../../media/fixtures/sample.h264");
+
+    #[test]
+    fn decode_scales_before_allocating_rgb_and_can_change_sizes() {
+        let mut decoder = VideoDecoder::new("h264").unwrap();
+        for (max_width, expected) in [(160, (160, 120)), (320, (320, 240)), (160, (160, 120))] {
+            let frames = decoder.decode_scaled(H264_SAMPLE, max_width).unwrap();
+            assert!(!frames.is_empty());
+            assert_eq!((decoder.width(), decoder.height()), expected);
+            assert!(frames
+                .iter()
+                .all(|frame| frame.len() == expected.0 as usize * expected.1 as usize * 3));
+        }
+    }
+
+    #[test]
+    fn concurrent_decoder_recreation_does_not_corrupt_native_heap() {
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..16 {
+                        let mut decoder = VideoDecoder::new("h264").unwrap();
+                        assert!(decoder.decode(&[0, 0, 0, 1, 0x41, 0xff]).is_err());
+                        drop(decoder);
+                        let mut decoder = VideoDecoder::new("h264").unwrap();
+                        assert!(!decoder.decode(H264_SAMPLE).unwrap().is_empty());
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
         }
     }
 }

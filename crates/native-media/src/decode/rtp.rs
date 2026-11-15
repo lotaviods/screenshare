@@ -29,6 +29,99 @@ pub struct RtpDepacketizer {
 
 const MAX_H264_ACCESS_UNIT_BYTES: usize = 32 * 1024 * 1024;
 
+/// Strip VP8's payload descriptor, leaving the frame/partition bytes.
+pub fn vp8_payload(payload: &[u8]) -> Option<&[u8]> {
+    let descriptor = *payload.first()?;
+    let mut offset = 1;
+    if descriptor & 0x80 != 0 {
+        let extension = *payload.get(offset)?;
+        offset += 1;
+        if extension & 0x80 != 0 {
+            let picture_id = *payload.get(offset)?;
+            offset += if picture_id & 0x80 != 0 { 2 } else { 1 };
+        }
+        if extension & 0x40 != 0 {
+            offset += 1;
+        }
+        if extension & 0x30 != 0 {
+            offset += 1;
+        }
+    }
+    payload.get(offset..)
+}
+
+/// Strip VP9's payload descriptor, including layers and scalability metadata.
+pub fn vp9_payload(payload: &[u8]) -> Option<&[u8]> {
+    let descriptor = *payload.first()?;
+    let mut offset = 1;
+    if descriptor & 0x80 != 0 {
+        let picture_id = *payload.get(offset)?;
+        offset += if picture_id & 0x80 != 0 { 2 } else { 1 };
+    }
+    if descriptor & 0x20 != 0 {
+        offset += 1;
+        if descriptor & 0x10 == 0 {
+            offset += 1;
+        }
+    }
+    if descriptor & 0x50 == 0x50 {
+        // Flexible-mode inter frame: up to three P_DIFF octets, N in the LSB.
+        for _ in 0..3 {
+            let difference = *payload.get(offset)?;
+            offset += 1;
+            if difference & 0x01 == 0 {
+                break;
+            }
+        }
+    }
+    if descriptor & 0x02 != 0 {
+        let scaling = *payload.get(offset)?;
+        offset += 1;
+        if scaling & 0x80 != 0 {
+            let layers = *payload.get(offset)?;
+            offset += 1;
+            if layers & 0x10 != 0 {
+                offset = offset.checked_add((usize::from((layers >> 5) & 0x07) + 1) * 4)?;
+            }
+            if layers & 0x08 != 0 {
+                let frames = usize::from(*payload.get(offset)?);
+                offset += 1;
+                for _ in 0..frames {
+                    let frame = *payload.get(offset)?;
+                    offset += 1 + usize::from((frame >> 2) & 0x07);
+                }
+            }
+        }
+    }
+    payload.get(offset..)
+}
+
+/// Return the payload after the fixed header, CSRCs, extensions and padding.
+pub fn rtp_payload(packet: &[u8]) -> Option<&[u8]> {
+    if packet.len() < 12 || packet[0] >> 6 != 2 {
+        return None;
+    }
+    let mut offset = 12 + usize::from(packet[0] & 0x0f) * 4;
+    if offset > packet.len() {
+        return None;
+    }
+    if packet[0] & 0x10 != 0 {
+        let extension = packet.get(offset..offset + 4)?;
+        let words = usize::from(u16::from_be_bytes([extension[2], extension[3]]));
+        offset = offset.checked_add(4 + words.checked_mul(4)?)?;
+    }
+    let end = if packet[0] & 0x20 != 0 {
+        let padding = usize::from(*packet.last()?);
+        if padding == 0 || padding > packet.len().saturating_sub(offset) {
+            return None;
+        }
+        packet.len() - padding
+    } else {
+        packet.len()
+    };
+    packet.get(offset..end)
+}
+
 impl RtpDepacketizer {
     pub fn new(kind: RtpKind) -> Self {
         Self {
@@ -44,10 +137,9 @@ impl RtpDepacketizer {
 
     /// Push one full RTP packet. Returns zero or more complete frames.
     pub fn push(&mut self, packet: &[u8]) -> Vec<Vec<u8>> {
-        if packet.len() < 12 {
+        let Some(payload) = rtp_payload(packet) else {
             return Vec::new();
-        }
-        let payload = &packet[12..];
+        };
         match self.kind {
             RtpKind::H264 => {
                 let ts = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
@@ -55,6 +147,16 @@ impl RtpDepacketizer {
                 let mut out = Vec::new();
                 if self.discard_ts == Some(ts) {
                     self.last_seq = Some(seq);
+                    return out;
+                }
+                if self.last_seq == Some(seq) {
+                    return out;
+                }
+                if self
+                    .last_seq
+                    .is_some_and(|last| seq.wrapping_sub(last) > 0x8000)
+                {
+                    // Do not feed a late fragment into the newer access unit.
                     return out;
                 }
                 let sequence_gap = self
@@ -93,7 +195,13 @@ impl RtpDepacketizer {
                 self.push_h264(payload);
                 out
             }
-            RtpKind::Vp8 | RtpKind::Vp9 | RtpKind::Opus => vec![payload.to_vec()],
+            RtpKind::Vp8 => {
+                vp8_payload(payload).map_or_else(Vec::new, |frame| vec![frame.to_vec()])
+            }
+            RtpKind::Vp9 => {
+                vp9_payload(payload).map_or_else(Vec::new, |frame| vec![frame.to_vec()])
+            }
+            RtpKind::Opus => vec![payload.to_vec()],
         }
     }
 
@@ -153,6 +261,19 @@ impl RtpDepacketizer {
         }
         if nal_type == 24 {
             // STAP-A: one or more NAL units, each with a 2-byte length.
+            // Validate the whole aggregation before committing any of its NALs.
+            let mut valid = 1;
+            while valid < payload.len() {
+                if valid + 2 > payload.len() {
+                    return;
+                }
+                let size = u16::from_be_bytes([payload[valid], payload[valid + 1]]) as usize;
+                valid += 2;
+                if size == 0 || valid.saturating_add(size) > payload.len() {
+                    return;
+                }
+                valid += size;
+            }
             let mut i = 1;
             while i + 2 <= payload.len() {
                 let size = u16::from_be_bytes([payload[i], payload[i + 1]]) as usize;
@@ -197,6 +318,7 @@ mod tests {
 
     fn rtp(payload: &[u8]) -> Vec<u8> {
         let mut packet = vec![0u8; 12];
+        packet[0] = 0x80;
         packet.extend_from_slice(payload);
         packet
     }
@@ -251,10 +373,61 @@ mod tests {
     }
 
     #[test]
-    fn vp8_and_opus_pass_through() {
-        let mut d = RtpDepacketizer::new(RtpKind::Vp8);
-        assert_eq!(d.push(&rtp(&[0x10, 0x01])), vec![vec![0x10, 0x01]]);
-        let mut d = RtpDepacketizer::new(RtpKind::Opus);
-        assert_eq!(d.push(&rtp(&[0x01, 0x02])), vec![vec![0x01, 0x02]]);
+    fn csrcs_extensions_and_padding_are_not_codec_payload() {
+        let mut packet = rtp(&[0x65, 0x01, 0x02, 0, 0, 0]);
+        packet[0] = 0x80 | 0x20 | 0x10 | 0x01;
+        packet.splice(12..12, [0, 0, 0, 1]);
+        packet.splice(16..16, [0xbe, 0xde, 0, 1, 9, 8, 7, 6]);
+        *packet.last_mut().unwrap() = 3;
+        let mut d = RtpDepacketizer::new(RtpKind::H264);
+        assert!(d.push(&packet).is_empty());
+        assert_eq!(d.flush(), vec![vec![0, 0, 0, 1, 0x65, 1, 2]]);
+    }
+
+    #[test]
+    fn duplicate_and_late_packets_do_not_corrupt_the_next_unit() {
+        let mut d = RtpDepacketizer::new(RtpKind::H264);
+        let mut first = rtp(&[0x65, 0x01]);
+        first[2..4].copy_from_slice(&10u16.to_be_bytes());
+        assert!(d.push(&first).is_empty());
+        assert!(d.push(&first).is_empty());
+        let mut late = rtp(&[0x41, 0xff]);
+        late[2..4].copy_from_slice(&9u16.to_be_bytes());
+        assert!(d.push(&late).is_empty());
+        assert_eq!(d.flush(), vec![vec![0, 0, 0, 1, 0x65, 1]]);
+    }
+
+    #[test]
+    fn malformed_stap_does_not_leave_a_partial_access_unit() {
+        let mut d = RtpDepacketizer::new(RtpKind::H264);
+        d.push(&rtp(&[0x78, 0, 2, 0x67, 0x01, 0, 9, 0x68]));
+        assert!(d.flush().is_empty());
+    }
+
+    #[test]
+    fn vp8_and_vp9_descriptors_are_not_sent_to_the_decoder() {
+        let mut vp8 = RtpDepacketizer::new(RtpKind::Vp8);
+        assert_eq!(vp8.push(&rtp(&[0x10, 0x01])), vec![vec![0x01]]);
+        // X, I, L and T/K: 15-bit picture id, TL0PICIDX and T/K octet.
+        assert_eq!(
+            vp8.push(&rtp(&[0x90, 0xf0, 0x81, 0x02, 0x03, 0x04, 0x00, 0x9d])),
+            vec![vec![0x00, 0x9d]]
+        );
+        let mut vp9 = RtpDepacketizer::new(RtpKind::Vp9);
+        // I, L, B and V with one layer size and one group entry.
+        assert_eq!(
+            vp9.push(&rtp(&[
+                0xaa, 0x01, 0x02, 0x03, 0x80, 0x10, 0, 1, 0, 2, 0x02, 0x9d,
+            ])),
+            vec![vec![0x02, 0x9d]]
+        );
+        // Flexible-mode inter frame: I, P and F with two P_DIFF octets.
+        let mut vp9 = RtpDepacketizer::new(RtpKind::Vp9);
+        assert_eq!(
+            vp9.push(&rtp(&[0xd0, 0x01, 0x85, 0x86, 0x9d])),
+            vec![vec![0x9d]]
+        );
+        let mut opus = RtpDepacketizer::new(RtpKind::Opus);
+        assert_eq!(opus.push(&rtp(&[0x01, 0x02])), vec![vec![0x01, 0x02]]);
     }
 }

@@ -9,4 +9,4 @@ pub mod rtp;
 
 pub use ffmpeg::{OpusDecoder, VideoDecoder};
 pub use jpeg::JpegEncoder;
-pub use rtp::{RtpDepacketizer, RtpKind};
+pub use rtp::{rtp_payload, vp8_payload, vp9_payload, RtpDepacketizer, RtpKind};
