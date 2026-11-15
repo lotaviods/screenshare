@@ -1619,6 +1619,7 @@ impl AppView {
             );
         }
 
+        sidebar = sidebar.child(self.transmission_panel());
         let rtt = self.rtt_history.back().copied();
         let mut graph = div().flex().flex_row().items_end().gap_1().h(px(32.));
         for ms in &self.rtt_history {
@@ -1750,6 +1751,60 @@ impl AppView {
                         ),
                 ),
         )
+    }
+
+    /// Live encoders per outgoing stream and the topology in use. Values come
+    /// from the config, which `start_share` rewrites to the stream it actually
+    /// started, so they track what peers receive.
+    fn transmission_panel(&self) -> Div {
+        let video = &self.config.video;
+        let audio = &self.config.audio;
+        let audio_detail = format!("{} · {} kbps", codec_name(audio.codec), audio.bitrate_kbps);
+        let video_detail = format!(
+            "{} · {}×{} @{} fps · {} kbps",
+            codec_name(video.codec),
+            video.width,
+            video.height,
+            video.max_fps,
+            video.max_bitrate_kbps
+        );
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(label("TRANSMISSION"))
+            .child(stream_row(
+                "Connection",
+                connection_mode_name(self.config.network.connection_mode).to_owned(),
+                true,
+            ))
+            .child(stream_row(
+                "Microphone",
+                if self.mic_on {
+                    audio_detail.clone()
+                } else {
+                    "Off".to_owned()
+                },
+                self.mic_on,
+            ))
+            .child(stream_row(
+                "System audio",
+                if self.system_on {
+                    audio_detail
+                } else {
+                    "Off".to_owned()
+                },
+                self.system_on,
+            ))
+            .child(stream_row(
+                "Screen video",
+                if self.sharing {
+                    video_detail
+                } else {
+                    "Off".to_owned()
+                },
+                self.sharing,
+            ))
     }
 
     fn settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2503,6 +2558,40 @@ fn label(text: impl Into<SharedString>) -> Div {
     div().text_xs().text_color(rgb(MUTED)).child(text.into())
 }
 
+/// One "name — value" line for the transmission panel.
+fn stream_row(name: &'static str, detail: String, active: bool) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .justify_between()
+        .gap_2()
+        .child(div().text_xs().text_color(rgb(MUTED)).child(name))
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(if active { TEXT } else { MUTED }))
+                .child(SharedString::from(detail)),
+        )
+}
+
+fn codec_name(codec: Codec) -> &'static str {
+    match codec {
+        Codec::Opus => "Opus",
+        Codec::Vp8 => "VP8",
+        Codec::Vp9 => "VP9",
+        Codec::H264 => "H.264",
+        Codec::H265 => "H.265",
+        Codec::Av1 => "AV1",
+    }
+}
+
+fn connection_mode_name(mode: ConnectionMode) -> &'static str {
+    match mode {
+        ConnectionMode::Mesh => "Mesh (peer to peer)",
+        ConnectionMode::Sfu => "SFU relay",
+    }
+}
+
 fn card() -> Div {
     div()
         .flex()
@@ -2789,6 +2878,17 @@ mod tests {
         assert!(!codec_requires_reconnect(Codec::H264, Codec::Vp9, false));
         // Picking the same codec again must not churn the connection.
         assert!(!codec_requires_reconnect(Codec::Vp9, Codec::Vp9, true));
+    }
+
+    #[test]
+    fn transmission_labels_are_human_readable() {
+        assert_eq!(codec_name(Codec::H264), "H.264");
+        assert_eq!(codec_name(Codec::Opus), "Opus");
+        assert_eq!(
+            connection_mode_name(ConnectionMode::Mesh),
+            "Mesh (peer to peer)"
+        );
+        assert_eq!(connection_mode_name(ConnectionMode::Sfu), "SFU relay");
     }
 
     #[test]
