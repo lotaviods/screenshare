@@ -396,9 +396,10 @@ async fn dispatch(
                 }
                 match item {
                     Incoming::Message(msg) => handle_message(&shared, msg).await,
-                    Incoming::Disconnected => {
+                    Incoming::Disconnected { reason } => {
+                        tracing::warn!(%reason, "signaling disconnected; stopping call dispatch");
                         let _ = shared.events.send(CallEvent::Error {
-                            message: "signaling connection lost".into(),
+                            message: format!("signaling connection lost: {reason}"),
                         });
                         break;
                     }

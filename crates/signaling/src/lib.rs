@@ -21,7 +21,7 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 #[derive(Debug)]
 pub enum Incoming {
     Message(SignalMessage),
-    Disconnected,
+    Disconnected { reason: String },
 }
 
 /// A cloneable handle for sending signaling messages.
@@ -82,41 +82,64 @@ impl SignalingClient {
         // Writer task: serialize outbound messages and write them to the socket.
         tokio::spawn(async move {
             while let Some(msg) = out_rx.recv().await {
-                let Outbound::Message(msg) = msg else { break };
+                let Outbound::Message(msg) = msg else {
+                    tracing::debug!("signaling writer: explicit close requested");
+                    break;
+                };
                 let Ok(text) = serde_json::to_string(&msg) else {
+                    tracing::warn!("signaling writer: failed to serialize outbound message");
                     continue;
                 };
-                if ws_sink.send(WsMessage::Text(text.into())).await.is_err() {
+                if let Err(e) = ws_sink.send(WsMessage::Text(text.into())).await {
+                    tracing::warn!("signaling writer: websocket send failed: {e}");
                     break;
                 }
             }
-            let _ = ws_sink.close().await;
+            if let Err(e) = ws_sink.close().await {
+                tracing::debug!("signaling writer: websocket close failed: {e}");
+            }
         });
 
         // Reader task: parse inbound messages and forward them; signal
         // disconnection when the socket closes or errors.
         tokio::spawn(async move {
-            while let Some(msg) = ws_stream.next().await {
+            let reason = loop {
+                let Some(msg) = ws_stream.next().await else {
+                    break "websocket stream ended without close frame".to_string();
+                };
                 match msg {
                     Ok(WsMessage::Text(text)) => {
                         match serde_json::from_str::<SignalMessage>(text.as_str()) {
                             Ok(m) => {
+                                tracing::trace!("signaling reader: received {:?}", std::mem::discriminant(&m));
                                 if incoming_tx.send(Incoming::Message(m)).is_err() {
                                     return;
                                 }
                             }
-                            Err(e) => tracing::warn!("ignoring malformed signaling message: {e}"),
+                            Err(e) => tracing::warn!("signaling reader: ignoring malformed signaling message: {e}"),
                         }
                     }
-                    Ok(WsMessage::Close(_)) => break,
-                    Ok(_) => {}
+                    Ok(WsMessage::Close(frame)) => {
+                        break match frame {
+                            Some(f) => format!(
+                                "server closed websocket: code={} reason={:?}",
+                                f.code, f.reason
+                            ),
+                            None => "server closed websocket without close frame details".to_string(),
+                        };
+                    }
+                    Ok(WsMessage::Ping(_)) => tracing::trace!("signaling reader: ping"),
+                    Ok(WsMessage::Pong(_)) => tracing::trace!("signaling reader: pong"),
+                    Ok(WsMessage::Binary(_)) => tracing::warn!("signaling reader: unexpected binary frame"),
+                    Ok(WsMessage::Frame(_)) => {}
                     Err(e) => {
                         tracing::warn!("signaling socket error: {e}");
-                        break;
+                        break format!("websocket read error: {e}");
                     }
                 }
-            }
-            let _ = incoming_tx.send(Incoming::Disconnected);
+            };
+            tracing::warn!("signaling disconnected: {reason}");
+            let _ = incoming_tx.send(Incoming::Disconnected { reason });
         });
 
         Ok(Self {

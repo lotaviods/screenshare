@@ -99,17 +99,33 @@ async fn handle_connection(mut socket: WebSocket, state: AppState, id: String, n
                 match msg {
                     Some(m) => {
                         if let Ok(text) = serde_json::to_string(&m) {
-                            if socket.send(Message::Text(text.into())).await.is_err() {
+                            if let Err(error) = socket.send(Message::Text(text.into())).await {
+                                tracing::warn!(peer_id = %id, room_id = ?room_id, "websocket send failed: {error}");
                                 break;
                             }
+                        } else {
+                            tracing::warn!(peer_id = %id, room_id = ?room_id, "failed to serialize outbound signaling message");
                         }
                     }
-                    None => break,
+                    None => {
+                        tracing::info!(peer_id = %id, room_id = ?room_id, "outbound signaling channel closed");
+                        break;
+                    }
                 }
             }
             // Inbound WebSocket messages → process.
             incoming = socket.recv() => {
-                let Some(Ok(msg)) = incoming else { break };
+                let msg = match incoming {
+                    Some(Ok(msg)) => msg,
+                    Some(Err(error)) => {
+                        tracing::warn!(peer_id = %id, room_id = ?room_id, "websocket receive error: {error}");
+                        break;
+                    }
+                    None => {
+                        tracing::info!(peer_id = %id, room_id = ?room_id, "websocket stream ended");
+                        break;
+                    }
+                };
                 match msg {
                     Message::Text(text) => {
                         let Ok(m) = serde_json::from_str::<SignalMessage>(text.as_str()) else {
@@ -332,7 +348,23 @@ async fn handle_connection(mut socket: WebSocket, state: AppState, id: String, n
                             _ => {}
                         }
                     }
-                    Message::Close(_) => break,
+                    Message::Close(frame) => {
+                        match frame {
+                            Some(frame) => tracing::info!(
+                                peer_id = %id,
+                                room_id = ?room_id,
+                                code = %frame.code,
+                                reason = %frame.reason,
+                                "websocket closed by client"
+                            ),
+                            None => tracing::info!(
+                                peer_id = %id,
+                                room_id = ?room_id,
+                                "websocket closed by client without close frame details"
+                            ),
+                        }
+                        break;
+                    }
                     _ => {}
                 }
             }
@@ -340,6 +372,7 @@ async fn handle_connection(mut socket: WebSocket, state: AppState, id: String, n
     }
 
     // Cleanup on disconnect: leave the room and notify the remaining peers.
+    tracing::info!(peer_id = %id, room_id = ?room_id, "signaling connection cleanup");
     if let Some(rid) = room_id {
         close_sfu_peer(&state, &rid, &id).await;
         if let Some(sfu_room) = state.sfu_rooms.lock().unwrap().get_mut(&rid) {

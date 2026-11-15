@@ -13,7 +13,7 @@ use tokio::time::timeout;
 async fn recv_msg(rx: &mut UnboundedReceiver<Incoming>) -> SignalMessage {
     match timeout(Duration::from_secs(5), rx.recv()).await {
         Ok(Some(Incoming::Message(m))) => m,
-        Ok(Some(Incoming::Disconnected)) => panic!("unexpected disconnect"),
+        Ok(Some(Incoming::Disconnected { reason })) => panic!("unexpected disconnect: {reason}"),
         Ok(None) => panic!("channel closed"),
         Err(_) => panic!("timed out waiting for signaling message"),
     }
