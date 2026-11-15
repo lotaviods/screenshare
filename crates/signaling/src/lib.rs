@@ -111,12 +111,17 @@ impl SignalingClient {
                     Ok(WsMessage::Text(text)) => {
                         match serde_json::from_str::<SignalMessage>(text.as_str()) {
                             Ok(m) => {
-                                tracing::trace!("signaling reader: received {:?}", std::mem::discriminant(&m));
+                                tracing::trace!(
+                                    "signaling reader: received {:?}",
+                                    std::mem::discriminant(&m)
+                                );
                                 if incoming_tx.send(Incoming::Message(m)).is_err() {
                                     return;
                                 }
                             }
-                            Err(e) => tracing::warn!("signaling reader: ignoring malformed signaling message: {e}"),
+                            Err(e) => tracing::warn!(
+                                "signaling reader: ignoring malformed signaling message: {e}"
+                            ),
                         }
                     }
                     Ok(WsMessage::Close(frame)) => {
@@ -125,12 +130,16 @@ impl SignalingClient {
                                 "server closed websocket: code={} reason={:?}",
                                 f.code, f.reason
                             ),
-                            None => "server closed websocket without close frame details".to_string(),
+                            None => {
+                                "server closed websocket without close frame details".to_string()
+                            }
                         };
                     }
                     Ok(WsMessage::Ping(_)) => tracing::trace!("signaling reader: ping"),
                     Ok(WsMessage::Pong(_)) => tracing::trace!("signaling reader: pong"),
-                    Ok(WsMessage::Binary(_)) => tracing::warn!("signaling reader: unexpected binary frame"),
+                    Ok(WsMessage::Binary(_)) => {
+                        tracing::warn!("signaling reader: unexpected binary frame")
+                    }
                     Ok(WsMessage::Frame(_)) => {}
                     Err(e) => {
                         tracing::warn!("signaling socket error: {e}");
