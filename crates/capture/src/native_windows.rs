@@ -149,6 +149,13 @@ fn run(
         let Some(encoder) = encoder.as_mut() else {
             return Err("video encoder unavailable".into());
         };
+        if options
+            .keyframe_request
+            .as_ref()
+            .is_some_and(|request| request.swap(false, std::sync::atomic::Ordering::AcqRel))
+        {
+            encoder.request_keyframe();
+        }
         // Share the captured frame with the preview worker for free; the worker
         // downsamples and JPEG-encodes it on its own thread.
         let frame = Arc::new(frame);
