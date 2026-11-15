@@ -656,12 +656,11 @@ impl FfmpegEncoder {
                 self.preview_sw_format = sw_format;
             }
 
-            let mut rgb = vec![0u8; preview_width as usize * preview_height as usize * 3];
             let src_data = [
-                (*cpu).data[0],
-                (*cpu).data[1],
-                (*cpu).data[2],
-                (*cpu).data[3],
+                (*cpu).data[0] as *const u8,
+                (*cpu).data[1] as *const u8,
+                (*cpu).data[2] as *const u8,
+                (*cpu).data[3] as *const u8,
             ];
             let src_stride = [
                 (*cpu).linesize[0],
@@ -669,28 +668,17 @@ impl FfmpegEncoder {
                 (*cpu).linesize[2],
                 (*cpu).linesize[3],
             ];
-            let dst_data = [
-                rgb.as_mut_ptr(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-            ];
-            let dst_stride = [preview_width as i32 * 3, 0, 0, 0];
-            let ret = ffi::sws_scale(
+            let rgb = crate::scale_rgb24(
                 self.preview_sws,
-                src_data.as_ptr() as *const *const u8,
-                src_stride.as_ptr(),
-                0,
+                &src_data,
+                &src_stride,
                 self.config.height as i32,
-                dst_data.as_ptr(),
-                dst_stride.as_ptr(),
-            );
+                preview_width,
+                preview_height,
+            )
+            .map_err(EncodeError::Ffmpeg);
             ffi::av_frame_free(&mut cpu);
-            if ret < 0 {
-                return Err(EncodeError::Ffmpeg(format!(
-                    "sws_scale(preview) failed: {ret}"
-                )));
-            }
+            let rgb = rgb?;
             let jpeg = self
                 .jpeg
                 .as_mut()

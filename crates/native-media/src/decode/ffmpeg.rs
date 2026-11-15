@@ -159,11 +159,6 @@ impl VideoDecoder {
                         return Err("sws_getContext failed".into());
                     }
                 }
-                let rgb_len = (width as usize)
-                    .checked_mul(height as usize)
-                    .and_then(|pixels| pixels.checked_mul(3))
-                    .ok_or_else(|| "decoded RGB frame size overflow".to_string())?;
-                let mut rgb = vec![0u8; rgb_len];
                 let src_data = [
                     (*self.frame).data[0] as *const u8,
                     (*self.frame).data[1] as *const u8,
@@ -176,27 +171,14 @@ impl VideoDecoder {
                     (*self.frame).linesize[2],
                     (*self.frame).linesize[3],
                 ];
-                let dst_data = [
-                    rgb.as_mut_ptr(),
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                ];
-                let dst_stride = [width as i32 * 3, 0, 0, 0];
-                let ret = ffi::sws_scale(
+                let rgb = crate::scale_rgb24(
                     self.sws,
-                    src_data.as_ptr(),
-                    src_stride.as_ptr(),
-                    0,
+                    &src_data,
+                    &src_stride,
                     src_height as i32,
-                    dst_data.as_ptr(),
-                    dst_stride.as_ptr(),
-                );
-                if ret != height as i32 {
-                    return Err(format!(
-                        "sws_scale returned {ret} rows for {height}-row output frame"
-                    ));
-                }
+                    width,
+                    height,
+                )?;
                 out.push(rgb);
             }
             Ok(out)
@@ -587,6 +569,20 @@ mod video_tests {
     use super::VideoDecoder;
 
     const H264_SAMPLE: &[u8] = include_bytes!("../../../media/fixtures/sample.h264");
+    const H264_PORTRAIT: &[u8] = include_bytes!("../../../media/fixtures/portrait.h264");
+
+    #[test]
+    fn decode_scales_odd_row_length_without_overrunning_rgb_buffer() {
+        // 940 * 3 leaves a tail libswscale rounds up, so a tightly sized RGB
+        // buffer overruns and corrupts the heap. Android shares hit this.
+        let mut decoder = VideoDecoder::new("h264").unwrap();
+        for _ in 0..8 {
+            let frames = decoder.decode_scaled(H264_PORTRAIT, 1280).unwrap();
+            assert_eq!((decoder.width(), decoder.height()), (940, 1920));
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].len(), 940 * 1920 * 3);
+        }
+    }
 
     #[test]
     fn decode_scales_before_allocating_rgb_and_can_change_sizes() {
