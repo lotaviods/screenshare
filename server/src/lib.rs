@@ -85,6 +85,7 @@ async fn ws_handler(
 }
 
 async fn handle_connection(mut socket: WebSocket, state: AppState, id: String, name: String) {
+    tracing::info!(peer_id = %id, peer_name = %name, "signaling websocket connected");
     let info = PeerInfo {
         id: id.clone(),
         name,
@@ -145,7 +146,14 @@ async fn handle_connection(mut socket: WebSocket, state: AppState, id: String, n
                                 let rid = state.rooms.create_room();
                                 room_id = Some(rid.clone());
                                 let _ = state.rooms.join(&rid, info.clone(), tx.clone());
-                                state.sfu_rooms.lock().unwrap().entry(rid.clone()).or_default().join(id.clone());
+                                state
+                                    .sfu_rooms
+                                    .lock()
+                                    .unwrap()
+                                    .entry(rid.clone())
+                                    .or_default()
+                                    .join(id.clone());
+                                tracing::info!(peer_id = %id, room_id = %rid, "room created");
                                 let _ = tx.send(SignalMessage::RoomCreated { room_id: rid });
                             }
                             SignalMessage::JoinRoom { room_id: rid } => {
@@ -158,7 +166,19 @@ async fn handle_connection(mut socket: WebSocket, state: AppState, id: String, n
                                 match state.rooms.join(&rid, info.clone(), tx.clone()) {
                                     Ok(existing) => {
                                         room_id = Some(rid.clone());
-                                        state.sfu_rooms.lock().unwrap().entry(rid.clone()).or_default().join(id.clone());
+                                        state
+                                            .sfu_rooms
+                                            .lock()
+                                            .unwrap()
+                                            .entry(rid.clone())
+                                            .or_default()
+                                            .join(id.clone());
+                                        tracing::info!(
+                                            peer_id = %id,
+                                            room_id = %rid,
+                                            peers = existing.len(),
+                                            "peer joined room"
+                                        );
                                         for p in &existing {
                                             let _ = state.rooms.send_to(
                                                 &rid,
@@ -170,11 +190,19 @@ async fn handle_connection(mut socket: WebSocket, state: AppState, id: String, n
                                             room_id: rid.clone(),
                                             peers: existing,
                                         });
-                                        if let Some(sfu_room) = state.sfu_rooms.lock().unwrap().get(&rid) {
+                                        if let Some(sfu_room) =
+                                            state.sfu_rooms.lock().unwrap().get(&rid)
+                                        {
                                             notify_subscriptions(&state, &rid, sfu_room);
                                         }
                                     }
                                     Err(e) => {
+                                        tracing::warn!(
+                                            peer_id = %id,
+                                            room_id = %rid,
+                                            error = %e,
+                                            "peer failed to join room"
+                                        );
                                         let _ = tx.send(SignalMessage::Error {
                                             message: e.to_string(),
                                         });
@@ -183,11 +211,20 @@ async fn handle_connection(mut socket: WebSocket, state: AppState, id: String, n
                             }
                             SignalMessage::LeaveRoom => {
                                 if let Some(rid) = room_id.take() {
+                                    tracing::info!(peer_id = %id, room_id = %rid, "peer leaving room");
                                     close_sfu_peer(&state, &rid, &id).await;
-                                    if let Some(sfu_room) = state.sfu_rooms.lock().unwrap().get_mut(&rid) {
+                                    if let Some(sfu_room) =
+                                        state.sfu_rooms.lock().unwrap().get_mut(&rid)
+                                    {
                                         sfu_room.leave(&id);
                                     }
                                     if let Some(remaining) = state.rooms.leave(&rid, &id) {
+                                        tracing::info!(
+                                            peer_id = %id,
+                                            room_id = %rid,
+                                            remaining = remaining.len(),
+                                            "peer left room"
+                                        );
                                         for p in remaining {
                                             let _ = state.rooms.send_to(
                                                 &rid,
@@ -196,7 +233,9 @@ async fn handle_connection(mut socket: WebSocket, state: AppState, id: String, n
                                             );
                                         }
                                     }
-                                    if let Some(sfu_room) = state.sfu_rooms.lock().unwrap().get(&rid) {
+                                    if let Some(sfu_room) =
+                                        state.sfu_rooms.lock().unwrap().get(&rid)
+                                    {
                                         notify_subscriptions(&state, &rid, sfu_room);
                                     }
                                 }
@@ -210,6 +249,12 @@ async fn handle_connection(mut socket: WebSocket, state: AppState, id: String, n
                                 };
                                 match state.rooms.delete(&rid) {
                                     Some(peers) => {
+                                        tracing::info!(
+                                            peer_id = %id,
+                                            room_id = %rid,
+                                            peers = peers.len(),
+                                            "room deleted"
+                                        );
                                         room_id = None;
                                         state.sfu_rooms.lock().unwrap().remove(&rid);
                                         close_room_sfu_peers(&state, &rid).await;
