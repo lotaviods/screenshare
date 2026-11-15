@@ -1,0 +1,21 @@
+FROM rust:1.73-bookworm AS builder
+
+# Install build dependencies needed by native-media crates
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libavcodec-dev libavformat-dev libavfilter-dev libswscale-dev libswresample-dev \
+    libpipewire-0.3-dev libpulse-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb-xkb-dev \
+    libvulkan-dev libwayland-dev libfontconfig1-dev clang cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+
+# Build only the UI binary (the AppImage bundles this)
+RUN cargo build -p sharescreen-ui --release
+
+# Runtime stage (used only for debugging; final AppImage built by script)
+FROM ubuntu:20.04 AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends squashfs-tools ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /src/target/release/sharescreen /usr/local/bin/sharescreen
+ENTRYPOINT ["/usr/local/bin/sharescreen"]
