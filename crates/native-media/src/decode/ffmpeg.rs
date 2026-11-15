@@ -90,6 +90,13 @@ impl VideoDecoder {
         self.decode_scaled(packet, u32::MAX)
     }
 
+    /// Discard buffered pictures and reference frames after a stream
+    /// discontinuity. The parsed SPS/PPS stay in the context, so decoding can
+    /// resume at the next intra frame without a new decoder.
+    pub fn flush(&mut self) {
+        unsafe { ffi::avcodec_flush_buffers(self.ctx) };
+    }
+
     /// Decode one packet, downscaling pictures wider than `max_width` before
     /// allocating their RGB buffers. `width` and `height` report the output size.
     pub fn decode_scaled(&mut self, packet: &[u8], max_width: u32) -> Result<Vec<Vec<u8>>, String> {

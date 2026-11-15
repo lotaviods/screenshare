@@ -730,6 +730,10 @@ fn broadcast_local_state(shared: &Shared) {
 
 /// Create a peer connection with the standard local tracks and offer to it.
 async fn offer_to(shared: &Shared, peer_id: &str) -> Result<(), CallError> {
+    if shared.cfg.read().unwrap().connection_mode == ConnectionMode::Sfu {
+        tracing::info!("not offering to {peer_id}: this call uses the SFU");
+        return Ok(());
+    }
     tracing::info!("offering to {peer_id}");
     let peer = create_peer(shared, peer_id).await?;
     let offer = peer.create_offer().await?;
@@ -984,6 +988,13 @@ async fn answer_peer(
     peer_id: &str,
     offer: SessionDescription,
 ) -> Result<(), CallError> {
+    // In SFU mode all media flows through the server. Answering a mesh offer
+    // would open a second media path for the same participant and double the
+    // encode/decode and bandwidth.
+    if shared.cfg.read().unwrap().connection_mode == ConnectionMode::Sfu {
+        tracing::info!("ignoring mesh offer from {peer_id}: this call uses the SFU");
+        return Ok(());
+    }
     tracing::info!("answering {peer_id}");
     // Read the guard in its own statement: holding it across the `await` in
     // `create_peer` would make the future non-`Send`.

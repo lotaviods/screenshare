@@ -347,7 +347,9 @@ impl Actor {
                 .capture
                 .failure()
                 .unwrap_or_else(|| "worker stopped unexpectedly; see the log for details".into());
-            self.stop_share().await?;
+            if let Err(stop_error) = self.stop_share().await {
+                tracing::warn!("failed to clean up the stopped share: {stop_error}");
+            }
             self.send(UiEvent::Error(format!("Screen capture stopped: {error}")));
         }
         Ok(())
@@ -440,8 +442,10 @@ impl Actor {
         self.frames.clear();
         self.session_generation.fetch_add(1, Ordering::AcqRel);
         self.latency_generation.fetch_add(1, Ordering::AcqRel);
-        if self.share.is_some() {
-            self.stop_share().await?;
+        if self.share.is_some()
+            && let Err(error) = self.stop_share().await
+        {
+            tracing::warn!("failed to stop the share during disconnect: {error}");
         }
         self.stop_mic().await?;
         self.stop_system().await?;
@@ -589,6 +593,15 @@ impl Actor {
         if !(64..=50_000).contains(&options.bitrate_kbps) {
             return Err("video bitrate must be between 64 and 50000 kbps".into());
         }
+        // Starting a second share replaces the first one. Update the call and
+        // the UI before the new capture starts so a failed start cannot leave
+        // the previous share advertised as still running.
+        if self.share.is_some() {
+            tracing::info!("replacing the active share with a new capture");
+            if let Err(error) = self.stop_share().await {
+                tracing::warn!("failed to stop the previous share: {error}");
+            }
+        }
         let sink = self.media_sink(Stream::Screen);
         let mut options = options;
         options.keyframe_request = Some(self.keyframe_request.clone());
@@ -655,14 +668,28 @@ impl Actor {
     }
 
     async fn stop_share(&mut self) -> Result<(), String> {
+        tracing::info!("stopping screen share");
+        // Stop the capture first, but always clear the call/UI state even if
+        // the backend fails: otherwise the participant list keeps advertising
+        // a share whose frames are gone.
+        let result = self.capture.stop().await;
         self.share = None;
-        self.capture.stop().await.map_err(|e| e.to_string())?;
         if let Some(call) = &self.call {
             call.set_screen_sharing(false);
         }
         self.frames.remove(&FrameKind::Local);
         self.send(UiEvent::Sharing(false));
-        Ok(())
+        match result {
+            Ok(()) => {
+                tracing::info!("screen capture stopped");
+                Ok(())
+            }
+            Err(error) => {
+                let message = format!("could not stop screen capture: {error}");
+                tracing::warn!(%message);
+                Err(message)
+            }
+        }
     }
 
     /// Follow monitor hotplug: when the shared source disappears, restart

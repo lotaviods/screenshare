@@ -22,9 +22,9 @@ use sharescreen_audio::Output;
 use sharescreen_core::{Codec, EncodedSample, MediaKind};
 use sharescreen_native_media::decode::{
     rtp_payload, vp8_payload, vp9_payload, JpegEncoder, OpusDecoder, RtpDepacketizer, RtpKind,
-    VideoDecoder,
+    RtpReorderBuffer, VideoDecoder,
 };
-use sharescreen_native_media::preview::{Demand, MAX_PREVIEW_WIDTH};
+use sharescreen_native_media::preview::Demand;
 use sharescreen_webrtc::{RemoteTrack, RemoteTrackKind};
 
 pub use sharescreen_native_media::linux_preview::LinuxPreviewer;
@@ -62,6 +62,12 @@ const KEYFRAME_PRIORITY_QUEUE: usize = 1;
 const MAX_VIDEO_DECODERS: usize = 14;
 const VIDEO_DEMAND_TIMEOUT: Duration = Duration::from_millis(500);
 const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(500);
+/// Widest frame decoded for a remote share. The UI shows a focused share at
+/// (nearly) full window width, so 1280 was visibly soft on large monitors.
+const MAX_REMOTE_VIDEO_WIDTH: u32 = 1920;
+/// Self-view loopback: the peer picture is small, so keep the extra pixels off
+/// the JPEG path.
+const MAX_LOOPBACK_PREVIEW_WIDTH: u32 = 1280;
 static VIDEO_RTP_QUEUE_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static OPUS_PACKET_GAPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static OPUS_FEC_RECOVERIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -200,6 +206,7 @@ fn run(
     video_demand: Arc<AtomicU64>,
     needs_keyframe: Arc<AtomicBool>,
 ) {
+    let mut reorder = RtpReorderBuffer::new();
     let mut depacketizer = RtpDepacketizer::new(rtp_kind);
     // Do not feed mid-GOP slices into a fresh native decoder. The RTP reader
     // asks for an IDR until the first picture arrives.
@@ -238,6 +245,9 @@ fn run(
     let mut decoded = 0u64;
     let mut consecutive_decode_errors = 0u32;
     let mut waiting_for_keyframe = kind == RemoteTrackKind::Video;
+    // Set after a decoder flush: the next access unit may need the cached
+    // SPS/PPS replayed if it does not carry its own.
+    let mut replay_parameter_sets = false;
     // A sender may emit SPS/PPS once before the IDR that follows. Keep the
     // latest ones so an IDR without repeated parameter sets can still start a
     // fresh decoder. Bounded because senders may repeat them per keyframe.
@@ -247,41 +257,48 @@ fn run(
     let mut process =
         |frame: &[u8], output: &mut Option<Output>, missing_audio_packets: u16| match kind {
             RemoteTrackKind::Video => {
-                // A sender may emit SPS/PPS once before the IDR that follows.
-                // Keep the latest ones so an IDR without repeated parameter
-                // sets can still start a fresh decoder.
-                if codec == Codec::H264 && is_h264_parameter_sets(frame) {
-                    if parameter_sets.len() + frame.len() > MAX_KEYFRAME_PRIORITY_BYTES {
-                        parameter_sets.clear();
+                // Keep the latest parameter sets; an encoder may emit them only
+                // once, before later IDRs. Bounded because senders may repeat
+                // them per keyframe.
+                if codec == Codec::H264 {
+                    let sets = extract_h264_parameter_sets(frame);
+                    if !sets.is_empty() && sets.len() <= MAX_KEYFRAME_PRIORITY_BYTES {
+                        parameter_sets = sets;
                     }
-                    parameter_sets.extend_from_slice(frame);
                 }
-                if video_recovery.load(Ordering::Acquire) {
-                    if !contains_video_keyframe(codec, frame) {
-                        return;
+                // A recovery keeps the same decoder: flushing it drops broken
+                // reference frames while the parsed SPS/PPS survive, so the
+                // next IDR decodes without a fresh context.
+                if (waiting_for_keyframe || video_recovery.load(Ordering::Acquire))
+                    && !contains_video_keyframe(codec, frame)
+                {
+                    return;
+                }
+                if video_recovery.swap(false, Ordering::AcqRel) {
+                    if let Some(decoder) = video.as_mut() {
+                        decoder.flush();
+                        // A flush may drop the parsed parameter sets; replay
+                        // them on an IDR that does not carry its own.
+                        replay_parameter_sets = true;
                     }
-                    video = None;
-                    waiting_for_keyframe = false;
-                    video_recovery.store(false, Ordering::Release);
                 }
                 let mut fresh = false;
                 if video.is_none() {
-                    if waiting_for_keyframe && !contains_video_keyframe(codec, frame) {
-                        return;
-                    }
                     match VideoDecoder::new(codec_name(codec)) {
                         Ok(decoder) => {
                             video = Some(decoder);
                             waiting_for_keyframe = false;
                             consecutive_decode_errors = 0;
                             fresh = true;
-                            tracing::info!("recreated video decoder at recovery boundary");
+                            tracing::info!("created video decoder");
                         }
                         Err(error) => {
                             tracing::error!("video decoder recreation failed: {error}");
                             return;
                         }
                     }
+                } else {
+                    waiting_for_keyframe = false;
                 }
                 let Some(jpeg) = jpeg.as_mut() else {
                     return;
@@ -291,7 +308,11 @@ fn run(
                 };
                 let mut joined;
                 let frame = match parameter_sets.is_empty() {
-                    false if fresh && !is_h264_parameter_sets(frame) => {
+                    false
+                        if codec == Codec::H264
+                            && (fresh || replay_parameter_sets)
+                            && !au_has_h264_parameter_sets(frame) =>
+                    {
                         joined = Vec::with_capacity(parameter_sets.len() + frame.len());
                         joined.extend_from_slice(&parameter_sets);
                         joined.extend_from_slice(frame);
@@ -299,7 +320,8 @@ fn run(
                     }
                     _ => frame,
                 };
-                let result = decoder.decode_scaled(frame, MAX_PREVIEW_WIDTH);
+                replay_parameter_sets = false;
+                let result = decoder.decode_scaled(frame, MAX_REMOTE_VIDEO_WIDTH);
                 match result {
                     Ok(rgb_frames) => {
                         if rgb_frames.is_empty() {
@@ -338,7 +360,14 @@ fn run(
                         needs_keyframe.store(true, Ordering::Release);
                         tracing::warn!(consecutive_decode_errors, "video decode failed: {error}");
                         if consecutive_decode_errors >= 3 {
-                            video = None;
+                            // Keep the decoder: its SPS/PPS stay valid, only
+                            // the broken reference frames need to go. Replay
+                            // the parameter sets with the next IDR in case the
+                            // flush also discards them.
+                            if let Some(decoder) = video.as_mut() {
+                                decoder.flush();
+                                replay_parameter_sets = true;
+                            }
                             waiting_for_keyframe = true;
                             consecutive_decode_errors = 0;
                         }
@@ -411,9 +440,14 @@ fn run(
                 discarded += 1;
             }
             VIDEO_RTP_QUEUE_DROPS.fetch_add(discarded, Ordering::Relaxed);
-            depacketizer = RtpDepacketizer::new(rtp_kind);
-            video_recovery.store(true, Ordering::Release);
-            needs_keyframe.store(true, Ordering::Release);
+            // Only re-arm on the transition into idle: doing this every 20 ms
+            // would spam keyframe requests and throw away the parsed
+            // parameter sets.
+            if !video_recovery.swap(true, Ordering::AcqRel) {
+                depacketizer = RtpDepacketizer::new(rtp_kind);
+                reorder.reset();
+                needs_keyframe.store(true, Ordering::Release);
+            }
             std::thread::sleep(Duration::from_millis(20));
             continue;
         }
@@ -425,6 +459,7 @@ fn run(
                 }
                 VIDEO_RTP_QUEUE_DROPS.fetch_add(discarded, Ordering::Relaxed);
                 depacketizer = RtpDepacketizer::new(rtp_kind);
+                reorder.reset();
                 Some(packets)
             }
             Err(mpsc::error::TryRecvError::Disconnected) => None,
@@ -440,24 +475,44 @@ fn run(
         }
         match rx.try_recv() {
             Ok(packet) => {
-                let missing = if kind == RemoteTrackKind::Audio && packet.len() >= 4 {
-                    let sequence = u16::from_be_bytes([packet[2], packet[3]]);
-                    let lost = last_audio_sequence
-                        .map(|previous| rtp_sequence_gap(previous, sequence))
-                        .unwrap_or(0);
-                    last_audio_sequence = Some(sequence);
-                    lost
+                if kind == RemoteTrackKind::Video {
+                    let ready = reorder.push(packet, Instant::now());
+                    for packet in ready {
+                        for frame in depacketizer.push(&packet) {
+                            process(&frame, &mut output, 0);
+                        }
+                    }
                 } else {
-                    0
-                };
-                for (index, frame) in depacketizer.push(&packet).into_iter().enumerate() {
-                    process(&frame, &mut output, if index == 0 { missing } else { 0 });
+                    let missing = if packet.len() >= 4 {
+                        let sequence = u16::from_be_bytes([packet[2], packet[3]]);
+                        let lost = last_audio_sequence
+                            .map(|previous| rtp_sequence_gap(previous, sequence))
+                            .unwrap_or(0);
+                        last_audio_sequence = Some(sequence);
+                        lost
+                    } else {
+                        0
+                    };
+                    for (index, frame) in depacketizer.push(&packet).into_iter().enumerate() {
+                        process(&frame, &mut output, if index == 0 { missing } else { 0 });
+                    }
                 }
             }
             Err(mpsc::error::TryRecvError::Disconnected) => break,
             Err(mpsc::error::TryRecvError::Empty) => {
-                for frame in depacketizer.flush() {
-                    process(&frame, &mut output, 0);
+                if kind == RemoteTrackKind::Video {
+                    let now = Instant::now();
+                    let mut ready = Vec::new();
+                    reorder.release(now, &mut ready);
+                    for packet in ready {
+                        for frame in depacketizer.push(&packet) {
+                            process(&frame, &mut output, 0);
+                        }
+                    }
+                    // Leave a partially assembled access unit buffered: its
+                    // remaining packets (or the marker that closes it) may
+                    // still be in flight. It is discarded on the next
+                    // sequence gap or when the stream idles.
                 }
                 if let Some(output) = output.as_mut() {
                     output.tick();
@@ -605,11 +660,55 @@ fn h264_nal_types(access_unit: &[u8]) -> Vec<u8> {
     types
 }
 
-/// True for an access unit carrying only SPS/PPS, with no slice to decode.
-fn is_h264_parameter_sets(access_unit: &[u8]) -> bool {
-    let types = h264_nal_types(access_unit);
-    types.iter().any(|kind| *kind == 7 || *kind == 8)
-        && !types.iter().any(|kind| (1..=5).contains(kind))
+/// True when an access unit carries an SPS or PPS NAL.
+fn au_has_h264_parameter_sets(access_unit: &[u8]) -> bool {
+    h264_nal_types(access_unit)
+        .iter()
+        .any(|kind| *kind == 7 || *kind == 8)
+}
+
+/// Extract the SPS/PPS NAL units from an access unit, in Annex-B form.
+///
+/// Encoders may bundle them with a slice, so this looks at every NAL instead
+/// of requiring a parameter-set-only access unit.
+fn extract_h264_parameter_sets(access_unit: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < access_unit.len() {
+        let start = if access_unit[i..].starts_with(&[0, 0, 0, 1]) {
+            4
+        } else if access_unit[i..].starts_with(&[0, 0, 1]) {
+            3
+        } else {
+            i += 1;
+            continue;
+        };
+        let body = i + start;
+        if body >= access_unit.len() {
+            break;
+        }
+        // The next start code ends this NAL. Emulation prevention guarantees
+        // `00 00 01` cannot occur inside the payload. A leading zero before it
+        // belongs to a four-byte start code, not to the NAL.
+        let mut end = body + 1;
+        while end + 3 <= access_unit.len() && !access_unit[end..].starts_with(&[0, 0, 1]) {
+            end += 1;
+        }
+        if end + 3 > access_unit.len() {
+            end = access_unit.len();
+        } else if end > body + 1 && access_unit[end - 1] == 0 {
+            end -= 1;
+        }
+        let kind = access_unit[body] & 0x1f;
+        if (kind == 7 || kind == 8)
+            && out.len().saturating_add(end - body + 4) <= MAX_KEYFRAME_PRIORITY_BYTES
+        {
+            out.extend_from_slice(&[0, 0, 0, 1]);
+            out.extend_from_slice(&access_unit[body..end]);
+        }
+        i = end.max(body + 1);
+    }
+    out
 }
 
 fn contains_h264_idr(access_unit: &[u8]) -> bool {
@@ -806,7 +905,7 @@ fn preview_loop(
                 waited = 0;
             }
         }
-        match video.decode_scaled(&sample.data, MAX_PREVIEW_WIDTH) {
+        match video.decode_scaled(&sample.data, MAX_LOOPBACK_PREVIEW_WIDTH) {
             Ok(pixels) => {
                 // The decoder must run in order, but the JPEG stage only needs
                 // to run as fast as the UI consumes frames. Skipping a frame
@@ -1249,10 +1348,16 @@ mod tests {
         out
     }
 
-    fn push_nal(decoder: &Decoder, sequence: &mut u16, timestamp: u32, nal: &[u8]) {
+    fn push_nal_marked(
+        decoder: &Decoder,
+        sequence: &mut u16,
+        timestamp: u32,
+        nal: &[u8],
+        marker: bool,
+    ) {
         let mut rtp = vec![0u8; 12];
         rtp[0] = 0x80;
-        rtp[1] = 96;
+        rtp[1] = 96 | if marker { 0x80 } else { 0 };
         rtp[2..4].copy_from_slice(&sequence.to_be_bytes());
         rtp[4..8].copy_from_slice(&timestamp.to_be_bytes());
         rtp.extend_from_slice(nal);
@@ -1260,11 +1365,22 @@ mod tests {
         *sequence = sequence.wrapping_add(1);
     }
 
+    fn push_nal(decoder: &Decoder, sequence: &mut u16, timestamp: u32, nal: &[u8]) {
+        push_nal_marked(decoder, sequence, timestamp, nal, false);
+    }
+
+    /// Push every NAL of one access unit, marking the last RTP packet the way
+    /// the real packetizer does.
     fn push_sample(decoder: &Decoder, sequence: &mut u16, timestamp: u32) {
         let sample = include_bytes!("../fixtures/sample.h264");
-        for nal in nals(sample) {
+        let nals = nals(sample);
+        let Some((last, rest)) = nals.split_last() else {
+            return;
+        };
+        for nal in rest {
             push_nal(decoder, sequence, timestamp, nal);
         }
+        push_nal_marked(decoder, sequence, timestamp, last, true);
     }
 
     fn wait_for_frame(decoder: &Decoder) -> Vec<u8> {
@@ -1294,7 +1410,7 @@ mod tests {
         decoder.latest_frame();
         let mut sequence = 0;
         assert!(decoder.needs_keyframe.load(Ordering::Acquire));
-        push_nal(&decoder, &mut sequence, 1, &[0x41, 0x88, 0x84]);
+        push_nal_marked(&decoder, &mut sequence, 1, &[0x41, 0x88, 0x84], true);
         std::thread::sleep(Duration::from_millis(30));
         assert!(decoder.latest_frame().is_none());
         assert!(decoder.needs_keyframe.load(Ordering::Acquire));
@@ -1307,8 +1423,8 @@ mod tests {
         // errors must not cancel the recovery sequence.
         for step in 0..3 {
             let timestamp = 3 + step * 2;
-            push_nal(&decoder, &mut sequence, timestamp, &[0x65, 0xff]);
-            push_nal(&decoder, &mut sequence, timestamp + 1, &[0x41, 0x88]);
+            push_nal_marked(&decoder, &mut sequence, timestamp, &[0x65, 0xff], true);
+            push_nal_marked(&decoder, &mut sequence, timestamp + 1, &[0x41, 0x88], true);
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(decoder.needs_keyframe.load(Ordering::Acquire));
@@ -1326,12 +1442,26 @@ mod tests {
 
     #[test]
     fn h264_parameter_set_detection_ignores_slices() {
-        assert!(is_h264_parameter_sets(&[0, 0, 0, 1, 0x67, 1, 2]));
-        assert!(is_h264_parameter_sets(&[0, 0, 0, 1, 0x68, 3]));
-        assert!(!is_h264_parameter_sets(&[
+        assert!(au_has_h264_parameter_sets(&[0, 0, 0, 1, 0x67, 1, 2]));
+        assert!(au_has_h264_parameter_sets(&[0, 0, 0, 1, 0x68, 3]));
+        assert!(au_has_h264_parameter_sets(&[
             0, 0, 0, 1, 0x67, 1, 0, 0, 0, 1, 0x65, 3
         ]));
-        assert!(!is_h264_parameter_sets(&[0, 0, 0, 1, 0x65, 3]));
+        assert!(!au_has_h264_parameter_sets(&[0, 0, 0, 1, 0x65, 3]));
+    }
+
+    #[test]
+    fn parameter_sets_are_extracted_even_when_bundled_with_a_slice() {
+        let access_unit = [
+            0, 0, 0, 1, 0x67, 1, 2, // SPS
+            0, 0, 1, 0x68, 3, // PPS
+            0, 0, 0, 1, 0x65, 9, 9, // IDR slice
+        ];
+        assert_eq!(
+            extract_h264_parameter_sets(&access_unit),
+            vec![0, 0, 0, 1, 0x67, 1, 2, 0, 0, 0, 1, 0x68, 3]
+        );
+        assert!(extract_h264_parameter_sets(&[0, 0, 0, 1, 0x65, 9]).is_empty());
     }
 
     #[test]
@@ -1350,15 +1480,23 @@ mod tests {
         );
         let mut sequence = 0;
         // Config arrives as separate access units, then an IDR slice without
-        // any repeated parameter sets.
-        for nal in &nals[..3] {
+        // any repeated parameter sets. The marker bit closes each unit.
+        let Some((last, rest)) = nals[..3].split_last() else {
+            unreachable!("the fixture has SPS, PPS and SEI");
+        };
+        for nal in rest {
             push_nal(&decoder, &mut sequence, 1, nal);
         }
+        push_nal_marked(&decoder, &mut sequence, 1, last, true);
         std::thread::sleep(Duration::from_millis(30));
         assert!(decoder.latest_frame().is_none());
-        for nal in &nals[3..] {
+        let Some((last, rest)) = nals[3..].split_last() else {
+            unreachable!("the fixture has an IDR");
+        };
+        for nal in rest {
             push_nal(&decoder, &mut sequence, 2, nal);
         }
+        push_nal_marked(&decoder, &mut sequence, 2, last, true);
         assert_eq!(&wait_for_frame(&decoder)[0..2], &[0xff, 0xd8]);
         decoder.stop();
     }
@@ -1371,7 +1509,7 @@ mod tests {
                     let decoder = Decoder::new(RemoteTrackKind::Video, Codec::H264).unwrap();
                     decoder.latest_frame();
                     let mut sequence = worker * 1000;
-                    push_nal(&decoder, &mut sequence, 1, &[0x65, 0xff]);
+                    push_nal_marked(&decoder, &mut sequence, 1, &[0x65, 0xff], true);
                     push_sample(&decoder, &mut sequence, 2);
                     assert_eq!(&wait_for_frame(&decoder)[0..2], &[0xff, 0xd8]);
                     decoder.stop();

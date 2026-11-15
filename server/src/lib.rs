@@ -61,6 +61,12 @@ struct AppState {
     turn: TurnConfig,
 }
 
+/// Per-subscriber egress queue. A screen keyframe spans many RTP packets, so
+/// a 64-packet queue dropped the middle of an intra frame and left the viewer
+/// corrupt until the next GOP. This covers bigger intra frames; an overflow
+/// still re-requests a keyframe from the publisher.
+const SFU_SUBSCRIBER_QUEUE: usize = 256;
+
 /// Current unix time in seconds.
 fn now_unix() -> u64 {
     SystemTime::now()
@@ -627,7 +633,7 @@ async fn handle_sfu_offer(
                 publication.kind,
                 peer_id.to_owned(),
                 Arc::new(writer),
-                64,
+                SFU_SUBSCRIBER_QUEUE,
             );
             request_publisher_keyframe(state, room_id, &publication);
         }
@@ -663,6 +669,9 @@ async fn handle_sfu_offer(
     let sources = state.sfu_sources.clone();
     let source_room = room_id.to_owned();
     let source_publisher = peer_id.to_owned();
+    let event_state = state.clone();
+    let event_room = source_room.clone();
+    let event_viewer = source_publisher.clone();
     let events = Arc::new(move |event: PeerEvent| match event {
         PeerEvent::IceCandidate(candidate) => {
             let _ = outbound.send(SignalMessage::SfuIceCandidate {
@@ -676,6 +685,30 @@ async fn handle_sfu_offer(
             source_publisher.clone(),
             track,
         ),
+        PeerEvent::ConnectionState(sharescreen_core::ConnectionState::Connected) => {
+            // The viewer can only decode from an intra frame. The keyframe
+            // requested when the subscription was created may have arrived
+            // while the transport was still connecting, so ask again now.
+            let state = event_state.clone();
+            let room_id = event_room.clone();
+            let viewer = event_viewer.clone();
+            tokio::spawn(async move {
+                let publications: Vec<sfu::PublishedTrack> = {
+                    let rooms = state.sfu_rooms.lock().unwrap();
+                    let Some(room) = rooms.get(&room_id) else {
+                        return;
+                    };
+                    let subscribed = room.subscriptions_for(&viewer).tracks;
+                    room.publications()
+                        .filter(|publication| subscribed.contains(&publication.id))
+                        .cloned()
+                        .collect()
+                };
+                for publication in publications {
+                    request_publisher_keyframe(&state, &room_id, &publication);
+                }
+            });
+        }
         _ => {}
     });
     let turn = state.turn.issue(now_unix());
@@ -720,7 +753,7 @@ async fn handle_sfu_offer(
             publication.kind,
             peer_id.to_owned(),
             Arc::new(writer),
-            64,
+            SFU_SUBSCRIBER_QUEUE,
         );
         request_publisher_keyframe(state, room_id, &publication);
     }

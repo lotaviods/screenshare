@@ -49,7 +49,13 @@ impl Write for LogFile {
 /// `config.toml`. The Windows GUI build has no console, so the file is the
 /// only place a user can look after a failed connect.
 fn init_logging() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // `blade_graphics` logs every texture/buffer it creates and destroys, i.e.
+    // several lines per rendered frame; at `info` it dominates the log and
+    // pushes useful call/media events out. The SRTP handler also repeats one
+    // warning per packet written before DTLS is ready.
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("info,blade_graphics=warn,rtc::peer_connection::handler=error")
+    });
     // Only emit ANSI colors when stdout is a real terminal and the user has
     // not asked for plain output. When output is captured or redirected, the
     // escape codes would show up as garbage.

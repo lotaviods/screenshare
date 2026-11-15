@@ -9,7 +9,12 @@ use sharescreen_webrtc::{RemoteTrack, RtpPacket, TrackWriter};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+/// Do not hammer a publisher with keyframe requests while its video queue is
+/// overflowing; one IDR every half second is enough to resynchronize viewers.
+const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SubscriptionError {
@@ -168,6 +173,7 @@ impl SfuRoom {
 pub struct RtpForwarder<T> {
     tracks: RwLock<HashMap<String, FanoutTrack<T>>>,
     keyframe_sources: RwLock<HashMap<String, RemoteTrack>>,
+    keyframe_requests: RwLock<HashMap<String, Instant>>,
     epochs: RwLock<HashMap<String, u64>>,
     next_epoch: AtomicU64,
     audio_packets_queued: AtomicU64,
@@ -199,6 +205,7 @@ impl<T: Clone + Send + 'static> RtpForwarder<T> {
         Self {
             tracks: RwLock::new(HashMap::new()),
             keyframe_sources: RwLock::new(HashMap::new()),
+            keyframe_requests: RwLock::new(HashMap::new()),
             epochs: RwLock::new(HashMap::new()),
             next_epoch: AtomicU64::new(1),
             audio_packets_queued: AtomicU64::new(0),
@@ -215,6 +222,28 @@ impl<T: Clone + Send + 'static> RtpForwarder<T> {
                 }
             });
         }
+    }
+
+    /// Ask the publisher for an IDR, but no more often than
+    /// [`KEYFRAME_REQUEST_MIN_INTERVAL`]. Used after a video queue overflow:
+    /// the dropped packets are gone, so only a fresh intra frame can repair
+    /// the viewers still holding a broken reference.
+    fn request_source_keyframe_throttled(&self, track_id: &str) {
+        let now = Instant::now();
+        let due = {
+            let requests = self.keyframe_requests.read().unwrap();
+            requests
+                .get(track_id)
+                .is_none_or(|last| now.duration_since(*last) >= KEYFRAME_REQUEST_MIN_INTERVAL)
+        };
+        if !due {
+            return;
+        }
+        self.keyframe_requests
+            .write()
+            .unwrap()
+            .insert(track_id.to_owned(), now);
+        self.request_source_keyframe(track_id);
     }
 
     fn ensure_epoch(&self, track_id: &str) -> u64 {
@@ -313,6 +342,7 @@ impl<T: Clone + Send + 'static> RtpForwarder<T> {
     pub fn remove_track(&self, track_id: &str) {
         self.tracks.write().unwrap().remove(track_id);
         self.keyframe_sources.write().unwrap().remove(track_id);
+        self.keyframe_requests.write().unwrap().remove(track_id);
         let next = self.next_epoch.fetch_add(1, Ordering::Relaxed);
         self.epochs
             .write()
@@ -372,6 +402,11 @@ impl<T: Clone + Send + 'static> RtpForwarder<T> {
                 }
                 self.video_packets_dropped
                     .fetch_add(dropped, Ordering::Relaxed);
+                if dropped > 0 {
+                    // A dropped packet leaves a hole the viewer cannot NACK
+                    // away (it never left the server), so resynchronize it.
+                    self.request_source_keyframe_throttled(track_id);
+                }
             }
         }
     }
@@ -718,5 +753,40 @@ mod tests {
         assert_eq!(rx.recv().await, Some(1));
         assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
         assert_eq!(forwarder.metrics().video_packets_dropped, 1);
+        assert!(
+            forwarder
+                .keyframe_requests
+                .read()
+                .unwrap()
+                .contains_key("screen"),
+            "an overflow must ask the publisher for a fresh keyframe"
+        );
+    }
+
+    #[tokio::test]
+    async fn overflow_keyframe_requests_are_throttled() {
+        let forwarder = RtpForwarder::new();
+        let (tx, _rx) = mpsc::channel(1);
+        forwarder.subscribe("screen", TrackKind::Screen, "viewer", tx);
+        forwarder.forward("screen", 1_u8).await;
+        forwarder.forward("screen", 2_u8).await;
+        let first = *forwarder
+            .keyframe_requests
+            .read()
+            .unwrap()
+            .get("screen")
+            .expect("the first overflow requests a keyframe");
+        // The queue is still full, so this packet is dropped as well.
+        forwarder.forward("screen", 3_u8).await;
+        let second = *forwarder
+            .keyframe_requests
+            .read()
+            .unwrap()
+            .get("screen")
+            .unwrap();
+        assert_eq!(
+            first, second,
+            "a burst of drops must not spam the publisher with keyframe requests"
+        );
     }
 }
