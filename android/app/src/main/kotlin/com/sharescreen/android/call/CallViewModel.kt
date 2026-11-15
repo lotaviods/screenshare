@@ -15,6 +15,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import org.json.JSONArray
 import org.webrtc.EglBase
 import org.webrtc.PeerConnection
 
@@ -27,6 +28,7 @@ data class CallUiState(
     val selfName: String = "",
     val serverUrl: String = "ws://10.0.2.2:3000/ws",
     val roomIdInput: String = "",
+    val recentRooms: List<String> = emptyList(),
     val currentRoomId: String? = null,
     val participants: List<Participant> = emptyList(),
     val micOn: Boolean = false,
@@ -41,6 +43,8 @@ class CallViewModel(application: Application) : AndroidViewModel(application) {
         private const val PREFS_NAME = "sharescreen"
         private const val KEY_NAME = "display_name"
         private const val KEY_SERVER_URL = "server_url"
+        private const val KEY_RECENT_ROOMS = "recent_rooms"
+        private const val MAX_RECENT_ROOMS = 8
     }
 
     private val context = application.applicationContext
@@ -48,10 +52,30 @@ class CallViewModel(application: Application) : AndroidViewModel(application) {
 
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
+    private fun loadRecentRooms(): List<String> {
+        val raw = prefs.getString(KEY_RECENT_ROOMS, null) ?: return emptyList()
+        return runCatching {
+            val array = JSONArray(raw)
+            buildList {
+                for (index in 0 until array.length()) {
+                    array.optString(index).takeIf { it.isNotBlank() }?.let(::add)
+                }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    private fun rememberRoom(roomId: String) {
+        val recent = (listOf(roomId) + _uiState.value.recentRooms.filterNot { it == roomId })
+            .take(MAX_RECENT_ROOMS)
+        _uiState.update { it.copy(recentRooms = recent) }
+        prefs.edit().putString(KEY_RECENT_ROOMS, JSONArray(recent).toString()).apply()
+    }
+
     private val _uiState = MutableStateFlow(
         CallUiState(
             selfName = prefs.getString(KEY_NAME, null).orEmpty(),
             serverUrl = prefs.getString(KEY_SERVER_URL, null) ?: CallUiState().serverUrl,
+            recentRooms = loadRecentRooms(),
         )
     )
     val uiState: StateFlow<CallUiState> = _uiState.asStateFlow()
@@ -183,10 +207,12 @@ class CallViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             is CallEvent.RoomCreated -> {
+                rememberRoom(event.roomId)
                 _uiState.update { it.copy(currentRoomId = event.roomId, view = AppView.Call) }
             }
 
             is CallEvent.RoomJoined -> {
+                rememberRoom(event.roomId)
                 _uiState.update { it.copy(currentRoomId = event.roomId, view = AppView.Call) }
             }
 
