@@ -1,9 +1,8 @@
 //! Lightweight second-stream thumbnail encoder for Linux (VAAPI path).
 //!
-//! This module runs entirely on the capture thread (inside the PipeWire
-//! callback). It reuses the same `Frame` that the primary encoder already
-//! consumed from the DMA-BUF, encodes it at ≤854×480 / 5 fps / 300 kbps,
-//! and ships the result via `try_send` — never blocking the capture loop.
+//! A dedicated bounded worker reuses capture frames after the primary encoder
+//! has consumed them. It encodes at ≤854×480 / 5 fps / 300 kbps and ships the
+//! result via `try_send`; thumbnail work never blocks the capture callback.
 //!
 //! All failures are logged and silently discarded so a broken thumbnail path
 //! never disrupts the primary video stream.
@@ -32,22 +31,23 @@ pub fn thumb_size(src_w: u32, src_h: u32) -> (u32, u32) {
     if src_w == 0 || src_h == 0 {
         return (0, 0);
     }
-    // Scale to fit width first, then clamp height.
-    let w_by_width = THUMB_MAX_WIDTH;
-    let h_by_width = (src_h as u64 * THUMB_MAX_WIDTH as u64 / src_w as u64) as u32;
-
-    if h_by_width <= THUMB_MAX_HEIGHT {
-        // Width-limited — make both dimensions even (codec requirement).
-        (w_by_width & !1, h_by_width.max(1) & !1)
+    let (width, height) = if src_w <= THUMB_MAX_WIDTH && src_h <= THUMB_MAX_HEIGHT {
+        (src_w, src_h)
+    } else if src_w as u64 * THUMB_MAX_HEIGHT as u64 > src_h as u64 * THUMB_MAX_WIDTH as u64 {
+        (
+            THUMB_MAX_WIDTH,
+            (src_h as u64 * THUMB_MAX_WIDTH as u64 / src_w as u64) as u32,
+        )
     } else {
-        // Height-limited.
-        let h = THUMB_MAX_HEIGHT;
-        let w = (src_w as u64 * THUMB_MAX_HEIGHT as u64 / src_h as u64) as u32;
-        (w.max(1) & !1, h & !1)
-    }
+        (
+            (src_w as u64 * THUMB_MAX_HEIGHT as u64 / src_h as u64) as u32,
+            THUMB_MAX_HEIGHT,
+        )
+    };
+    (width & !1, height & !1)
 }
 
-/// Per-frame thumbnail state kept on the capture thread.
+/// Per-frame thumbnail state kept on the bounded thumbnail worker.
 #[cfg(target_os = "linux")]
 pub struct ThumbnailEncoder {
     encoder: Option<FfmpegEncoder>,
@@ -89,7 +89,7 @@ impl ThumbnailEncoder {
         self.frame_count = self.frame_count.wrapping_add(1);
 
         // Rate limiting: only encode every `self.every` frames.
-        if count % self.every != 0 {
+        if !count.is_multiple_of(self.every) {
             return;
         }
 
@@ -132,40 +132,12 @@ impl ThumbnailEncoder {
             }
         }
 
-        // The VAAPI encoder requires that the input frame matches the
-        // encoder's configured resolution.  When the compositor has
-        // negotiated a different size than the thumbnail target, we need a
-        // scaled frame.  The primary FfmpegEncoder operates on DMA-BUF
-        // `Frame` objects at the full resolution; the thumbnail encoder is
-        // also configured for the thumbnail resolution — so encoding the
-        // full-resolution frame into it would fail with a size mismatch.
-        //
-        // Strategy: construct a synthetic scaled Frame from the primary one.
-        // Because VAAPI encoding validates `frame.width/height` against the
-        // encoder config, we fabricate a Frame with the thumbnail dimensions
-        // while keeping the same DMA-BUF descriptors.  VAAPI's
-        // `scale_vaapi` filter inside the encoder handles the actual
-        // down-scaling on the GPU.
-        //
-        // If the frame is already at or below thumbnail resolution, pass
-        // it through directly.
-        let scaled = if frame.width == self.thumb_w && frame.height == self.thumb_h {
-            None
-        } else {
-            // Build a Frame view at the thumbnail dimensions.  The
-            // underlying DMA-BUF objects are shared (we borrow them via the
-            // frame reference), so no copy is made.
-            Some(frame.with_size(self.thumb_w, self.thumb_h))
-        };
-
-        let encode_frame = scaled.as_ref().unwrap_or(frame);
-
         let enc = match self.encoder.as_mut() {
             Some(e) => e,
             None => return,
         };
 
-        match enc.encode(encode_frame, false) {
+        match enc.encode(frame, false) {
             Ok(frames) => {
                 for f in frames {
                     let sample = EncodedSample {
@@ -183,7 +155,9 @@ impl ThumbnailEncoder {
                             tracing::debug!("thumbnail queue full; dropping frame");
                         }
                         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                            tracing::debug!("thumbnail consumer closed; disabling thumbnail encoder");
+                            tracing::debug!(
+                                "thumbnail consumer closed; disabling thumbnail encoder"
+                            );
                             self.encoder = None;
                         }
                     }
@@ -194,5 +168,18 @@ impl ThumbnailEncoder {
                 // Don't disable the encoder on a transient failure.
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thumbnail_dimensions_fit_limits_without_upscaling() {
+        assert_eq!(thumb_size(1920, 1080), (852, 480));
+        assert_eq!(thumb_size(640, 360), (640, 360));
+        assert_eq!(thumb_size(1920, 1200), (768, 480));
+        assert_eq!(thumb_size(0, 1080), (0, 0));
     }
 }

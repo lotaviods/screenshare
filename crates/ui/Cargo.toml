@@ -24,5 +24,6 @@ sharescreen-core = { path = "../core" }
 sharescreen-config = { path = "../config" }
 sharescreen-capture = { path = "../capture" }
 sharescreen-audio = { path = "../audio" }
+sharescreen-media = { path = "../media" }
 sharescreen-call = { path = "../call" }
 sharescreen-network = { path = "../network" }

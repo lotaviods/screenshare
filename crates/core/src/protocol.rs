@@ -72,6 +72,8 @@ pub enum SignalMessage {
         sdp: String,
         video_codec: String,
     },
+    /// Close the server-side peer before a client rebuilds its SFU transport.
+    SfuRestart,
     SfuAnswer {
         sdp: String,
     },
@@ -114,6 +116,10 @@ pub enum SignalMessage {
     SfuSubscriptions {
         focus: Option<String>,
         tracks: Vec<String>,
+    },
+    /// Ask a publisher to force a keyframe on one of its screen tracks.
+    SfuKeyframeRequest {
+        track_id: String,
     },
 }
 

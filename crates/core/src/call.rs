@@ -53,6 +53,10 @@ pub enum CallEvent {
         participant_id: String,
         state: ConnectionState,
     },
+    /// The SFU asks this publisher to force an intra frame for a new viewer.
+    KeyframeRequested {
+        track_id: String,
+    },
     Error {
         message: String,
     },

@@ -81,13 +81,13 @@ pub enum CaptureBackend {
     Windows,
 }
 
-/// Preferred connection topology. `Mesh` is peer-to-peer for small rooms;
-/// `Sfu` selects an SFU when one is configured.
+/// Preferred connection topology. `Sfu` is the scalable default; `Mesh` remains
+/// available for small rooms and deployments without the relay service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionMode {
-    #[default]
     Mesh,
+    #[default]
     Sfu,
 }
 

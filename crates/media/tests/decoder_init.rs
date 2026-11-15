@@ -38,3 +38,19 @@ fn audio_decoder_lifecycle_thread_exit_and_teardown() {
         decoder.stop();
     }
 }
+
+#[test]
+#[ignore = "requires a live PulseAudio/WASAPI playback device"]
+fn audio_decoder_workers_exit_while_output_is_open() {
+    let mut output = sharescreen_audio::Output::open(None).expect("open playback device");
+    for _ in 0..100 {
+        let decoder = sharescreen_media::Decoder::new(
+            sharescreen_webrtc::RemoteTrackKind::Audio,
+            sharescreen_core::Codec::Opus,
+        )
+        .expect("audio decoder must construct cleanly");
+        decoder.stop();
+    }
+    output.play(&vec![0; 960 * 2]);
+    output.stop();
+}

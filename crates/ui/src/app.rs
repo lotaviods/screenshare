@@ -7,8 +7,8 @@ use std::time::Duration;
 use gpui::{
     AnyElement, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Div, ElementId, Entity,
     FontWeight, ObjectFit, Render, RenderImage, SharedString, Stateful, StatefulInteractiveElement,
-    WeakEntity, Window, WindowHandle, WindowKind, WindowOptions, div, img, prelude::*, px, rgb,
-    size,
+    Subscription, WeakEntity, Window, WindowHandle, WindowKind, WindowOptions, div, img,
+    prelude::*, px, rgb, size,
 };
 use sharescreen_config::{Config, ConfigStore, NoiseSuppressionLevel};
 use sharescreen_core::{
@@ -85,6 +85,8 @@ pub struct AppView {
     peer_volumes: HashMap<String, f64>,
     peer_rtt: HashMap<String, f64>,
     rtt_history: std::collections::VecDeque<f64>,
+    audio_metrics: Option<sharescreen_audio::AudioMetrics>,
+    media_metrics: Option<sharescreen_media::MediaMetrics>,
 
     name_input: Entity<TextInput>,
     host_input: Entity<TextInput>,
@@ -110,10 +112,13 @@ pub struct AppView {
     monitors: Vec<Device>,
 
     remote_frames: HashMap<String, Arc<RenderImage>>,
+    remote_thumbnail_frames: HashMap<String, Arc<RenderImage>>,
     local_frame: Option<Arc<RenderImage>>,
     focused_share: Option<ShareId>,
     pip_window: Option<WindowHandle<PipView>>,
     pip_entity: Option<Entity<PipView>>,
+    video_window_active: bool,
+    activation_subscription: Option<Subscription>,
 }
 
 impl AppView {
@@ -146,6 +151,8 @@ impl AppView {
             peer_volumes: HashMap::new(),
             peer_rtt: HashMap::new(),
             rtt_history: std::collections::VecDeque::new(),
+            audio_metrics: None,
+            media_metrics: None,
             name_input: cx.new(|cx| TextInput::new(name.clone(), "Name others will see", cx)),
             host_input: cx.new(|cx| TextInput::new(host.clone(), "127.0.0.1", cx)),
             port_input: cx.new(|cx| TextInput::new(port.clone(), "8080", cx)),
@@ -165,10 +172,13 @@ impl AppView {
             outputs: Vec::new(),
             monitors: Vec::new(),
             remote_frames: HashMap::new(),
+            remote_thumbnail_frames: HashMap::new(),
             local_frame: None,
             focused_share: None,
             pip_window: None,
             pip_entity: None,
+            video_window_active: true,
+            activation_subscription: None,
         };
 
         view.backend.send(Command::ListDevices);
@@ -268,7 +278,7 @@ impl AppView {
 
     fn frame_request(&mut self, cx: &mut Context<Self>) -> Option<FrameRequest> {
         self.prune_pip(cx);
-        let peers: Vec<_> = if self.screen == Screen::Call {
+        let peers: Vec<_> = if self.screen == Screen::Call && self.video_window_active {
             self.participants
                 .iter()
                 .filter(|participant| participant.screen_on)
@@ -277,12 +287,12 @@ impl AppView {
         } else {
             Vec::new()
         };
-        let local = self.screen == Screen::Call && self.sharing;
+        let local = self.video_window_active && self.screen == Screen::Call && self.sharing;
         if self.screen != Screen::Call && self.pip_window.is_none() && !local {
             return None;
         }
         Some(FrameRequest {
-            remote: true,
+            remote: self.video_window_active,
             peers,
             pip: false,
             pip_target: None,
@@ -293,7 +303,7 @@ impl AppView {
     /// The faster self-view request: PiP and the local stage, no remote peer.
     fn preview_request(&mut self, cx: &mut Context<Self>) -> Option<FrameRequest> {
         self.prune_pip(cx);
-        let local = self.screen == Screen::Call && self.sharing;
+        let local = self.video_window_active && self.screen == Screen::Call && self.sharing;
         let pip = self.pip_window.is_some();
         if !pip && !local {
             return None;
@@ -319,6 +329,7 @@ impl AppView {
 
     fn forget_remote_share(&mut self, peer: &str) {
         self.remote_frames.remove(peer);
+        self.remote_thumbnail_frames.remove(peer);
         if self.focused_share == Some(ShareId::Remote(peer.to_owned())) {
             self.focused_share = None;
         }
@@ -342,10 +353,18 @@ impl AppView {
             shares.push((ShareId::Local, "You".to_owned(), self.local_frame.clone()));
         }
         for participant in self.participants.iter().filter(|p| p.screen_on) {
+            let focused = self.focused_share == Some(ShareId::Remote(participant.id.clone()));
             shares.push((
                 ShareId::Remote(participant.id.clone()),
                 participant.name.clone(),
-                self.remote_frames.get(&participant.id).cloned(),
+                if focused {
+                    self.remote_frames.get(&participant.id).cloned()
+                } else {
+                    self.remote_thumbnail_frames
+                        .get(&participant.id)
+                        .or_else(|| self.remote_frames.get(&participant.id))
+                        .cloned()
+                },
             ));
         }
         shares
@@ -559,6 +578,7 @@ impl AppView {
                     self.room_id = None;
                     self.participants.clear();
                     self.remote_frames.clear();
+                    self.remote_thumbnail_frames.clear();
                     self.focused_share = None;
                     self.local_frame = None;
                 }
@@ -598,6 +618,10 @@ impl AppView {
                     self.rtt_history.clear();
                 }
             }
+            UiEvent::MediaMetrics { audio, media } => {
+                self.audio_metrics = Some(audio);
+                self.media_metrics = Some(media);
+            }
             UiEvent::Sharing(on) => {
                 self.sharing = on;
                 if !on {
@@ -608,7 +632,7 @@ impl AppView {
                     }
                 }
             }
-            UiEvent::Frame { kind, frame } => match kind {
+            UiEvent::Frame { kind, frame, .. } => match kind {
                 FrameKind::Remote(peer) => {
                     // Accept the frame even if the participant update has not
                     // arrived yet; the map is only read for peers that are
@@ -617,6 +641,13 @@ impl AppView {
                         self.remote_frames.insert(peer, frame);
                     } else {
                         self.remote_frames.remove(&peer);
+                    }
+                }
+                FrameKind::RemoteThumbnail(peer) => {
+                    if let Some(frame) = frame {
+                        self.remote_thumbnail_frames.insert(peer, frame);
+                    } else {
+                        self.remote_thumbnail_frames.remove(&peer);
                     }
                 }
                 FrameKind::Local => self.local_frame = frame,
@@ -650,6 +681,7 @@ impl AppView {
                 self.rtt_history.clear();
                 self.participants.clear();
                 self.remote_frames.clear();
+                self.remote_thumbnail_frames.clear();
                 self.focused_share = None;
                 self.local_frame = None;
                 self.screen = Screen::Home;
@@ -675,6 +707,7 @@ impl AppView {
                 self.peer_rtt.remove(&id);
             }
             CallEvent::ConnectionStateChanged { .. } => {}
+            CallEvent::KeyframeRequested { .. } => {}
             CallEvent::Error { message } => self.error = Some(message),
         }
     }
@@ -726,6 +759,7 @@ impl AppView {
         self.resume_share = false;
         self.participants.clear();
         self.remote_frames.clear();
+        self.remote_thumbnail_frames.clear();
         self.focused_share = None;
         self.local_frame = None;
         self.screen = Screen::Home;
@@ -959,6 +993,7 @@ impl AppView {
         self.rtt_history.clear();
         self.participants.clear();
         self.remote_frames.clear();
+        self.remote_thumbnail_frames.clear();
         self.focused_share = None;
         self.local_frame = None;
         self.screen = Screen::Home;
@@ -972,6 +1007,7 @@ impl AppView {
         self.rtt_history.clear();
         self.participants.clear();
         self.remote_frames.clear();
+        self.remote_thumbnail_frames.clear();
         self.focused_share = None;
         self.local_frame = None;
         self.screen = Screen::Home;
@@ -1025,6 +1061,7 @@ impl AppView {
             bitrate_kbps: self.share.bitrate,
             hardware_encoding: cfg!(target_os = "linux") || self.share.hardware,
             thumbnail_sender: None,
+            keyframe_request: None,
         };
         tracing::info!(
             source = %source.id,
@@ -1561,6 +1598,30 @@ impl AppView {
                         .child("Network round trip · last 60 s"),
                 ),
         );
+        if let (Some(audio), Some(media)) = (self.audio_metrics, self.media_metrics) {
+            sidebar = sidebar.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("Media counters (cumulative)")
+                    .child(format!(
+                        "Audio drops {} · underruns {} · write errors {}",
+                        audio.capture_queue_drops,
+                        audio.playback_underruns,
+                        audio.playback_write_errors
+                    ))
+                    .child(format!(
+                        "Video drops {} · Opus gaps {} · FEC {} · PLC {}",
+                        media.video_rtp_queue_drops,
+                        media.opus_packet_gaps,
+                        media.opus_fec_recoveries,
+                        media.opus_plc_frames
+                    )),
+            );
+        }
         if let Some(notice) = &self.encoder_notice {
             sidebar = sidebar.child(div().text_xs().text_color(rgb(MUTED)).child(notice.clone()));
         }
@@ -2280,7 +2341,15 @@ impl AppView {
 }
 
 impl Render for AppView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.activation_subscription.is_none() {
+            self.video_window_active = window.is_window_active();
+            self.activation_subscription =
+                Some(cx.observe_window_activation(window, |view, window, cx| {
+                    view.video_window_active = window.is_window_active();
+                    cx.notify();
+                }));
+        }
         let mut root = div()
             .size_full()
             .flex()

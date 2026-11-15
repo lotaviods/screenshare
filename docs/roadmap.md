@@ -22,9 +22,9 @@ Last updated: 2026-11-14.
 | Crash on call end | Root cause proven; P0.1 code landed in `5836c7b`, live PulseAudio lifecycle validation pending |
 | Audio stutter | Playback worker/cadence, queue/write reporting, adaptive prebuffer, libopus PLC/FEC and RTP gap recovery landed in `5836c7b`; live session unverified |
 | Video decode | Nonblocking overload policy, IDR recovery and self-view JPEG cap landed in `5836c7b`; runtime acceptance pending |
-| Scale to 6-8 | Relay SFU forwards real RTP end-to-end; focus switching adds the new track and pauses the old subscription in automated 2-3 client tests. Mesh remains the default; keyframe requests, thumbnails and measurements remain open |
+| Scale to 6-8 | SFU is the default and mesh calls above 3 total participants upgrade to SFU in the worktree; room admission caps at 8 including creator. Selected relay/focus tests pass; live scale and capacity measurements remain open |
 | Windows | Untested; release gate recorded (D11) |
-| Code changes | Inherited working tree committed as `5836c7b`; SFU media-path tests and the codec pin are in `95a09d2` |
+| Code changes | Baseline commits `5836c7b`, `95a09d2`; current SFU, thumbnail, lifecycle and UI increment remains uncommitted in the existing worktree |
 
 ## Context
 
@@ -216,6 +216,51 @@ and only payload type and SSRC are rewritten for the egress leg. The unused
 `server/tests/sfu_media_e2e.rs` (two clients through live signaling, plus a
 third publisher added by a focus switch).
 
+### D19 - Keep mesh only as a small-room compatibility fallback
+**Accepted.** SFU remains the path for the 6–8 participant target. Mesh may
+remain available for small rooms, but must not be presented as a supported
+topology for the target group size. The owner selected a cutoff of **3 total
+participants, including the local participant** (2026-11-14). Calls configured
+for mesh upgrade to SFU when the roster exceeds this limit; real multi-client
+upgrade behavior remains untested.
+
+### D20 - Prioritize keyframes for every supported video codec
+**Accepted.** Queue recovery must recognize and prioritize keyframes for H.264,
+VP8 and VP9. The worktree detects all three formats and batches fragmented
+keyframes in a bounded priority queue; codec-detection unit tests pass.
+
+### D21 - Linux first; defer Windows implementation and live testing
+**Accepted.** Implement and validate the current work on Linux only. Defer
+Windows-specific feature parity and WASAPI device testing to a later phase.
+D11's Windows release-build gate remains a release prerequisite.
+
+### D22 - Pause remote video decoding while the window is minimized
+**Accepted.** Stop remote frame demand and drain incoming video RTP while the
+main window is inactive; request a keyframe when frame demand resumes. GPUI
+exposes activation, not a minimized-state query, so this also pauses decode
+when the window loses focus; actual minimized/restored desktop behavior remains
+unverified.
+
+### D23 - Preserve the negotiated codec when falling back from hardware
+**Accepted.** Try software encoding with the same negotiated codec when
+available. The current Linux DMA-BUF capture path still has only its VAAPI
+encoder; when it fails, it reports an error through the UI and never switches
+codecs. A same-codec software path is not implemented because no CPU-frame
+fallback exists in this capture path, so D23 remains incomplete.
+
+### D24 - Cap rooms at eight participants total
+**Accepted.** The creator counts toward the eight-person room limit.
+The server join path already inserts the creator into room membership; a
+server unit test now verifies creator + seven peers succeeds and a ninth is
+rejected.
+
+### D25 - Measure before suppressing idle thumbnail encoding
+**Accepted.** Keep thumbnail encoding behavior until measurements show that
+encoding without subscribers wastes meaningful uplink or compute; implement
+subscriber-aware suppression only if the measurements justify it. No such
+measurement has been run, so the worktree continues encoding thumbnails without
+subscriber-aware suppression.
+
 ## Plan
 
 ### Phase 0 - Stability and audio correctness
@@ -264,9 +309,11 @@ playback underruns on a loopback test, counters exported. `audio_metrics()` and
 
 - [x] P1.1 RTP reader never awaits the decoder queue; drop by policy, never by
       blocking the track reader. Landed 2026-11-14 in `5836c7b`.
-- [ ] P1.2 Queue policy that keeps keyframes over stale P-frames. The current
-      policy drops the newest packet when the queue is full and waits for the
-      next IDR, which bounds damage but does not prefer an incoming keyframe.
+- [ ] P1.2 Queue policy that keeps keyframes over stale P-frames. H.264 IDR
+      starts are now recognized for H.264, VP8 and VP9. The worktree collects a
+      bounded keyframe access unit before prioritizing it over stale queued
+      packets; codec-recognition unit tests pass. No sustained overload or live
+      stream recovery test has run; the item stays open until commit/evidence.
 - [x] P1.3 Decoder recovery: on repeated `AVERROR_INVALIDDATA`, discard to the
       next IDR and rebuild the context if it persists. Landed 2026-11-14 in
       `5836c7b`.
@@ -291,7 +338,14 @@ under 1 %, no stuck decoder. Not measured.
 - [ ] P2.2 Measure per-client CPU, memory and one-way latency at 3 peers.
 - [ ] P2.3 Compare against the LiveKit path on paper only: what we would lose
       from D6, what we would gain in operability. Decide D5. D5 is accepted and
-      amended by D18 for the transport; the LiveKit comparison is still open.
+      amended by D18 for the transport. The comparison is now recorded: the
+      in-process Rust relay preserves the VAAPI/DMA-BUF H.264 pipeline and
+      shares the client's webrtc-rs transport, with no server transcoding or
+      extra media service. LiveKit would provide a mature separately operated
+      SFU, but its Rust source/encode path conflicts with D6 and would discard
+      the current native capture/encode path. D5/D18 remain the choice for this
+      evaluation; this paper comparison does not establish operational
+      reliability or capacity, and P2.3 remains open pending measurements.
 
 Acceptance: 3 clients, 10 min, no relay-induced decode errors, decision
 recorded. Media relay is proven in tests; duration, decode-error rate and the
@@ -300,23 +354,27 @@ decision remain open.
 ### Phase 3 - Call layer rework
 
 - [ ] P3.1 Replace mesh in `crates/call` with publish/subscribe against the
-      SFU. The SFU path exists and is selected by `ConnectionMode::Sfu`, but
-      mesh is still the default and both topologies coexist.
+      SFU. SFU is the default; a mesh-configured call promotes to SFU above
+      three total participants (D19). The switch has a cutoff unit test but no
+      live multi-client validation; mesh remains available for up to three.
 - [ ] P3.2 Subscription API and roster integration; join/leave while sharing.
       Subscription snapshots drive client renegotiation; join/leave while
       sharing has only automated control-plane coverage.
-- [ ] P3.3 Reconnect and keyframe request on subscribe. Reconnect handling and
-      PLI/FIR upstream requests are not implemented; a late subscriber waits
-      for the encoder's next IDR.
+- [ ] P3.3 Reconnect and keyframe request on subscribe. SFU transport restart
+      and upstream PLI/keyframe signaling are implemented in the worktree.
+      Remote decode drains RTP without frame demand and asks for a keyframe on
+      the next poll; automatic reconnect and late-subscriber runtime behavior
+      remain unverified.
 - [x] P3.4 Keep `crates/webrtc` as the peer wrapper; the SFU changes the
       topology, not the codec handling. Confirmed 2026-11-14 (D18).
 - [ ] P3.5 Focus switching: `set_focus(peer_id)` swaps the full-quality
       subscription and requests a keyframe; everyone else stays on the
       thumbnail track (D15). The swap, the new egress track and pausing the
       previous subscription are proven in `server/tests/sfu_media_e2e.rs`
-      (2026-11-14, `95a09d2` and `27619bb`); keyframe requests and thumbnail
-      tracks are still
-      missing, and the 500 ms time is not asserted.
+      (2026-11-14, `95a09d2` and `27619bb`). Keyframe requests and thumbnail
+      tracks are implemented in the worktree; the test now asserts the
+      500 ms focus-switch target and passed in the workspace suite. Live
+      multi-host focus/keyframe behavior remains unverified.
 
 Acceptance: 4 clients on one relay; a late joiner gets video without a manual
 keyframe; leaving mid-share does not disturb the others; focusing a different
@@ -325,20 +383,35 @@ share shows it in under 500 ms.
 ### Phase 4 - Scale to 6-8
 
 - [ ] P4.1 Publish two tracks per share: focus stream (1080p30, 2.5-4 Mbps) and
-      thumbnail stream (480p/360p at 5 fps, ~200-300 kbps) (D16).
+      thumbnail stream (480p/360p at 5 fps, ~200-300 kbps) (D16). Linux
+      thumbnail publication is implemented in the worktree; Windows parity
+      and quality/uplink measurements remain open.
 - [ ] P4.2 Secondary tile strip in the UI, with exactly one focus at a time
-      (D15). No cap on the number of secondary tiles; pause their decode while
-      the window is minimised.
+      (D15). Thumbnail display and focus wiring are implemented in the
+      worktree. Remote frame polling stops when the main window is inactive;
+      RTP draining and PLI-on-resume are wired, but GPUI exposes activation
+      rather than minimized state, and desktop/live verification remains open.
 - [ ] P4.3 UI decode budget: shared jpeg/decode budget across tiles instead of
-      one independent decoder pipeline per tile.
+      one independent decoder pipeline per tile. The worktree caps active
+      remote video decoders at eight, pauses/drains inactive tracks, and caps
+      outstanding UI frame events at 16. The UI still uses one decoder per
+      active track; load behavior remains unverified.
 - [ ] P4.4 Skip the thumbnail encode when the SFU reports no subscriber, only if
-      measurement shows the uplink waste matters.
+      measurement shows the uplink waste matters. No measurement justifies
+      suppression, so the current thumbnail behavior is retained.
 - [ ] P4.5 Server capacity target and TURN interaction (`server/src/turn.rs`).
+      Room admission is capped at eight total participants, including the
+      creator, and a unit test verifies that boundary. TURN is the ICE relay
+      fallback; when selected, publisher ingress and subscriber egress also
+      consume TURN relay bandwidth. This is a product guardrail, not a measured
+      server-capacity claim; throughput and TURN load still need measurement.
 - [ ] P4.6 Soak: 8 peers, 1 h, audio underrun and drop counters at zero.
 
 ### Phase 5 - Windows
 
-- [ ] P5.1 Build gate on Windows for every release (D11).
+- [ ] P5.1 Build gate on Windows for every release (D11). Windows feature
+      implementation and validation are deferred; the existing build workflow
+      in the worktree has not run on GitHub.
 - [ ] P5.2 WASAPI capture and playback smoke test on real hardware.
 - [ ] P5.3 Encoder selection and fallback visible in the UI, not only in logs.
 
@@ -363,6 +436,8 @@ share shows it in under 500 ms.
 5. ~~How many simultaneous shares must be visible at full quality?~~ **Answered
    2026-11-14: one focus at full quality, the rest as secondary tiles (D15).**
    The earlier "max 4" cap is dropped.
+6. ~~What is the mesh room cutoff?~~ **Answered 2026-11-14: three total
+   participants including the creator.** Resolved by D19.
 
 ## Working state and handoff
 
@@ -386,10 +461,11 @@ continue without re-deriving the analysis belongs here.
   and `media_metrics()` exports video queue drops plus Opus gap/FEC/PLC/silence
   counters; neither is shown in the UI yet.
 - P1.1/P1.3/P1.4: video RTP enqueue uses `try_send` with a cumulative drop
-  counter; audio enqueue remains awaited. On video overflow the decoder waits
-  for an H.264 IDR and recreates its context; after three decode errors it also
-  waits for an IDR. The self-view JPEG stage is capped at 15 fps. Queue stress
-  and the 10-minute share acceptance remain unverified.
+  counter; audio enqueue remains awaited. On video overflow, keyframes for
+  H.264/VP8/VP9 are grouped in a single bounded priority slot (up to 256 RTP
+  packets/2 MiB), and decoder recovery waits for the matching codec keyframe.
+  The self-view JPEG stage is capped at 15 fps. Queue stress and the 10-minute
+  share acceptance remain unverified.
 - P0.2 audit: WASAPI declares the COM guard after the endpoint/client handles,
   so it is dropped last; capture and playback stop their clients in `Drop`.
   No PulseAudio-style owner ordering defect was found, but Windows build and
@@ -415,37 +491,34 @@ continue without re-deriving the analysis belongs here.
   relay tracks; remote tracks expose stream/track ids. The call layer now has
   the `ConnectionMode::Sfu` path with publication, offer/answer, ICE,
   subscription-driven renegotiation, focus signalling and track attachment.
-  Mesh remains the default.
+  SFU is the default; mesh calls promote above three total participants.
 - Audio loss recovery: `OpusDecoder` dynamically loads libopus for PLC and FEC,
   with FFmpeg as fallback. The receive loop detects bounded forward RTP gaps,
   applies PLC for earlier losses and FEC from the next packet for the final
   one, and counts gaps/FEC/PLC/silence. Unit tests cover PLC/FEC and sequence
   wrap/reorder; live loss is unverified.
-- Latest validation: `cargo test --workspace` passes, including the six
-  signaling integration tests, the two SFU media-path tests and the WebRTC
-  loopback tests. `cargo clippy --workspace --all-targets -- -D warnings`
-  passes and `cargo fmt --all` is clean. `sharescreen-ui` starts and opens its
-  Vulkan window; `sharescreen-server` binds `0.0.0.0:8080`. No live audio
-  device, manual multi-host SFU session or long-running call was exercised.
+- Latest validation: the Linux workspace test suite passed before the final
+  small queue-bound adjustment; targeted call/media/capture/UI/server tests,
+  `cargo fmt --all -- --check`, and `cargo clippy --workspace --all-targets --
+  -D warnings` pass after it. Hardware-dependent audio smoke tests are ignored;
+  no Windows, live multi-host SFU session, or long-running call was exercised.
 - The crash diagnosis is proven by core dumps, but the fix has not been checked
   in a live PulseAudio close/reopen loop.
 
 ### Start here (next actions, in order)
 
-1. Request a keyframe on subscribe/focus (P3.3): send PLI/FIR upstream from the
-   ingress receiver when a new viewer is wired, so the first focused frame does
-   not wait for the encoder's periodic IDR.
-2. Show exported audio/media counters in the call sidebar and run the Phase 0
-   acceptance session on a machine with PulseAudio (1 h, two peers, zero drops).
-3. Measure P2.2 (CPU, memory, one-way latency at 3 peers) and write the P2.3
-   LiveKit comparison.
-4. Rework the call UI/default from mesh to SFU, then implement the two-encode
-   thumbnail track (D16) and the shared decode budget (P4.3).
-5. Run the 8-peer soak and complete the Windows build/device gates.
+1. Commit the current increment only after authorization; until then, leave
+   plan checkboxes open under the evidence/commit rule.
+2. Validate real minimized/restored behavior, keyframe recovery under queue
+   pressure, SFU reconnect/focus, and thumbnail behavior with live clients.
+3. Measure P2.2, thumbnail uplink/compute, and TURN/server capacity before
+   changing thumbnail suppression or claiming scalability.
+4. Run the 8-peer soak and Phase 0 audio acceptance session on Linux hardware.
+   Windows implementation/build/device checks remain deferred.
 
-Do not treat the SFU as production-ready before keyframe requests and a
-multi-host session exist. The automated tests prove the media path, not call
-quality.
+The code paths for keyframe requests, thumbnails and reconnect are present but
+not yet validated in a live multi-host session. Automated tests prove selected
+media/control paths, not call quality or production capacity.
 
 ### Facts a new reader would otherwise re-discover
 
@@ -478,8 +551,8 @@ quality.
   with `rid` and `scale_resolution_down_by`) but does not downscale pre-encoded
   samples, so simulcast would not save an encode for us (D16).
 - The settings UI has an "SFU" button and `crates/core` has
-  `ConnectionMode::Sfu`; both now select the single-peer SFU path. Mesh remains
-  the config default.
+  `ConnectionMode::Sfu`; SFU is the config default and mesh calls upgrade to
+  SFU above three total participants.
 - Deployment is one host via `deploy/compose.yaml` (signaling + coturn, plus a
   disabled LiveKit `sfu` profile). `/home/usr_jg` is the only validated
   platform.
@@ -712,5 +785,56 @@ quality.
 - Hardware capture/encode failure paths (DMA-BUF, VAAPI, WASAPI) under driver
   error conditions.
 - Live PulseAudio close/reopen and audio-jitter measurements.
-- Keyframe requests on subscribe, relay CPU/memory/latency measurements and
-  thumbnail decoding/encoding behaviour.
+- Linux workspace tests passed before the final queue-bound tweak; targeted
+  affected-package tests, clippy, formatting and whitespace checks pass after
+  it. Hardware-dependent audio smoke tests are ignored.
+- Relay CPU/memory/latency, TURN throughput, thumbnail quality/uplink, runtime
+  reconnect, actual minimized/restored desktop behavior, and the 8-peer soak.
+- Same-codec software fallback for Linux DMA-BUF capture remains unimplemented;
+  failures are surfaced and do not silently switch codecs.
+
+### 2026-11-14 - Roadmap implementation continuation
+
+- Implemented SFU PLI/keyframe signaling, transport restart handling, and
+  publisher keyframe requests; added bounded Linux thumbnail encoding and
+  thumbnail publication, demand-based remote-video pausing, and an eight-track
+  decoder budget.
+- Connected thumbnail frames and media counters to the UI, made SFU the
+  default connection mode, and added timing/lifecycle coverage.
+- Added an eight-participant room admission cap and a Windows release-build
+  workflow. Recorded the qualitative LiveKit comparison and remaining evidence
+  gaps above.
+- Fixed reconnect scheduling to avoid spawning a non-`Send` peer future, made
+  SFU renegotiation coverage wait for the publication snapshot it asserts, and
+  added bounded/no-upscale thumbnail-size coverage.
+- `CARGO_INCREMENTAL=0 cargo test --workspace`, `CARGO_INCREMENTAL=0 cargo
+  clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`
+  and `git diff --check` pass. Hardware-dependent audio smoke tests remain
+  ignored; no Windows, live multi-host, PulseAudio soak, TURN load, or 8-peer
+  validation was performed.
+- All changes remain uncommitted. Plan checkboxes stay open until changes are
+  committed and their stated roadmap evidence is available.
+
+### 2026-11-14 - D19-D25 implementation follow-up
+
+- The owner selected three total participants for mesh. Calls over the limit
+  now promote to SFU in the worktree; the cutoff has a unit test.
+- Queue recovery recognizes H.264/VP8/VP9 keyframes and prioritizes a bounded
+  complete access unit. Video demand pauses when the main window is inactive;
+  incoming RTP is drained and a keyframe is requested when frame polling
+  resumes. GPUI does not expose a minimized-state query, so inactivity is the
+  available proxy, and no desktop behavior was exercised.
+- UI frame notifications are bounded to 16 outstanding events. Thumbnail
+  worker startup failure is nonfatal to primary capture; thumbnail encode
+  suppression remains unchanged without measurements.
+- The server room-cap test verifies creator + seven peers is accepted and a
+  ninth participant is rejected.
+- `cargo test --workspace` passed before the final queue-size bound was added;
+  targeted Linux tests for call, media, capture, UI and server passed after it.
+  `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --
+  -D warnings`, and `git diff --check` passed. One PulseAudio smoke test remains
+  ignored because it requires a live device.
+- No same-codec software encoder fallback exists on the Linux DMA-BUF path;
+  encoder failure is reported visibly without changing the negotiated codec.
+  No hardware capture, minimized-window desktop test, live multi-host call,
+  Windows test, or soak was run. Changes remain uncommitted.

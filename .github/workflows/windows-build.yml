@@ -1,0 +1,19 @@
+name: Windows release build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Build portable desktop app
+        shell: pwsh
+        run: ./scripts/build.ps1 -NoArchive

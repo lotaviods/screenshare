@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum FrameKind {
     Remote(String),
+    RemoteThumbnail(String),
     Pip,
     Local,
 }
@@ -102,13 +103,20 @@ pub enum UiEvent {
     Sharing(bool),
     /// Latest RTT measurements for the active peer connections, in ms.
     Latency(Vec<(String, f64)>),
+    MediaMetrics {
+        audio: sharescreen_audio::AudioMetrics,
+        media: sharescreen_media::MediaMetrics,
+    },
     EncoderNotice(String),
     Frame {
         kind: FrameKind,
         /// Already-decoded BGRA pixels; the GPUI thread only wraps them.
         frame: Option<Arc<RenderImage>>,
+        _permit: tokio::sync::OwnedSemaphorePermit,
     },
 }
+
+const FRAME_EVENT_BUDGET: usize = 16;
 
 /// Handle the UI uses to issue commands.
 #[derive(Clone)]
@@ -170,6 +178,8 @@ struct Actor {
     latency_inflight: Arc<AtomicBool>,
     latency_generation: Arc<AtomicU64>,
     session_generation: Arc<AtomicU64>,
+    keyframe_request: Arc<AtomicBool>,
+    frame_event_budget: Arc<tokio::sync::Semaphore>,
 }
 
 impl Actor {
@@ -200,6 +210,8 @@ impl Actor {
             latency_inflight: Arc::new(AtomicBool::new(false)),
             latency_generation: Arc::new(AtomicU64::new(0)),
             session_generation: Arc::new(AtomicU64::new(0)),
+            keyframe_request: Arc::new(AtomicBool::new(false)),
+            frame_event_budget: Arc::new(tokio::sync::Semaphore::new(FRAME_EVENT_BUDGET)),
         }
     }
 
@@ -268,7 +280,8 @@ impl Actor {
                 Ok(())
             }
             Command::ForgetRemote(peer) => {
-                self.frames.remove(&FrameKind::Remote(peer));
+                self.frames.remove(&FrameKind::Remote(peer.clone()));
+                self.frames.remove(&FrameKind::RemoteThumbnail(peer));
                 Ok(())
             }
             Command::PollLatency => {
@@ -305,6 +318,10 @@ impl Actor {
     }
 
     async fn check_media_health(&mut self) -> Result<(), String> {
+        self.send(UiEvent::MediaMetrics {
+            audio: sharescreen_audio::audio_metrics(),
+            media: sharescreen_media::media_metrics(),
+        });
         if let Some(notice) = self.capture.take_notice() {
             self.send(UiEvent::EncoderNotice(notice));
         }
@@ -373,12 +390,16 @@ impl Actor {
         let (tx, mut rx) = mpsc::unbounded_channel::<CallEvent>();
         let ui = self.ui.clone();
         let store = self.store.clone();
+        let keyframe_request = self.keyframe_request.clone();
         let generation = self.session_generation.clone();
         let current = generation.fetch_add(1, Ordering::AcqRel) + 1;
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
                 if generation.load(Ordering::Acquire) != current {
                     break;
+                }
+                if matches!(&event, CallEvent::KeyframeRequested { .. }) {
+                    keyframe_request.store(true, Ordering::Release);
                 }
                 if let CallEvent::RoomCreated { room_id } | CallEvent::RoomJoined { room_id } =
                     &event
@@ -570,6 +591,7 @@ impl Actor {
         }
         let sink = self.media_sink(Stream::Screen);
         let mut options = options;
+        options.keyframe_request = Some(self.keyframe_request.clone());
         if let Some(call) = &self.call {
             let session_codec = call.video_codec();
             if options.codec != session_codec {
@@ -580,6 +602,10 @@ impl Actor {
                 );
             }
             options.codec = session_codec;
+            #[cfg(target_os = "linux")]
+            {
+                options.thumbnail_sender = Some(call.thumbnail_sender());
+            }
         }
         tracing::info!(
             "starting screen share: source={} resolution={}x{} fps={} bitrate={} kbps",
@@ -676,12 +702,19 @@ impl Actor {
     fn poll_frames(&mut self, request: FrameRequest) {
         if request.remote {
             self.frames.retain(|kind, _| match kind {
-                FrameKind::Remote(id) => request.peers.contains(id),
+                FrameKind::Remote(id) | FrameKind::RemoteThumbnail(id) => {
+                    request.peers.contains(id)
+                }
                 _ => true,
             });
             for peer in &request.peers {
                 let frame = self.call.as_ref().and_then(|call| call.remote_frame(peer));
                 self.emit_frame(FrameKind::Remote(peer.clone()), frame);
+                let thumbnail = self
+                    .call
+                    .as_ref()
+                    .and_then(|call| call.remote_thumbnail_frame(peer));
+                self.emit_frame(FrameKind::RemoteThumbnail(peer.clone()), thumbnail);
             }
         }
 
@@ -722,11 +755,22 @@ impl Actor {
         if self.frames.get(&kind) == Some(&hash) {
             return;
         }
+        let permit = match self.frame_event_budget.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::debug!("dropping UI frame update because the bounded frame queue is full");
+                return;
+            }
+        };
         self.frames.insert(kind.clone(), hash);
         // JPEG decoding and the RGBA->BGRA pass run on the backend thread, not
         // the GPUI thread. Only a cheap `RenderImage` wrapper crosses over.
         let frame = decode_frame(jpeg);
-        self.send(UiEvent::Frame { kind, frame });
+        self.send(UiEvent::Frame {
+            kind,
+            frame,
+            _permit: permit,
+        });
     }
 
     fn save_config(&mut self, config: Config) -> Result<(), String> {
@@ -826,7 +870,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_poll_does_not_clear_remote_frame() {
+    fn preview_poll_preserves_remote_frame_and_frame_events_are_bounded() {
         let path = std::env::temp_dir().join(format!(
             "sharescreen-preview-test-{}-{}.toml",
             std::process::id(),
@@ -868,6 +912,13 @@ mod tests {
             }
         }
         assert_eq!(delivered, ["a", "b"]);
+        for index in 0..FRAME_EVENT_BUDGET + 3 {
+            actor.emit_frame(FrameKind::Remote(format!("queued-{index}")), None);
+        }
+        let queued_frames = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|event| matches!(event, UiEvent::Frame { .. }))
+            .count();
+        assert_eq!(queued_frames, FRAME_EVENT_BUDGET);
         actor.poll_frames(FrameRequest {
             remote: true,
             ..Default::default()

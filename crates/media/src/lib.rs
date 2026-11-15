@@ -10,9 +10,9 @@
 //! hand to the GPUI renderer.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -43,6 +43,8 @@ pub struct Decoder {
     frames: Option<Arc<Mutex<Option<Vec<u8>>>>>,
     volume: Arc<Mutex<f64>>,
     tx: mpsc::Sender<Vec<u8>>,
+    keyframe_tx: mpsc::Sender<Vec<Vec<u8>>>,
+    video_demand: Arc<AtomicU64>,
     stop: watch::Sender<bool>,
     video_recovery: Arc<AtomicBool>,
 }
@@ -51,6 +53,10 @@ pub struct Decoder {
 /// for 20 ms audio, less for video). `attach` awaits capacity, keeping packet
 /// memory bounded while allowing the WebRTC reader to apply backpressure.
 const REMOTE_RTP_QUEUE: usize = 256;
+const MAX_KEYFRAME_PRIORITY_BYTES: usize = 2 * 1024 * 1024;
+const KEYFRAME_PRIORITY_QUEUE: usize = 1;
+const MAX_VIDEO_DECODERS: usize = 8;
+const VIDEO_DEMAND_TIMEOUT: Duration = Duration::from_millis(500);
 static VIDEO_RTP_QUEUE_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static OPUS_PACKET_GAPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static OPUS_FEC_RECOVERIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -95,6 +101,8 @@ impl Decoder {
         let running = Arc::new(AtomicBool::new(true));
         let volume = Arc::new(Mutex::new(1.0));
         let (tx, mut rx) = mpsc::channel(REMOTE_RTP_QUEUE);
+        let (keyframe_tx, mut keyframe_rx) = mpsc::channel(KEYFRAME_PRIORITY_QUEUE);
+        let video_demand = Arc::new(AtomicU64::new(0));
         let (stop, _) = watch::channel(false);
         let video_recovery = Arc::new(AtomicBool::new(false));
 
@@ -104,6 +112,7 @@ impl Decoder {
         let thread_flag = flag.clone();
         let thread_stop = stop.clone();
         let thread_recovery = video_recovery.clone();
+        let thread_video_demand = video_demand.clone();
         let thread = std::thread::Builder::new()
             .name("sharescreen-media".into())
             .spawn(move || {
@@ -112,10 +121,12 @@ impl Decoder {
                     codec,
                     rtp_kind,
                     &mut rx,
+                    &mut keyframe_rx,
                     flag,
                     volume_slot,
                     frames_slot,
                     thread_recovery,
+                    thread_video_demand,
                 );
                 thread_flag.store(false, Ordering::SeqCst);
                 thread_stop.send_replace(true);
@@ -128,6 +139,8 @@ impl Decoder {
             frames,
             volume,
             tx,
+            keyframe_tx,
+            video_demand,
             stop,
             video_recovery,
         })
@@ -168,10 +181,12 @@ fn run(
     codec: Codec,
     rtp_kind: RtpKind,
     rx: &mut mpsc::Receiver<Vec<u8>>,
+    keyframe_rx: &mut mpsc::Receiver<Vec<Vec<u8>>>,
     running: Arc<AtomicBool>,
     volume: Arc<Mutex<f64>>,
     frames: Option<Arc<Mutex<Option<Vec<u8>>>>>,
     video_recovery: Arc<AtomicBool>,
+    video_demand: Arc<AtomicU64>,
 ) {
     let mut depacketizer = RtpDepacketizer::new(rtp_kind);
     let mut video = if kind == RemoteTrackKind::Video {
@@ -225,7 +240,7 @@ fn run(
         |frame: &[u8], output: &mut Option<Output>, missing_audio_packets: u16| match kind {
             RemoteTrackKind::Video => {
                 if video_recovery.load(Ordering::Acquire) {
-                    if codec == Codec::H264 && !contains_h264_idr(frame) {
+                    if !contains_video_keyframe(codec, frame) {
                         return;
                     }
                     video = None;
@@ -233,7 +248,7 @@ fn run(
                     video_recovery.store(false, Ordering::Release);
                 }
                 if video.is_none() {
-                    if waiting_for_keyframe && codec == Codec::H264 && !contains_h264_idr(frame) {
+                    if waiting_for_keyframe && !contains_video_keyframe(codec, frame) {
                         return;
                     }
                     match VideoDecoder::new(codec_name(codec)) {
@@ -347,6 +362,43 @@ fn run(
 
     let mut last_audio_sequence = None;
     while running.load(Ordering::SeqCst) {
+        if kind == RemoteTrackKind::Video
+            && !video_demand_recent(video_demand.load(Ordering::Relaxed), monotonic_micros())
+        {
+            let mut discarded = 0u64;
+            while rx.try_recv().is_ok() {
+                discarded += 1;
+            }
+            while keyframe_rx.try_recv().is_ok() {
+                discarded += 1;
+            }
+            VIDEO_RTP_QUEUE_DROPS.fetch_add(discarded, Ordering::Relaxed);
+            depacketizer = RtpDepacketizer::new(rtp_kind);
+            video_recovery.store(true, Ordering::Release);
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        let priority_keyframe = match keyframe_rx.try_recv() {
+            Ok(packets) => {
+                let mut discarded = 0u64;
+                while rx.try_recv().is_ok() {
+                    discarded += 1;
+                }
+                VIDEO_RTP_QUEUE_DROPS.fetch_add(discarded, Ordering::Relaxed);
+                depacketizer = RtpDepacketizer::new(rtp_kind);
+                Some(packets)
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => None,
+            Err(mpsc::error::TryRecvError::Empty) => None,
+        };
+        if let Some(packets) = priority_keyframe {
+            for packet in packets {
+                for frame in depacketizer.push(&packet) {
+                    process(&frame, &mut output, 0);
+                }
+            }
+            continue;
+        }
         match rx.try_recv() {
             Ok(packet) => {
                 let missing = if kind == RemoteTrackKind::Audio && packet.len() >= 4 {
@@ -379,6 +431,15 @@ fn run(
     }
 }
 
+fn monotonic_micros() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_micros() as u64
+}
+
+fn video_demand_recent(last_requested: u64, now: u64) -> bool {
+    now.saturating_sub(last_requested) <= VIDEO_DEMAND_TIMEOUT.as_micros() as u64
+}
+
 fn rtp_sequence_gap(previous: u16, current: u16) -> u16 {
     let distance = current.wrapping_sub(previous);
     if (2..=32).contains(&distance) {
@@ -388,6 +449,184 @@ fn rtp_sequence_gap(previous: u16, current: u16) -> u16 {
         // a stream reset rather than speculative PLC on an arbitrary duration.
         0
     }
+}
+
+fn h264_rtp_idr_start(packet: &[u8]) -> bool {
+    let Some(payload) = rtp_payload(packet) else {
+        return false;
+    };
+    let Some(&indicator) = payload.first() else {
+        return false;
+    };
+    match indicator & 0x1f {
+        5 => true,
+        24 => {
+            let mut cursor = 1;
+            while cursor + 2 <= payload.len() {
+                let nal_len =
+                    usize::from(u16::from_be_bytes([payload[cursor], payload[cursor + 1]]));
+                cursor += 2;
+                let Some(nal) = payload.get(cursor..cursor + nal_len) else {
+                    return false;
+                };
+                if nal.first().is_some_and(|header| header & 0x1f == 5) {
+                    return true;
+                }
+                cursor += nal_len;
+            }
+            false
+        }
+        28 => payload.len() >= 2 && payload[1] & 0x80 != 0 && payload[1] & 0x1f == 5,
+        _ => false,
+    }
+}
+
+fn rtp_payload(packet: &[u8]) -> Option<&[u8]> {
+    if packet.len() < 12 || packet[0] >> 6 != 2 {
+        return None;
+    }
+    let mut offset = 12 + usize::from(packet[0] & 0x0f) * 4;
+    if offset > packet.len() {
+        return None;
+    }
+    if packet[0] & 0x10 != 0 {
+        let extension = packet.get(offset..offset + 4)?;
+        let words = usize::from(u16::from_be_bytes([extension[2], extension[3]]));
+        offset += 4 + words * 4;
+    }
+    if packet[0] & 0x20 != 0 {
+        let padding = usize::from(*packet.last()?);
+        if padding == 0 || padding > packet.len().saturating_sub(offset) {
+            return None;
+        }
+        return packet.get(offset..packet.len() - padding);
+    }
+    packet.get(offset..)
+}
+
+fn rtp_marker(packet: &[u8]) -> bool {
+    packet.get(1).is_some_and(|header| header & 0x80 != 0)
+}
+
+fn vp8_rtp_keyframe_start(packet: &[u8]) -> bool {
+    let Some(payload) = rtp_payload(packet) else {
+        return false;
+    };
+    let Some(&descriptor) = payload.first() else {
+        return false;
+    };
+    if descriptor & 0x10 == 0 || descriptor & 0x0f != 0 {
+        return false;
+    }
+    let mut offset = 1;
+    if descriptor & 0x80 != 0 {
+        let Some(&extension) = payload.get(offset) else {
+            return false;
+        };
+        offset += 1;
+        if extension & 0x80 != 0 {
+            let Some(&picture_id) = payload.get(offset) else {
+                return false;
+            };
+            offset += if picture_id & 0x80 != 0 { 2 } else { 1 };
+        }
+        offset += usize::from(extension & 0x40 != 0);
+        offset += usize::from(extension & 0x20 != 0);
+    }
+    payload.get(offset).is_some_and(|tag| tag & 1 == 0)
+}
+
+fn vp9_rtp_keyframe_start(packet: &[u8]) -> bool {
+    let Some(payload) = rtp_payload(packet) else {
+        return false;
+    };
+    let Some(&descriptor) = payload.first() else {
+        return false;
+    };
+    if descriptor & 0x08 == 0 || descriptor & 0x40 != 0 {
+        return false;
+    }
+    let mut offset = 1;
+    if descriptor & 0x80 != 0 {
+        let Some(&picture_id) = payload.get(offset) else {
+            return false;
+        };
+        offset += if picture_id & 0x80 != 0 { 2 } else { 1 };
+    }
+    if descriptor & 0x20 != 0 {
+        let Some(&_layer) = payload.get(offset) else {
+            return false;
+        };
+        offset += 1;
+        if descriptor & 0x10 == 0 {
+            offset += 1;
+        }
+    }
+    if descriptor & 0x02 != 0 {
+        let Some(&scaling) = payload.get(offset) else {
+            return false;
+        };
+        offset += 1;
+        if scaling & 0x80 != 0 {
+            let Some(&layers) = payload.get(offset) else {
+                return false;
+            };
+            offset += 1;
+            for _ in 0..=usize::from((layers >> 5) & 0x07) {
+                if layers & 0x10 != 0 {
+                    offset += 4;
+                }
+            }
+            if layers & 0x08 != 0 {
+                let Some(&frames) = payload.get(offset) else {
+                    return false;
+                };
+                offset += 1;
+                for _ in 0..frames {
+                    let Some(&frame) = payload.get(offset) else {
+                        return false;
+                    };
+                    offset += 1 + usize::from(frame & 0x03);
+                }
+            }
+        }
+    }
+    payload.get(offset..).is_some_and(vp9_frame_is_keyframe)
+}
+
+fn packet_starts_keyframe(codec: Codec, packet: &[u8]) -> bool {
+    match codec {
+        Codec::H264 => h264_rtp_idr_start(packet),
+        Codec::Vp8 => vp8_rtp_keyframe_start(packet),
+        Codec::Vp9 => vp9_rtp_keyframe_start(packet),
+        _ => false,
+    }
+}
+
+fn contains_video_keyframe(codec: Codec, access_unit: &[u8]) -> bool {
+    match codec {
+        Codec::H264 => contains_h264_idr(access_unit),
+        Codec::Vp8 => access_unit.first().is_some_and(|tag| tag & 1 == 0),
+        Codec::Vp9 => vp9_frame_is_keyframe(access_unit),
+        _ => false,
+    }
+}
+
+fn vp9_frame_is_keyframe(frame: &[u8]) -> bool {
+    let Some(&header) = frame.first() else {
+        return false;
+    };
+    if header & 0x03 != 0x02 {
+        return false;
+    }
+    let profile = (header >> 2) & 0x03;
+    let mut next_bit = 4;
+    if profile == 3 {
+        next_bit += 1;
+    }
+    let show_existing_frame = (header >> next_bit) & 1;
+    next_bit += 1;
+    show_existing_frame == 0 && (header >> next_bit) & 1 == 0
 }
 
 fn contains_h264_idr(access_unit: &[u8]) -> bool {
@@ -627,6 +866,9 @@ pub struct RemoteMedia {
 struct RemoteMediaInner {
     tracks: RwLock<HashMap<String, TrackHandle>>,
     frames: RwLock<HashMap<String, SharedFrame>>,
+    frame_requests: RwLock<HashMap<String, Arc<AtomicU64>>>,
+    keyframe_tracks: RwLock<HashMap<String, RemoteTrack>>,
+    video_slots: Arc<tokio::sync::Semaphore>,
     counter: std::sync::atomic::AtomicU64,
 }
 
@@ -635,6 +877,8 @@ type SharedFrame = Arc<Mutex<Option<Vec<u8>>>>;
 struct TrackHandle {
     peer_id: String,
     kind: RemoteTrackKind,
+    frame_key: String,
+    _video_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     decoder: Decoder,
 }
 
@@ -650,6 +894,9 @@ impl RemoteMedia {
             inner: Arc::new(RemoteMediaInner {
                 tracks: RwLock::new(HashMap::new()),
                 frames: RwLock::new(HashMap::new()),
+                frame_requests: RwLock::new(HashMap::new()),
+                keyframe_tracks: RwLock::new(HashMap::new()),
+                video_slots: Arc::new(tokio::sync::Semaphore::new(MAX_VIDEO_DECODERS)),
                 counter: std::sync::atomic::AtomicU64::new(0),
             }),
         }
@@ -657,30 +904,70 @@ impl RemoteMedia {
 
     /// Attach a remote track and start feeding it with the track's RTP packets.
     pub async fn attach(&self, peer_id: &str, track: RemoteTrack) -> Result<(), MediaError> {
+        self.attach_named(peer_id, peer_id, track).await
+    }
+
+    /// Attach a track while keeping its publication id as the frame key.
+    pub async fn attach_named(
+        &self,
+        peer_id: &str,
+        frame_key: &str,
+        track: RemoteTrack,
+    ) -> Result<(), MediaError> {
         let kind = track.kind().await;
         let codec = track.codec().await.unwrap_or(Codec::Opus);
         tracing::info!("remote track from {peer_id}: kind={kind:?} codec={codec:?}");
+        let video_permit = if kind == RemoteTrackKind::Video {
+            Some(
+                self.inner
+                    .video_slots
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| {
+                        MediaError::Pipeline(format!(
+                            "remote video decode budget exhausted ({MAX_VIDEO_DECODERS} tracks)"
+                        ))
+                    })?,
+            )
+        } else {
+            None
+        };
         let key = format!(
             "{peer_id}#{}",
             self.inner.counter.fetch_add(1, Ordering::Relaxed)
         );
 
         let decoder = Decoder::new(kind, codec)?;
+        let frame_request = decoder.video_demand.clone();
         if let Some(slot) = decoder.frames.clone() {
             self.inner
                 .frames
                 .write()
                 .unwrap()
-                .insert(peer_id.to_string(), slot);
+                .insert(frame_key.to_string(), slot);
+            self.inner
+                .frame_requests
+                .write()
+                .unwrap()
+                .insert(frame_key.to_string(), frame_request.clone());
+            self.inner
+                .keyframe_tracks
+                .write()
+                .unwrap()
+                .insert(frame_key.to_string(), track.clone());
         }
 
         let running = decoder.running.clone();
         let tx = decoder.tx.clone();
+        let keyframe_tx = decoder.keyframe_tx.clone();
         let recovery = decoder.video_recovery.clone();
+        let thread_frame_request = frame_request.clone();
         let mut stop = decoder.stop.subscribe();
         let inner = Arc::downgrade(&self.inner);
         let cleanup_key = key.clone();
         tokio::spawn(async move {
+            let mut keyframe_packets: Option<Vec<Vec<u8>>> = None;
+            let mut keyframe_bytes = 0usize;
             loop {
                 let packet = tokio::select! {
                     _ = stop.changed() => break,
@@ -690,16 +977,66 @@ impl RemoteMedia {
                 if !running.load(Ordering::SeqCst) {
                     break;
                 }
+                if kind == RemoteTrackKind::Video
+                    && !video_demand_recent(
+                        thread_frame_request.load(Ordering::Relaxed),
+                        monotonic_micros(),
+                    )
+                {
+                    keyframe_packets = None;
+                    keyframe_bytes = 0;
+                    recovery.store(true, Ordering::Release);
+                    continue;
+                }
                 let bytes = packet.to_bytes();
                 if kind == RemoteTrackKind::Video {
-                    if let Err(error) = tx.try_send(bytes) {
-                        if matches!(error, mpsc::error::TrySendError::Closed(_)) {
-                            break;
+                    if let Some(packets) = keyframe_packets.as_mut() {
+                        keyframe_bytes = keyframe_bytes.saturating_add(bytes.len());
+                        packets.push(bytes);
+                        if packets.len() > REMOTE_RTP_QUEUE
+                            || keyframe_bytes > MAX_KEYFRAME_PRIORITY_BYTES
+                        {
+                            VIDEO_RTP_QUEUE_DROPS
+                                .fetch_add(packets.len() as u64, Ordering::Relaxed);
+                            keyframe_packets = None;
+                            keyframe_bytes = 0;
+                        } else if packets.last().is_some_and(|packet| rtp_marker(packet)) {
+                            let complete = keyframe_packets.take().unwrap();
+                            keyframe_bytes = 0;
+                            if let Err(error) = keyframe_tx.try_send(complete) {
+                                tracing::debug!(
+                                    "dropping prioritized keyframe because its queue is full: {error}"
+                                );
+                            }
                         }
-                        let drops = VIDEO_RTP_QUEUE_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
-                        recovery.store(true, Ordering::Release);
-                        if drops == 1 || drops.is_multiple_of(100) {
-                            tracing::warn!(drops, "dropping video RTP packet: decoder queue full");
+                        continue;
+                    }
+                    if let Err(error) = tx.try_send(bytes) {
+                        match error {
+                            mpsc::error::TrySendError::Closed(_) => break,
+                            mpsc::error::TrySendError::Full(bytes) => {
+                                let drops =
+                                    VIDEO_RTP_QUEUE_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
+                                recovery.store(true, Ordering::Release);
+                                if packet_starts_keyframe(codec, &bytes) {
+                                    if rtp_marker(&bytes) {
+                                        if let Err(error) = keyframe_tx.try_send(vec![bytes]) {
+                                            tracing::debug!(
+                                                "dropping prioritized keyframe because its queue is full: {error}"
+                                            );
+                                        }
+                                    } else {
+                                        keyframe_bytes = bytes.len();
+                                        keyframe_packets = Some(vec![bytes]);
+                                    }
+                                }
+                                if drops == 1 || drops.is_multiple_of(100) {
+                                    tracing::warn!(
+                                        drops,
+                                        "dropping video RTP packet: decoder queue full"
+                                    );
+                                }
+                            }
                         }
                     }
                 } else if tx.send(bytes).await.is_err() {
@@ -716,6 +1053,8 @@ impl RemoteMedia {
             TrackHandle {
                 peer_id: peer_id.to_string(),
                 kind,
+                frame_key: frame_key.to_string(),
+                _video_permit: video_permit,
                 decoder,
             },
         );
@@ -739,10 +1078,49 @@ impl RemoteMedia {
         }
     }
 
-    /// The latest decoded video frame (JPEG) for a peer, if any.
-    pub fn latest_frame(&self, peer_id: &str) -> Option<Vec<u8>> {
+    /// Stop the decoder for one SFU publication and release its decode slot.
+    pub fn detach_frame_key(&self, frame_key: &str) {
+        let keys: Vec<String> = self
+            .inner
+            .tracks
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(_, track)| track.frame_key == frame_key)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in keys {
+            stop_track(&self.inner, &key);
+        }
+    }
+
+    /// The latest decoded video frame (JPEG) for a track key, if any.
+    pub fn latest_frame(&self, frame_key: &str) -> Option<Vec<u8>> {
         let frames = self.inner.frames.read().unwrap();
-        let slot = frames.get(peer_id)?;
+        let slot = frames.get(frame_key)?;
+        if let Some(request) = self.inner.frame_requests.read().unwrap().get(frame_key) {
+            let now = monotonic_micros();
+            let was_inactive = !video_demand_recent(request.load(Ordering::Relaxed), now);
+            request.store(now, Ordering::Relaxed);
+            if was_inactive {
+                let track = self
+                    .inner
+                    .keyframe_tracks
+                    .read()
+                    .unwrap()
+                    .get(frame_key)
+                    .cloned();
+                if let Some(track) = track {
+                    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                        runtime.spawn(async move {
+                            if let Err(error) = track.request_keyframe().await {
+                                tracing::debug!(%error, "could not request video keyframe after decode resumed");
+                            }
+                        });
+                    }
+                }
+            }
+        }
         let guard = slot.lock().unwrap();
         guard.clone()
     }
@@ -766,24 +1144,18 @@ impl RemoteMedia {
 fn stop_track(inner: &RemoteMediaInner, key: &str) {
     let handle = inner.tracks.write().unwrap().remove(key);
     let Some(handle) = handle else { return };
-    let peer_id = handle.peer_id.clone();
+    let frame_key = handle.frame_key.clone();
     let removed_frame = handle.decoder.frames.clone();
     handle.decoder.stop();
-    let has_video = inner
-        .tracks
-        .read()
-        .unwrap()
-        .values()
-        .any(|track| track.peer_id == peer_id && track.kind == RemoteTrackKind::Video);
-    if !has_video {
-        let mut frames = inner.frames.write().unwrap();
-        let is_removed_track_frame = frames
-            .get(&peer_id)
-            .zip(removed_frame.as_ref())
-            .is_some_and(|(current, removed)| Arc::ptr_eq(current, removed));
-        if is_removed_track_frame {
-            frames.remove(&peer_id);
-        }
+    let mut frames = inner.frames.write().unwrap();
+    let is_removed_track_frame = frames
+        .get(&frame_key)
+        .zip(removed_frame.as_ref())
+        .is_some_and(|(current, removed)| Arc::ptr_eq(current, removed));
+    if is_removed_track_frame {
+        frames.remove(&frame_key);
+        inner.frame_requests.write().unwrap().remove(&frame_key);
+        inner.keyframe_tracks.write().unwrap().remove(&frame_key);
     }
 }
 
@@ -805,6 +1177,51 @@ mod tests {
         assert!(contains_h264_idr(&[0, 0, 0, 1, 0x65, 0x88]));
         assert!(contains_h264_idr(&[0, 0, 1, 0x67, 0x42, 0, 0, 1, 0x65]));
         assert!(!contains_h264_idr(&[0, 0, 0, 1, 0x41, 0x88]));
+    }
+
+    #[test]
+    fn recognizes_keyframe_starts_for_all_negotiated_video_codecs() {
+        let packet = |payload: &[u8]| {
+            let mut rtp = vec![0x80, 96, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1];
+            rtp.extend_from_slice(payload);
+            rtp
+        };
+        assert!(packet_starts_keyframe(Codec::H264, &packet(&[0x65, 0x88])));
+        assert!(packet_starts_keyframe(
+            Codec::H264,
+            &packet(&[0x7c, 0x85, 0x88])
+        ));
+        assert!(!packet_starts_keyframe(
+            Codec::H264,
+            &packet(&[0x7c, 0x45, 0x88])
+        ));
+        assert!(!packet_starts_keyframe(Codec::H264, &packet(&[0x41, 0x88])));
+        assert!(packet_starts_keyframe(Codec::Vp8, &packet(&[0x10, 0x00])));
+        assert!(!packet_starts_keyframe(Codec::Vp8, &packet(&[0x10, 0x01])));
+        assert!(packet_starts_keyframe(Codec::Vp9, &packet(&[0x08, 0x02])));
+        assert!(!packet_starts_keyframe(Codec::Vp9, &packet(&[0x08, 0x22])));
+        assert!(!packet_starts_keyframe(Codec::Vp9, &packet(&[0x48, 0x02])));
+    }
+
+    #[test]
+    fn recovery_keyframe_detection_matches_h264_vp8_and_vp9_frames() {
+        assert!(contains_video_keyframe(Codec::H264, &[0, 0, 0, 1, 0x65]));
+        assert!(!contains_video_keyframe(Codec::H264, &[0, 0, 0, 1, 0x41]));
+        assert!(contains_video_keyframe(
+            Codec::Vp8,
+            &[0x00, 0x9d, 0x01, 0x2a]
+        ));
+        assert!(!contains_video_keyframe(Codec::Vp8, &[0x01, 0x00]));
+        assert!(contains_video_keyframe(Codec::Vp9, &[0x02, 0x00]));
+        assert!(!contains_video_keyframe(Codec::Vp9, &[0x22, 0x00]));
+        assert!(!contains_video_keyframe(Codec::Vp9, &[0x12, 0x00]));
+    }
+
+    #[test]
+    fn inactive_video_tracks_stop_decoding_after_demand_expires() {
+        assert!(video_demand_recent(1_000_000, 1_499_999));
+        assert!(!video_demand_recent(1_000_000, 1_500_001));
+        assert!(video_demand_recent(2_000_000, 1_000_000));
     }
 
     fn nals(sample: &[u8]) -> Vec<&[u8]> {
@@ -835,6 +1252,7 @@ mod tests {
     fn decodes_h264_sample_into_jpeg() {
         let sample = include_bytes!("../fixtures/sample.h264");
         let decoder = Decoder::new(RemoteTrackKind::Video, Codec::H264).unwrap();
+        decoder.latest_frame();
         for (sequence, nal) in nals(sample).into_iter().enumerate() {
             let mut rtp = vec![0u8; 12];
             rtp[0] = 0x80;

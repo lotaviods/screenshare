@@ -282,15 +282,29 @@ async fn handle_connection(mut socket: WebSocket, state: AppState, id: String, n
                                     }
                                 }
                             }
+                            SignalMessage::SfuRestart => {
+                                if let Some(rid) = &room_id {
+                                    close_sfu_peer(&state, rid, &id).await;
+                                }
+                            }
                             SignalMessage::SfuOffer { sdp, video_codec } => {
                                 let Some(rid) = &room_id else {
                                     let _ = tx.send(SignalMessage::Error { message: "not in a room".into() });
                                     continue;
                                 };
-                                if let Err(error) = handle_sfu_offer(
-                                    &state, rid, &id, &tx, &sdp, &video_codec,
-                                ).await {
-                                    let _ = tx.send(SignalMessage::Error { message: error });
+                                match handle_sfu_offer(&state, rid, &id, &tx, &sdp, &video_codec)
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        if let Some(sfu_room) =
+                                            state.sfu_rooms.lock().unwrap().get(rid)
+                                        {
+                                            notify_subscriptions(&state, rid, sfu_room);
+                                        }
+                                    }
+                                    Err(error) => {
+                                        let _ = tx.send(SignalMessage::Error { message: error });
+                                    }
                                 }
                             }
                             SignalMessage::SfuAnswer { sdp } => {
@@ -377,6 +391,27 @@ fn sfu_track_key(room_id: &str, track_id: &str) -> String {
 
 fn sfu_source_prefix(room_id: &str, publisher: &str) -> String {
     format!("{}:{room_id}{}:{publisher}", room_id.len(), publisher.len())
+}
+
+fn request_publisher_keyframe(state: &AppState, room_id: &str, publication: &sfu::PublishedTrack) {
+    if publication.kind != sfu::TrackKind::Screen
+        || publication.layer != Some(sfu::VideoLayer::Full)
+    {
+        return;
+    }
+    if !state.rooms.send_to(
+        room_id,
+        &publication.publisher,
+        SignalMessage::SfuKeyframeRequest {
+            track_id: publication.id.clone(),
+        },
+    ) {
+        tracing::warn!(
+            publisher = %publication.publisher,
+            track_id = %publication.id,
+            "could not deliver upstream keyframe request"
+        );
+    }
 }
 
 fn attach_relay_source(
@@ -483,7 +518,11 @@ async fn handle_sfu_offer(
             if wanted && already_wired {
                 // The egress track is already negotiated. Re-enable it instead
                 // of adding another m-line; focus swaps reuse the same slot.
+                let was_active = state.sfu_forwarder.is_active(&track_key, peer_id);
                 state.sfu_forwarder.set_active(&track_key, peer_id, true);
+                if !was_active {
+                    request_publisher_keyframe(state, room_id, &publication);
+                }
                 continue;
             }
             if !wanted {
@@ -512,6 +551,7 @@ async fn handle_sfu_offer(
                 Arc::new(writer),
                 64,
             );
+            request_publisher_keyframe(state, room_id, &publication);
         }
 
         let offer: SessionDescription = serde_json::from_str(sdp).map_err(|e| e.to_string())?;
@@ -604,6 +644,7 @@ async fn handle_sfu_offer(
             Arc::new(writer),
             64,
         );
+        request_publisher_keyframe(state, room_id, &publication);
     }
     let offer: SessionDescription = serde_json::from_str(sdp).map_err(|e| e.to_string())?;
     peer.set_remote_description(&offer)

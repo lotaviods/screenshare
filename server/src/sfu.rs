@@ -167,6 +167,7 @@ impl SfuRoom {
 /// other tracks; its overflow is counted and the stale packet is dropped.
 pub struct RtpForwarder<T> {
     tracks: RwLock<HashMap<String, FanoutTrack<T>>>,
+    keyframe_sources: RwLock<HashMap<String, RemoteTrack>>,
     epochs: RwLock<HashMap<String, u64>>,
     next_epoch: AtomicU64,
     audio_packets_queued: AtomicU64,
@@ -197,10 +198,22 @@ impl<T: Clone + Send + 'static> RtpForwarder<T> {
     pub fn new() -> Self {
         Self {
             tracks: RwLock::new(HashMap::new()),
+            keyframe_sources: RwLock::new(HashMap::new()),
             epochs: RwLock::new(HashMap::new()),
             next_epoch: AtomicU64::new(1),
             audio_packets_queued: AtomicU64::new(0),
             video_packets_dropped: AtomicU64::new(0),
+        }
+    }
+
+    fn request_source_keyframe(&self, track_id: &str) {
+        let source = self.keyframe_sources.read().unwrap().get(track_id).cloned();
+        if let Some(source) = source {
+            tokio::spawn(async move {
+                if let Err(error) = source.request_keyframe().await {
+                    tracing::warn!(%error, "SFU upstream keyframe request failed");
+                }
+            });
         }
     }
 
@@ -240,10 +253,19 @@ impl<T: Clone + Send + 'static> RtpForwarder<T> {
     /// Enable or disable forwarding to one viewer without tearing down its
     /// negotiated track. Used when a focus switch changes the subscription set.
     pub fn set_active(&self, track_id: &str, viewer: &str, active: bool) {
-        if let Some(track) = self.tracks.write().unwrap().get_mut(track_id) {
-            if let Some(subscriber) = track.subscribers.get_mut(viewer) {
+        let activated = self
+            .tracks
+            .write()
+            .unwrap()
+            .get_mut(track_id)
+            .and_then(|track| track.subscribers.get_mut(viewer))
+            .is_some_and(|subscriber| {
+                let activated = active && !subscriber.active;
                 subscriber.active = active;
-            }
+                activated
+            });
+        if activated {
+            self.request_source_keyframe(track_id);
         }
     }
 
@@ -290,6 +312,7 @@ impl<T: Clone + Send + 'static> RtpForwarder<T> {
     /// Remove a publication and invalidate packets from its previous source.
     pub fn remove_track(&self, track_id: &str) {
         self.tracks.write().unwrap().remove(track_id);
+        self.keyframe_sources.write().unwrap().remove(track_id);
         let next = self.next_epoch.fetch_add(1, Ordering::Relaxed);
         self.epochs
             .write()
@@ -377,8 +400,12 @@ impl RtpForwarder<RtpPacket> {
         writer: std::sync::Arc<TrackWriter>,
         queue_capacity: usize,
     ) {
+        let track_id = track_id.into();
         let (sender, mut receiver) = mpsc::channel(queue_capacity.max(1));
-        self.subscribe(track_id, kind, viewer, sender);
+        self.subscribe(track_id.clone(), kind, viewer, sender);
+        if kind == TrackKind::Screen {
+            self.request_source_keyframe(&track_id);
+        }
         tokio::spawn(async move {
             while let Some(packet) = receiver.recv().await {
                 if let Err(error) = writer.write_rtp(packet).await {
@@ -397,6 +424,24 @@ impl RtpForwarder<RtpPacket> {
     ) -> tokio::task::JoinHandle<()> {
         let track_id = track_id.into();
         let epoch = self.ensure_epoch(&track_id);
+        self.keyframe_sources
+            .write()
+            .unwrap()
+            .insert(track_id.clone(), track.clone());
+        let has_active_subscriber =
+            self.tracks
+                .read()
+                .unwrap()
+                .get(&track_id)
+                .is_some_and(|source| {
+                    source
+                        .subscribers
+                        .values()
+                        .any(|subscriber| subscriber.active)
+                });
+        if has_active_subscriber {
+            self.request_source_keyframe(&track_id);
+        }
         let forwarder = self.clone();
         tokio::spawn(async move {
             while let Some(packet) = track.next_packet().await {

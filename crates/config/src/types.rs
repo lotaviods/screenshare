@@ -42,7 +42,7 @@ impl Default for NetworkConfig {
                 url: "stun:stun.l.google.com:19302".to_string(),
             }],
             turn_servers: Vec::new(),
-            connection_mode: ConnectionMode::Mesh,
+            connection_mode: ConnectionMode::Sfu,
         }
     }
 }

@@ -96,6 +96,7 @@ impl RtpPacket {
 }
 
 /// A remote track delivering RTP packets.
+#[derive(Clone)]
 pub struct RemoteTrack {
     inner: Arc<dyn TrackRemote>,
 }
@@ -138,6 +139,26 @@ impl RemoteTrack {
             .await
             .first()
             .and_then(|c| codec_from_mime(&c.codec.mime_type))
+    }
+
+    /// Ask the remote encoder for an intra frame after a subscription starts.
+    pub async fn request_keyframe(&self) -> Result<()> {
+        let media_ssrc = self
+            .inner
+            .codings()
+            .await
+            .iter()
+            .find_map(|coding| coding.rtp_coding_parameters.ssrc)
+            .ok_or(WebRtcError::RemoteSsrcUnavailable)?;
+        self.inner
+            .write_rtcp(vec![Box::new(
+                rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication {
+                    sender_ssrc: 0,
+                    media_ssrc,
+                },
+            )])
+            .await?;
+        Ok(())
     }
 
     /// Wait for the next RTP packet. Returns `None` when the track ends.

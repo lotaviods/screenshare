@@ -24,6 +24,7 @@ use crate::hub::MediaHub;
 
 const SFU_MAX_REMOTE_PARTICIPANTS: usize = 7;
 const SFU_AUDIO_TRACKS_PER_PARTICIPANT: usize = 2;
+const MAX_MESH_PARTICIPANTS: usize = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CallError {
@@ -55,6 +56,7 @@ pub struct CallSession {
     mic_tx: mpsc::Sender<EncodedSample>,
     system_tx: mpsc::Sender<EncodedSample>,
     screen_tx: mpsc::Sender<EncodedSample>,
+    thumbnail_tx: mpsc::Sender<EncodedSample>,
 }
 
 #[derive(Clone)]
@@ -69,6 +71,9 @@ struct Shared {
     sfu_negotiated: Arc<AtomicBool>,
     sfu_negotiating: Arc<AtomicBool>,
     sfu_subscription_dirty: Arc<AtomicBool>,
+    sfu_published: Arc<AtomicBool>,
+    sfu_connection_epoch: Arc<std::sync::atomic::AtomicU64>,
+    sfu_reconnect: mpsc::UnboundedSender<u64>,
     /// Every remote participant in the room, with their last known media and
     /// connection state.
     roster: Arc<RwLock<HashMap<String, Participant>>>,
@@ -84,6 +89,7 @@ struct Shared {
     mic: Arc<MediaHub>,
     system: Arc<MediaHub>,
     screen: Arc<MediaHub>,
+    thumbnail: Arc<MediaHub>,
     events: mpsc::UnboundedSender<CallEvent>,
     room_id: Arc<RwLock<Option<String>>>,
     /// Decoder pipelines for the remote participants' tracks.
@@ -112,10 +118,13 @@ impl CallSession {
         let (mic_tx, mic_rx) = mpsc::channel(64);
         let (system_tx, system_rx) = mpsc::channel(64);
         let (screen_tx, screen_rx) = mpsc::channel(64);
+        let (thumbnail_tx, thumbnail_rx) = mpsc::channel(16);
+        let (sfu_reconnect_tx, sfu_reconnect_rx) = mpsc::unbounded_channel();
 
         let mic = Arc::new(MediaHub::new());
         let system = Arc::new(MediaHub::new());
         let screen = Arc::new(MediaHub::new());
+        let thumbnail = Arc::new(MediaHub::new());
         let local_preview = Arc::new(LocalPreview::new());
 
         let shared = Shared {
@@ -127,6 +136,9 @@ impl CallSession {
             sfu_negotiated: Arc::new(AtomicBool::new(false)),
             sfu_negotiating: Arc::new(AtomicBool::new(false)),
             sfu_subscription_dirty: Arc::new(AtomicBool::new(false)),
+            sfu_published: Arc::new(AtomicBool::new(false)),
+            sfu_connection_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            sfu_reconnect: sfu_reconnect_tx,
             roster: Arc::new(RwLock::new(HashMap::new())),
             remote_media: Arc::new(RwLock::new(HashMap::new())),
             pending_ice: Arc::new(RwLock::new(HashMap::new())),
@@ -134,6 +146,7 @@ impl CallSession {
             mic: mic.clone(),
             system: system.clone(),
             screen: screen.clone(),
+            thumbnail: thumbnail.clone(),
             events,
             room_id: Arc::new(RwLock::new(None)),
             remote: Arc::new(RemoteMedia::new()),
@@ -146,9 +159,10 @@ impl CallSession {
         tokio::spawn(hub_loop(mic, mic_rx, None));
         tokio::spawn(hub_loop(system, system_rx, None));
         tokio::spawn(hub_loop(screen, screen_rx, Some(local_preview)));
+        tokio::spawn(hub_loop(thumbnail, thumbnail_rx, None));
 
         // Signaling dispatch.
-        tokio::spawn(dispatch(shared.clone(), incoming));
+        tokio::spawn(dispatch(shared.clone(), incoming, sfu_reconnect_rx));
 
         // Ask the server for time-limited TURN credentials; they are folded
         // into the ICE configuration before any peer connection is made.
@@ -159,6 +173,7 @@ impl CallSession {
             mic_tx,
             system_tx,
             screen_tx,
+            thumbnail_tx,
         })
     }
 
@@ -251,6 +266,11 @@ impl CallSession {
         self.screen_tx.clone()
     }
 
+    /// Channel for the best-effort low-resolution screen-share layer.
+    pub fn thumbnail_sender(&self) -> mpsc::Sender<EncodedSample> {
+        self.thumbnail_tx.clone()
+    }
+
     pub fn room_id(&self) -> Option<String> {
         self.shared.room_id.read().unwrap().clone()
     }
@@ -292,7 +312,17 @@ impl CallSession {
 
     /// The latest decoded video frame (JPEG) from a peer, if any.
     pub fn remote_frame(&self, peer_id: &str) -> Option<Vec<u8>> {
-        self.shared.remote.latest_frame(peer_id)
+        self.shared
+            .remote
+            .latest_frame(&format!("{peer_id}-screen"))
+            .or_else(|| self.shared.remote.latest_frame(peer_id))
+    }
+
+    /// The latest low-resolution SFU thumbnail for a participant.
+    pub fn remote_thumbnail_frame(&self, peer_id: &str) -> Option<Vec<u8>> {
+        self.shared
+            .remote
+            .latest_frame(&format!("{peer_id}-screen-thumb"))
     }
 
     /// The latest frame of our own screen share as a peer decodes it, if any.
@@ -315,7 +345,10 @@ impl CallSession {
             .values()
             .find(|p| p.screen_on)
             .map(|p| p.id.clone())?;
-        self.shared.remote.latest_frame(&sharer)
+        self.shared
+            .remote
+            .latest_frame(&format!("{sharer}-screen"))
+            .or_else(|| self.shared.remote.latest_frame(&sharer))
     }
 
     /// Set the playback volume for a peer's audio.
@@ -349,18 +382,47 @@ async fn hub_loop(
     }
 }
 
-async fn dispatch(shared: Shared, mut incoming: mpsc::UnboundedReceiver<Incoming>) {
-    while let Some(item) = incoming.recv().await {
-        if shared.closing.load(Ordering::Acquire) {
-            break;
-        }
-        match item {
-            Incoming::Message(msg) => handle_message(&shared, msg).await,
-            Incoming::Disconnected => {
-                let _ = shared.events.send(CallEvent::Error {
-                    message: "signaling connection lost".into(),
-                });
-                break;
+async fn dispatch(
+    shared: Shared,
+    mut incoming: mpsc::UnboundedReceiver<Incoming>,
+    mut sfu_reconnects: mpsc::UnboundedReceiver<u64>,
+) {
+    loop {
+        tokio::select! {
+            item = incoming.recv() => {
+                let Some(item) = item else { break };
+                if shared.closing.load(Ordering::Acquire) {
+                    break;
+                }
+                match item {
+                    Incoming::Message(msg) => handle_message(&shared, msg).await,
+                    Incoming::Disconnected => {
+                        let _ = shared.events.send(CallEvent::Error {
+                            message: "signaling connection lost".into(),
+                        });
+                        break;
+                    }
+                }
+            }
+            Some(epoch) = sfu_reconnects.recv() => {
+                if shared.sfu_connection_epoch.load(Ordering::Acquire) != epoch
+                    || shared.closing.load(Ordering::Acquire)
+                    || !shared.sfu_published.load(Ordering::Acquire)
+                {
+                    continue;
+                }
+                if let Err(error) = shared.sender.send(SignalMessage::SfuRestart) {
+                    let _ = shared.events.send(CallEvent::Error {
+                        message: format!("Could not restart SFU signaling: {error}"),
+                    });
+                    continue;
+                }
+                close_sfu_transport(&shared).await;
+                if let Err(error) = offer_sfu(&shared).await {
+                    let _ = shared.events.send(CallEvent::Error {
+                        message: format!("Could not reconnect to SFU: {error}"),
+                    });
+                }
             }
         }
     }
@@ -395,6 +457,7 @@ async fn handle_message(shared: &Shared, msg: SignalMessage) {
                     .send(CallEvent::ParticipantJoined { participant });
                 send_local_state(shared, &p.id);
             }
+            promote_mesh_to_sfu(shared, peers.len() + 1).await;
             let _ = shared.events.send(CallEvent::RoomJoined { room_id });
         }
         SignalMessage::RoomDeleted { room_id } => {
@@ -411,6 +474,10 @@ async fn handle_message(shared: &Shared, msg: SignalMessage) {
                 .events
                 .send(CallEvent::ParticipantJoined { participant });
             send_local_state(shared, &peer.id);
+            let participant_count = shared.roster.read().unwrap().len() + 1;
+            if promote_mesh_to_sfu(shared, participant_count).await {
+                return;
+            }
             if shared.cfg.read().unwrap().connection_mode == ConnectionMode::Mesh {
                 if let Err(e) = offer_to(shared, &peer.id).await {
                     tracing::warn!("failed to offer to {}: {e}", peer.id);
@@ -525,16 +592,22 @@ async fn handle_message(shared: &Shared, msg: SignalMessage) {
         }
         SignalMessage::SfuSubscriptions { tracks, .. } => {
             let tracks: HashSet<String> = tracks.into_iter().collect();
-            let changed = {
+            let removed = {
                 let mut last = shared.sfu_subscriptions.write().unwrap();
                 if last.as_ref() == Some(&tracks) {
-                    false
+                    None
                 } else {
+                    let removed = last
+                        .as_ref()
+                        .map(|previous| previous.difference(&tracks).cloned().collect::<Vec<_>>());
                     *last = Some(tracks);
-                    true
+                    Some(removed.unwrap_or_default())
                 }
             };
-            if changed {
+            if let Some(removed) = removed {
+                for track_id in removed {
+                    shared.remote.detach_frame_key(&track_id);
+                }
                 shared.sfu_subscription_dirty.store(true, Ordering::Release);
                 if shared.sfu_negotiated.load(Ordering::Acquire) {
                     if let Err(error) = renegotiate_sfu(shared).await {
@@ -545,11 +618,49 @@ async fn handle_message(shared: &Shared, msg: SignalMessage) {
                 }
             }
         }
+        SignalMessage::SfuKeyframeRequest { track_id } => {
+            let _ = shared
+                .events
+                .send(CallEvent::KeyframeRequested { track_id });
+        }
         SignalMessage::Error { message } => {
             let _ = shared.events.send(CallEvent::Error { message });
         }
         _ => {}
     }
+}
+
+async fn promote_mesh_to_sfu(shared: &Shared, participant_count: usize) -> bool {
+    if !mesh_needs_sfu(participant_count) {
+        return false;
+    }
+    {
+        let mut cfg = shared.cfg.write().unwrap();
+        if cfg.connection_mode != ConnectionMode::Mesh {
+            return false;
+        }
+        cfg.connection_mode = ConnectionMode::Sfu;
+    }
+
+    let peers: Vec<String> = shared.peers.read().unwrap().keys().cloned().collect();
+    for peer_id in peers {
+        close_peer(shared, &peer_id).await;
+    }
+    let _ = shared.events.send(CallEvent::Error {
+        message: format!(
+            "This room has more than {MAX_MESH_PARTICIPANTS} participants; switching this call to the SFU."
+        ),
+    });
+    if let Err(error) = offer_sfu(shared).await {
+        let _ = shared.events.send(CallEvent::Error {
+            message: format!("Could not switch this call to the SFU: {error}"),
+        });
+    }
+    true
+}
+
+fn mesh_needs_sfu(participant_count: usize) -> bool {
+    participant_count > MAX_MESH_PARTICIPANTS
 }
 
 /// What a remote participant is publishing.
@@ -650,22 +761,66 @@ async fn offer_sfu(shared: &Shared) -> Result<(), CallError> {
         }
         PeerEvent::TrackReceived { track } => {
             let remote = shared_for_events.remote.clone();
+            let subscriptions = shared_for_events.sfu_subscriptions.clone();
+            let events = shared_for_events.events.clone();
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                 runtime.spawn(async move {
                     let publisher = track.stream_id().await;
-                    if let Err(error) = remote.attach(&publisher, track).await {
+                    let track_id = track.track_id().await;
+                    if subscriptions
+                        .read()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|subscriptions| !subscriptions.contains(&track_id))
+                    {
+                        return;
+                    }
+                    if let Err(error) = remote.attach_named(&publisher, &track_id, track).await {
                         tracing::warn!(%publisher, %error, "failed to attach SFU track");
+                        let _ = events.send(CallEvent::Error {
+                            message: format!("Could not decode remote track {track_id}: {error}"),
+                        });
                     }
                 });
             }
         }
-        PeerEvent::ConnectionState(state) => tracing::info!("SFU peer state: {state:?}"),
+        PeerEvent::ConnectionState(state) => {
+            tracing::info!("SFU peer state: {state:?}");
+            let epoch = shared_for_events
+                .sfu_connection_epoch
+                .fetch_add(1, Ordering::AcqRel)
+                + 1;
+            if matches!(
+                state,
+                ConnectionState::Disconnected | ConnectionState::Failed
+            ) {
+                let reconnect = shared_for_events.clone();
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        if reconnect.sfu_connection_epoch.load(Ordering::Acquire) != epoch
+                            || reconnect.closing.load(Ordering::Acquire)
+                            || !reconnect.sfu_published.load(Ordering::Acquire)
+                        {
+                            return;
+                        }
+                        if let Err(error) = reconnect.sfu_reconnect.send(epoch) {
+                            let _ = reconnect.events.send(CallEvent::Error {
+                                message: format!("Could not queue SFU reconnect: {error}"),
+                            });
+                        }
+                    });
+                }
+            }
+        }
         _ => {}
     });
     let peer = Arc::new(WebRtcPeer::new(cfg.peer_config.clone(), cfg.video_codec, events).await?);
     let mic_id = format!("{}-mic", cfg.self_id);
     let system_id = format!("{}-system", cfg.self_id);
     let screen_id = format!("{}-screen", cfg.self_id);
+    #[cfg(target_os = "linux")]
+    let thumbnail_id = format!("{}-screen-thumb", cfg.self_id);
     let mic = peer
         .add_relay_track(&cfg.self_id, &mic_id, Codec::Opus)
         .await?;
@@ -675,32 +830,49 @@ async fn offer_sfu(shared: &Shared) -> Result<(), CallError> {
     let screen = peer
         .add_relay_track(&cfg.self_id, &screen_id, cfg.video_codec)
         .await?;
+    #[cfg(target_os = "linux")]
+    let thumbnail = peer
+        .add_relay_track(&cfg.self_id, &thumbnail_id, cfg.video_codec)
+        .await?;
     shared.mic.register("__sfu__", Arc::new(mic));
     shared.system.register("__sfu__", Arc::new(system));
     shared.screen.register("__sfu__", Arc::new(screen));
+    #[cfg(target_os = "linux")]
+    shared.thumbnail.register("__sfu__", Arc::new(thumbnail));
     for _ in 0..(SFU_MAX_REMOTE_PARTICIPANTS * SFU_AUDIO_TRACKS_PER_PARTICIPANT) {
         peer.add_recvonly_transceiver(sharescreen_webrtc::RemoteTrackKind::Audio)
             .await?;
     }
-    for _ in 0..SFU_MAX_REMOTE_PARTICIPANTS {
+    let video_slots = SFU_MAX_REMOTE_PARTICIPANTS * if cfg!(target_os = "linux") { 2 } else { 1 };
+    for _ in 0..video_slots {
         peer.add_recvonly_transceiver(sharescreen_webrtc::RemoteTrackKind::Video)
             .await?;
     }
 
-    for (track_id, kind, layer) in [
-        (mic_id, PublishedTrackKind::Audio, None),
-        (system_id, PublishedTrackKind::Audio, None),
-        (
-            screen_id,
+    if !shared.sfu_published.load(Ordering::Acquire) {
+        let mut publications = vec![
+            (mic_id, PublishedTrackKind::Audio, None),
+            (system_id, PublishedTrackKind::Audio, None),
+            (
+                screen_id,
+                PublishedTrackKind::Screen,
+                Some(sharescreen_core::PublishedVideoLayer::Full),
+            ),
+        ];
+        #[cfg(target_os = "linux")]
+        publications.push((
+            thumbnail_id,
             PublishedTrackKind::Screen,
-            Some(sharescreen_core::PublishedVideoLayer::Full),
-        ),
-    ] {
-        shared.sender.send(SignalMessage::PublishTrack {
-            track_id,
-            kind,
-            layer,
-        })?;
+            Some(sharescreen_core::PublishedVideoLayer::Thumbnail),
+        ));
+        for (track_id, kind, layer) in publications {
+            shared.sender.send(SignalMessage::PublishTrack {
+                track_id,
+                kind,
+                layer,
+            })?;
+        }
+        shared.sfu_published.store(true, Ordering::Release);
     }
     let offer = peer.create_offer().await?;
     peer.set_local_description(&offer).await?;
@@ -749,15 +921,26 @@ async fn renegotiate_sfu(shared: &Shared) -> Result<(), CallError> {
 }
 
 async fn close_sfu_peer(shared: &Shared) {
+    close_sfu_transport(shared).await;
+    shared.sfu_published.store(false, Ordering::Release);
+}
+
+async fn close_sfu_transport(shared: &Shared) {
     shared.sfu_negotiated.store(false, Ordering::Release);
     shared.sfu_negotiating.store(false, Ordering::Release);
     shared
         .sfu_subscription_dirty
         .store(false, Ordering::Release);
-    *shared.sfu_subscriptions.write().unwrap() = None;
+    let subscriptions = shared.sfu_subscriptions.write().unwrap().take();
+    if let Some(subscriptions) = subscriptions {
+        for track_id in subscriptions {
+            shared.remote.detach_frame_key(&track_id);
+        }
+    }
     shared.mic.unregister("__sfu__");
     shared.system.unregister("__sfu__");
     shared.screen.unregister("__sfu__");
+    shared.thumbnail.unregister("__sfu__");
     shared.pending_ice.write().unwrap().remove("__sfu__");
     let peer = shared.sfu_peer.write().unwrap().take();
     if let Some(peer) = peer {
@@ -940,15 +1123,30 @@ fn peer_event_handler(shared: Shared, peer_id: String) -> Arc<dyn Fn(PeerEvent) 
             // The handler runs on the WebRTC runtime; hop to a task so the
             // decoder pipeline can be attached.
             let media = shared.remote.clone();
+            let events = shared.events.clone();
             let peer = peer_id.clone();
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
                     if let Err(e) = media.attach(&peer, track).await {
                         tracing::warn!("failed to attach remote track from {peer}: {e}");
+                        let _ = events.send(CallEvent::Error {
+                            message: format!("Could not decode remote track from {peer}: {e}"),
+                        });
                     }
                 });
             }
         }
         PeerEvent::GatheringComplete | PeerEvent::NegotiationNeeded => {}
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mesh_limit_counts_the_local_participant() {
+        assert!(!mesh_needs_sfu(3));
+        assert!(mesh_needs_sfu(4));
+    }
 }

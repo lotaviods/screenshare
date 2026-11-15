@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 
 /// Sends messages to a connected peer.
 pub type PeerSender = mpsc::UnboundedSender<SignalMessage>;
+pub const MAX_ROOM_PARTICIPANTS: usize = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RoomError {
@@ -20,6 +21,8 @@ pub enum RoomError {
     NotFound,
     #[error("peer not in room")]
     PeerNotFound,
+    #[error("room is full (maximum 8 participants)")]
+    Full,
 }
 
 #[derive(Default)]
@@ -72,6 +75,9 @@ impl RoomManager {
     ) -> Result<Vec<PeerInfo>, RoomError> {
         let mut rooms = self.rooms.lock().unwrap();
         let room = rooms.get_mut(room_id).ok_or(RoomError::NotFound)?;
+        if room.peers.len() >= MAX_ROOM_PARTICIPANTS && !room.peers.contains_key(&info.id) {
+            return Err(RoomError::Full);
+        }
         let existing = room.peers.values().map(|p| p.info.clone()).collect();
         room.peers.insert(info.id.clone(), Peer { info, tx });
         Ok(existing)
@@ -235,6 +241,28 @@ mod tests {
         assert!(rm.join(&rid, peer("a"), tx1).unwrap().is_empty());
         let existing = rm.join(&rid, peer("b"), tx2).unwrap();
         assert_eq!(existing, vec![peer("a")]);
+    }
+
+    #[test]
+    fn room_capacity_includes_the_creator_and_caps_at_eight_participants() {
+        let rm = RoomManager::new();
+        let rid = rm.create_room();
+        let (creator_tx, _creator_rx) = mpsc::unbounded_channel();
+        rm.join(&rid, peer("creator"), creator_tx)
+            .expect("creator occupies a room slot");
+        for index in 1..MAX_ROOM_PARTICIPANTS {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            rm.join(&rid, peer(&format!("peer-{index}")), tx)
+                .expect("all supported participants should join");
+        }
+        let (repeat_tx, _repeat_rx) = mpsc::unbounded_channel();
+        rm.join(&rid, peer("peer-7"), repeat_tx)
+            .expect("an existing participant does not consume another slot");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        assert!(matches!(
+            rm.join(&rid, peer("ninth"), tx),
+            Err(RoomError::Full)
+        ));
     }
 
     #[test]

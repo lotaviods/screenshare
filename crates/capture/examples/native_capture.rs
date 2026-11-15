@@ -35,6 +35,7 @@ async fn main() {
         bitrate_kbps: 6000,
         hardware_encoding: true,
         thumbnail_sender: None,
+        keyframe_request: None,
     };
     let source = capture
         .list_sources()

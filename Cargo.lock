@@ -5972,6 +5972,7 @@ dependencies = [
  "sharescreen-capture",
  "sharescreen-config",
  "sharescreen-core",
+ "sharescreen-media",
  "sharescreen-network",
  "tokio",
  "tracing",

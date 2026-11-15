@@ -395,12 +395,18 @@ async fn sfu_renegotiation_reuses_peer_connection_on_new_tracks() {
     })
     .unwrap();
 
-    // A receives SfuSubscriptions with b-audio
-    match recv_signaling(&mut a.incoming, false).await {
-        SignalMessage::SfuSubscriptions { tracks, .. } => {
-            assert!(tracks.contains(&"b-audio".to_string()));
+    // Ignore any queued snapshot from the initial offer and wait for B's
+    // publication update.
+    loop {
+        match recv_signaling(&mut a.incoming, false).await {
+            SignalMessage::SfuSubscriptions { tracks, .. }
+                if tracks.contains(&"b-audio".to_string()) =>
+            {
+                break;
+            }
+            SignalMessage::SfuSubscriptions { .. } => continue,
+            other => panic!("expected SfuSubscriptions, got {other:?}"),
         }
-        other => panic!("expected SfuSubscriptions, got {other:?}"),
     }
 
     // Now A renegotiates: sends a second SfuOffer on the existing peer connection!

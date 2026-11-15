@@ -82,6 +82,8 @@ unsafe extern "C" fn free_drm_desc(_opaque: *mut libc::c_void, data: *mut u8) {
 /// RGB -> NV12 conversion done by VAAPI VPP.
 struct Converter {
     sw_format: i32,
+    input_width: u32,
+    input_height: u32,
     input_frames: *mut ffi::AVBufferRef,
     graph: *mut ffi::AVFilterGraph,
     src: *mut ffi::AVFilterContext,
@@ -95,6 +97,8 @@ impl Converter {
         device: *mut ffi::AVBufferRef,
         config: &EncoderConfig,
         sw_format: ffi::AVPixelFormat,
+        input_width: u32,
+        input_height: u32,
     ) -> Result<Self, EncodeError> {
         let input_frames = ffi::av_hwframe_ctx_alloc(device);
         if input_frames.is_null() {
@@ -106,8 +110,8 @@ impl Converter {
             let hw = (*input_frames).data as *mut ffi::AVHWFramesContext;
             (*hw).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
             (*hw).sw_format = sw_format;
-            (*hw).width = config.width as i32;
-            (*hw).height = config.height as i32;
+            (*hw).width = input_width as i32;
+            (*hw).height = input_height as i32;
             (*hw).initial_pool_size = 0;
         }
         let ret = ffi::av_hwframe_ctx_init(input_frames);
@@ -142,8 +146,8 @@ impl Converter {
         let ret = (|| {
             let mut params: ffi::AVBufferSrcParameters = std::mem::zeroed();
             params.format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32;
-            params.width = config.width as i32;
-            params.height = config.height as i32;
+            params.width = input_width as i32;
+            params.height = input_height as i32;
             params.time_base = ffi::AVRational {
                 num: 1,
                 den: config.fps.max(1) as i32,
@@ -170,11 +174,16 @@ impl Converter {
 
             let mut scale: *mut ffi::AVFilterContext = ptr::null_mut();
             let mut sink: *mut ffi::AVFilterContext = ptr::null_mut();
+            let scale_args = CString::new(format!(
+                "w={}:h={}:format=nv12",
+                config.width, config.height
+            ))
+            .map_err(|_| ffi::AVERROR(libc::EINVAL))?;
             Self::create_filter(
                 &mut scale,
                 "scale_vaapi",
                 "convert",
-                c"w=iw:h=ih:format=nv12".as_ptr(),
+                scale_args.as_ptr(),
                 graph,
             )?;
             Self::create_filter(&mut sink, "buffersink", "out", ptr::null(), graph)?;
@@ -215,6 +224,8 @@ impl Converter {
 
         Ok(Self {
             sw_format: sw_format as i32,
+            input_width,
+            input_height,
             input_frames,
             graph,
             src,
@@ -385,11 +396,8 @@ impl FfmpegEncoder {
         frames: *mut ffi::AVBufferRef,
         frame: &Frame,
     ) -> Result<*mut ffi::AVFrame, EncodeError> {
-        if frame.width != self.config.width || frame.height != self.config.height {
-            return Err(EncodeError::Ffmpeg(format!(
-                "frame size {}x{} does not match encoder {}x{}",
-                frame.width, frame.height, self.config.width, self.config.height
-            )));
+        if frame.width == 0 || frame.height == 0 {
+            return Err(EncodeError::Ffmpeg("empty input frame".into()));
         }
         if frame.objects.is_empty() || frame.layers.is_empty() {
             return Err(EncodeError::Ffmpeg("empty dmabuf frame".into()));
@@ -499,13 +507,52 @@ impl FfmpegEncoder {
         let Some(sw_format) = vaapi_sw_format(format) else {
             return Err(EncodeError::UnsupportedFormat(Some(format)));
         };
+        self.encode_converted(frame, sw_format, force_keyframe)
+    }
 
-        if self.converter.as_ref().map(|c| c.sw_format) != Some(sw_format as i32) {
-            self.converter = Some(unsafe { Converter::new(self.device, &self.config, sw_format)? });
+    fn encode_nv12(
+        &mut self,
+        frame: &Frame,
+        force_keyframe: bool,
+    ) -> Result<Vec<EncodedFrame>, EncodeError> {
+        if !frame.is_nv12() {
+            return Err(EncodeError::UnsupportedFormat(frame.format()));
+        }
+        if frame.width != self.config.width || frame.height != self.config.height {
+            return self.encode_converted(
+                frame,
+                ffi::AVPixelFormat::AV_PIX_FMT_NV12,
+                force_keyframe,
+            );
+        }
+        let hw = unsafe { self.import_drm(self.frames, frame)? };
+        unsafe { self.receive_with_keyframe(hw, force_keyframe) }
+    }
+
+    fn encode_converted(
+        &mut self,
+        frame: &Frame,
+        sw_format: ffi::AVPixelFormat,
+        force_keyframe: bool,
+    ) -> Result<Vec<EncodedFrame>, EncodeError> {
+        let converter_mismatch = self.converter.as_ref().is_none_or(|converter| {
+            converter.sw_format != sw_format as i32
+                || converter.input_width != frame.width
+                || converter.input_height != frame.height
+        });
+        if converter_mismatch {
+            self.converter = Some(unsafe {
+                Converter::new(
+                    self.device,
+                    &self.config,
+                    sw_format,
+                    frame.width,
+                    frame.height,
+                )?
+            });
         }
         let converter = self.converter.as_ref().expect("converter created above");
         let (src, sink, input_frames) = (converter.src, converter.sink, converter.input_frames);
-
         unsafe {
             let hw = self.import_drm(input_frames, frame)?;
             let ret = ffi::av_buffersrc_add_frame_flags(src, hw, 0);
@@ -515,7 +562,6 @@ impl FfmpegEncoder {
                     "av_buffersrc_add_frame failed: {ret}"
                 )));
             }
-
             let mut converted = ffi::av_frame_alloc();
             if converted.is_null() {
                 return Err(EncodeError::Ffmpeg("av_frame_alloc failed".into()));
@@ -529,18 +575,6 @@ impl FfmpegEncoder {
             }
             self.receive_with_keyframe(converted, force_keyframe)
         }
-    }
-
-    fn encode_nv12(
-        &mut self,
-        frame: &Frame,
-        force_keyframe: bool,
-    ) -> Result<Vec<EncodedFrame>, EncodeError> {
-        if !frame.is_nv12() {
-            return Err(EncodeError::UnsupportedFormat(frame.format()));
-        }
-        let hw = unsafe { self.import_drm(self.frames, frame)? };
-        unsafe { self.receive_with_keyframe(hw, force_keyframe) }
     }
 
     /// Encode one frame as a JPEG preview for the local self-view.
@@ -564,8 +598,15 @@ impl FfmpegEncoder {
             (ffi::AVPixelFormat::AV_PIX_FMT_NV12, self.frames)
         } else {
             let sw = vaapi_sw_format(format).ok_or(EncodeError::UnsupportedFormat(Some(format)))?;
-            if self.converter.as_ref().map(|c| c.sw_format) != Some(sw as i32) {
-                self.converter = Some(unsafe { Converter::new(self.device, &self.config, sw)? });
+            let converter_mismatch = self.converter.as_ref().is_none_or(|converter| {
+                converter.sw_format != sw as i32
+                    || converter.input_width != frame.width
+                    || converter.input_height != frame.height
+            });
+            if converter_mismatch {
+                self.converter = Some(unsafe {
+                    Converter::new(self.device, &self.config, sw, frame.width, frame.height)?
+                });
             }
             (
                 sw,

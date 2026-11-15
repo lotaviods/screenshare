@@ -507,6 +507,7 @@ async fn focus_switch_subscribes_to_the_second_publisher() {
     // Bob's focus request.
     publisher_c.wait_answers(1).await;
 
+    let focus_requested_at = std::time::Instant::now();
     viewer.send(SignalMessage::SetFocus {
         publisher: Some("c".into()),
     });
@@ -534,6 +535,10 @@ async fn focus_switch_subscribes_to_the_second_publisher() {
         .await
         .expect("focused publisher packet should arrive")
         .expect("focused track should stay open");
+    assert!(
+        focus_requested_at.elapsed() < Duration::from_millis(500),
+        "focused video should arrive within 500 ms"
+    );
     assert_eq!(packet.payload, vec![0xC3; 32]);
 
     // The previous focus must stop forwarding. Its writer stays negotiated, so

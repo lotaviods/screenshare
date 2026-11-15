@@ -15,6 +15,8 @@ use sharescreen_native_media::encode::{EncoderConfig, FfmpegEncoder, VideoEncode
 use sharescreen_native_media::linux_preview::LinuxPreviewer;
 use sharescreen_native_media::preview::Demand;
 
+use crate::thumbnail::ThumbnailEncoder;
+
 /// Whether the native path can encode this request.
 pub fn available(codec: Codec) -> bool {
     matches!(codec, Codec::H264 | Codec::Vp8 | Codec::Vp9)
@@ -25,6 +27,7 @@ pub fn available(codec: Codec) -> bool {
 pub struct Stream {
     running: Arc<AtomicUsize>,
     thread: JoinHandle<()>,
+    thumbnail_worker: Option<JoinHandle<()>>,
     #[allow(dead_code)] // wired into the capture worker next
     demand: Arc<Demand>,
     #[allow(dead_code)] // wired into the capture worker next
@@ -41,7 +44,15 @@ impl Stream {
     }
     pub fn stop(self) {
         self.running.store(0, Ordering::SeqCst);
-        let _ = self.thread.join();
+        let Self {
+            thread,
+            thumbnail_worker,
+            ..
+        } = self;
+        let _ = thread.join();
+        if let Some(worker) = thumbnail_worker {
+            let _ = worker.join();
+        }
     }
 
     /// Latest JPEG self-view frame of the running capture.
@@ -63,6 +74,27 @@ pub fn spawn(
     let requested_height = options.height.max(1);
     let bitrate_kbps = options.bitrate_kbps.max(1000);
     let codec = options.codec;
+    let thumbnail_sender = options.thumbnail_sender.clone();
+    let keyframe_request = options.keyframe_request.clone();
+    let (thumbnail_tx, thumbnail_worker) = if let Some(sender) = thumbnail_sender {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        match std::thread::Builder::new()
+            .name("sharescreen-thumbnail".into())
+            .spawn(move || {
+                let mut encoder = ThumbnailEncoder::new(codec, fps, sender);
+                while let Ok(frame) = rx.recv() {
+                    encoder.try_encode(&frame);
+                }
+            }) {
+            Ok(worker) => (Some(tx), Some(worker)),
+            Err(error) => {
+                tracing::warn!(%error, "thumbnail worker unavailable; continuing primary capture");
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
     let running = Arc::new(AtomicUsize::new(1));
     let flag = running.clone();
     let linux_preview = match LinuxPreviewer::spawn() {
@@ -85,6 +117,7 @@ pub fn spawn(
             let raw = fd.as_raw_fd();
             let _keep_alive = fd;
             let mut encoder: Option<FfmpegEncoder> = None;
+            let mut thumbnail_tx = thumbnail_tx;
             let mut failed = false;
             let mut frame_count = 0u64;
             let mut last_encoded: Option<std::time::Instant> = None;
@@ -134,7 +167,8 @@ pub fn spawn(
                         match FfmpegEncoder::new(config) {
                             Ok(created) => encoder = Some(created),
                             Err(err) => {
-                                let message = format!("native encoder unavailable: {err}");
+                                let message =
+                                    format!("native {codec:?} encoder unavailable: {err}");
                                 tracing::error!(error = %message);
                                 if let Ok(mut failure) = callback_failure.lock() {
                                     *failure = Some(message);
@@ -148,6 +182,12 @@ pub fn spawn(
                     let Some(encoder) = encoder.as_mut() else {
                         return;
                     };
+                    if keyframe_request
+                        .as_ref()
+                        .is_some_and(|request| request.swap(false, std::sync::atomic::Ordering::AcqRel))
+                    {
+                        encoder.request_keyframe();
+                    }
                     match encoder.encode(&frame, false) {
                         Ok(frames) => {
                             for frame in frames {
@@ -178,6 +218,20 @@ pub fn spawn(
                                     }
                                 }
                             }
+                            if let Some(sender) = thumbnail_tx.as_ref() {
+                                match sender.try_send(frame) {
+                                    Ok(()) => {}
+                                    Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                                        tracing::debug!("thumbnail worker busy; dropping frame");
+                                    }
+                                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                        tracing::warn!(
+                                            "thumbnail worker stopped; disabling thumbnail output"
+                                        );
+                                        thumbnail_tx = None;
+                                    }
+                                }
+                            }
                             // Only pay for the self-view while the UI reads it. The
                             // preview shares this thread with the encoder, so an
                             // unused preview would otherwise stall the peer stream.
@@ -190,7 +244,7 @@ pub fn spawn(
                             frame_count = frame_count.wrapping_add(1);
                         }
                         Err(err) => {
-                            let message = format!("native encode failed: {err}");
+                            let message = format!("native {codec:?} encode failed: {err}");
                             tracing::error!(error = %message);
                             if let Ok(mut failure) = callback_failure.lock() {
                                 *failure = Some(message);
@@ -217,6 +271,7 @@ pub fn spawn(
     Ok(Stream {
         running,
         thread,
+        thumbnail_worker,
         demand,
         linux_preview,
         failure,

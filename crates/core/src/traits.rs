@@ -40,6 +40,9 @@ pub struct CaptureOptions {
     /// via `try_send`; failures are silently dropped.
     #[serde(skip)]
     pub thumbnail_sender: Option<tokio::sync::mpsc::Sender<EncodedSample>>,
+    /// Optional cross-thread request to force the next video keyframe.
+    #[serde(skip)]
+    pub keyframe_request: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Platform screen-capture backend. Implementations live in

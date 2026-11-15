@@ -32,6 +32,8 @@ pub enum WebRtcError {
     NoMatchingCodec(sharescreen_core::Codec),
     #[error("video codec {0:?} is not registered by the WebRTC transport")]
     UnsupportedCodec(sharescreen_core::Codec),
+    #[error("remote video track has no negotiated SSRC for a keyframe request")]
+    RemoteSsrcUnavailable,
 }
 
 pub type Result<T> = std::result::Result<T, WebRtcError>;

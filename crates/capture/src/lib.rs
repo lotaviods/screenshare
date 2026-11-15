@@ -8,6 +8,8 @@
 
 #[cfg(target_os = "linux")]
 mod native;
+#[cfg(target_os = "linux")]
+mod thumbnail;
 
 #[cfg(windows)]
 mod native_windows;
