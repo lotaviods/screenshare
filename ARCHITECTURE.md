@@ -97,7 +97,11 @@ boundary.
 
 `CaptureEngine::Auto` prefers the GStreamer backend on Linux when the runtime
 and `pipewiresrc` are installed; the explicit `Portal`/`X11` backend keeps the
-native portal + FFmpeg VAAPI path as a fallback. Microphone capture prefers
+native portal + FFmpeg VAAPI path as a fallback. When a share asks for hardware
+encoding and this GStreamer install has no hardware encoder for the codec,
+`Auto` starts the native VAAPI path instead: software `x264enc` at 2560x1440@60
+measured 169% CPU here, which lags the whole desktop. If the native start fails
+the share stays on the GStreamer software encoder. Microphone capture prefers
 GStreamer `pulsesrc` and falls back to `libpulse`. System audio deliberately
 stays on the native mixer: it records each application playback stream and
 excludes the call's own output, which a plain monitor source would echo back to
@@ -118,7 +122,8 @@ Known limits of this cut, stated rather than hidden:
 - GStreamer encoders expose no portable force-keyframe call, so a keyframe
   request is logged and served by the next periodic GOP keyframe.
 - Hardware encode (`vah264enc`/`vaapih264enc`, `vavp8enc`, `vavp9enc`) is used
-  only when the element exists; otherwise the software encoder runs. The
-  hardware branch is untested on this workstation because no VAAPI plugin is
-  installed.
+  only when the element exists; otherwise the software encoder runs, unless
+  hardware encoding was requested and FFmpeg has a VAAPI encoder, in which case
+  `Auto` falls back to the native path. The GStreamer hardware branch is
+  untested on this workstation because no VAAPI plugin is installed.
 

@@ -160,6 +160,34 @@ impl ScreenCapture for CaptureEngine {
         options: CaptureOptions,
         sink: mpsc::Sender<EncodedSample>,
     ) -> Result<(), CaptureError> {
+        #[cfg(target_os = "linux")]
+        if matches!(self, Self::Gst(_))
+            && options.hardware_encoding
+            && !gst::hardware_encoder(options.codec)
+            && native::available(options.codec)
+        {
+            // Hardware encoding was requested but this GStreamer install has no
+            // hardware encoder for the codec. The native path encodes on the
+            // GPU, so a 1440p60 share does not pin several CPU cores on x264.
+            // A native start failure keeps the GStreamer software encoder.
+            let mut native = WaylandCapture::default();
+            match native
+                .start(source.clone(), options.clone(), sink.clone())
+                .await
+            {
+                Ok(()) => {
+                    tracing::warn!(
+                        codec = ?options.codec,
+                        "no GStreamer hardware encoder installed; encoding with native VAAPI"
+                    );
+                    *self = Self::Wayland(native);
+                    return Ok(());
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "native capture failed; using the GStreamer software encoder");
+                }
+            }
+        }
         match self {
             #[cfg(target_os = "linux")]
             Self::Gst(w) => w.start(source, options, sink).await,

@@ -161,13 +161,17 @@ struct EncoderPlan {
     output_caps: &'static str,
 }
 
-fn encoder_plans(options: &CaptureOptions) -> Option<Vec<EncoderPlan>> {
-    let gop = options.fps.max(1) * 2;
-    let kbps = options.bitrate_kbps;
-    let bps = kbps.saturating_mul(1000);
-    let mut plans = Vec::new();
+/// Whether a hardware encoder element is installed for this codec.
+///
+/// Without one a 1440p60 share is encoded by `x264enc` on the CPU, which
+/// saturates several cores and makes the whole desktop lag.
+pub fn hardware_encoder(codec: Codec) -> bool {
+    !hardware_plans(codec, 60, 0).is_empty()
+}
 
-    let hardware = match options.codec {
+/// Hardware encoder plans for one codec, most preferred first.
+fn hardware_plans(codec: Codec, gop: u32, kbps: u32) -> Vec<EncoderPlan> {
+    match codec {
         Codec::H264 => [("vah264enc", "NV12"), ("vaapih264enc", "NV12")]
             .into_iter()
             .filter(|(element, _)| gst::has_element(element))
@@ -177,7 +181,7 @@ fn encoder_plans(options: &CaptureOptions) -> Option<Vec<EncoderPlan>> {
                 input_format: format,
                 output_caps: "video/x-h264,stream-format=byte-stream,alignment=au",
             })
-            .collect::<Vec<_>>(),
+            .collect(),
         Codec::Vp8 => ["vavp8enc", "vaapivp8enc"]
             .into_iter()
             .filter(|element| gst::has_element(element))
@@ -199,9 +203,17 @@ fn encoder_plans(options: &CaptureOptions) -> Option<Vec<EncoderPlan>> {
             })
             .collect(),
         _ => Vec::new(),
-    };
+    }
+}
+
+fn encoder_plans(options: &CaptureOptions) -> Option<Vec<EncoderPlan>> {
+    let gop = options.fps.max(1) * 2;
+    let kbps = options.bitrate_kbps;
+    let bps = kbps.saturating_mul(1000);
+    let mut plans = Vec::new();
+
     if options.hardware_encoding {
-        plans.extend(hardware);
+        plans.extend(hardware_plans(options.codec, gop, kbps));
     }
 
     let software = match options.codec {
@@ -312,6 +324,18 @@ mod tests {
         let plans = encoder_plans(&options(Codec::H264, false)).expect("software H.264");
         assert!(plans.iter().any(|plan| plan.element == "x264enc"));
         assert_eq!(plans.last().unwrap().input_format, "I420");
+    }
+
+    /// The backend choice depends on this predicate: a `true` here means the
+    /// share stays on GStreamer, so it must only report elements that exist.
+    #[test]
+    fn hardware_encoder_reports_installed_elements_only() {
+        assert!(!hardware_encoder(Codec::Opus));
+        assert!(!hardware_encoder(Codec::Av1));
+        let installed = ["vah264enc", "vaapih264enc"]
+            .iter()
+            .any(|element| gst::has_element(element));
+        assert_eq!(hardware_encoder(Codec::H264), installed);
     }
 
     #[test]

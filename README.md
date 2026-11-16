@@ -54,7 +54,9 @@ On Arch: `pacman -S vulkan-icd-loader wayland libxkbcommon fontconfig clang cmak
 
 Screen capture and encoding use GStreamer on Linux. When it is missing the app
 falls back to the native portal + FFmpeg path; set the capture backend to
-`portal` in the config to force that path.
+`portal` in the config to force that path. A share that asks for hardware
+encoding also uses that native path when the installed GStreamer has no
+hardware encoder (for example when `gstreamer1.0-vaapi` is not installed).
 
 ### Windows
 
