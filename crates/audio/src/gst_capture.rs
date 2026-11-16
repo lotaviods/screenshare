@@ -91,3 +91,66 @@ fn start(device: Option<String>, label: &str) -> Result<Box<dyn Capture>, String
         pending: Vec::new(),
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::microphone;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    /// A temporary PulseAudio null sink, so the test never records the user's
+    /// microphone. Unloading on drop leaves the audio configuration unchanged.
+    struct NullSink {
+        module: String,
+    }
+
+    impl NullSink {
+        fn create(name: &str) -> Option<Self> {
+            let output = Command::new("pactl")
+                .args(["load-module", "module-null-sink"])
+                .arg(format!("sink_name={name}"))
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let module = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            module
+                .starts_with(|c: char| c.is_ascii_digit())
+                .then_some(Self { module })
+        }
+    }
+
+    impl Drop for NullSink {
+        fn drop(&mut self) {
+            let _ = Command::new("pactl")
+                .args(["unload-module", &self.module])
+                .status();
+        }
+    }
+
+    /// The whole chain must produce Opus packets: source → framer → encoder.
+    /// Skips when the host has no PulseAudio control to create the sink.
+    #[test]
+    fn captures_and_encodes_from_a_silent_source() {
+        let name = format!("ss_gst_test_{}", std::process::id());
+        let Some(_sink) = NullSink::create(&name) else {
+            return;
+        };
+        let mut capture = match microphone(Some(format!("{name}.monitor"))) {
+            Ok(capture) => capture,
+            Err(_) => return,
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut samples = 0usize;
+        while Instant::now() < deadline && samples == 0 {
+            capture.pump().expect("capture stays healthy");
+            if let Some(pcm) = capture.next() {
+                samples += pcm.len();
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(samples > 0, "GStreamer microphone delivered no PCM");
+    }
+}

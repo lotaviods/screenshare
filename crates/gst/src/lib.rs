@@ -10,6 +10,8 @@
 //! SDK.
 #![cfg(feature = "gst-runtime")]
 
+pub mod webrtc;
+
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 

@@ -10,9 +10,11 @@ description = "GStreamer pipeline runner shared by capture and audio backends"
 # backends enable `gst-runtime`; a Windows build of the workspace leaves the
 # feature off, so no GStreamer SDK is needed to compile the tree.
 [features]
-gst-runtime = ["dep:gstreamer", "dep:gstreamer-app"]
+gst-runtime = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-webrtc", "dep:gstreamer-sdp"]
 
 [dependencies]
 gstreamer = { version = "0.25", optional = true }
 gstreamer-app = { version = "0.25", optional = true }
+gstreamer-webrtc = { version = "0.25", optional = true }
+gstreamer-sdp = { version = "0.25", optional = true }
 tracing.workspace = true
