@@ -10,6 +10,7 @@ members = [
     "crates/signaling",
     "crates/call",
     "crates/media",
+    "crates/processing",
     "crates/network",
     "crates/ui",
     "server",

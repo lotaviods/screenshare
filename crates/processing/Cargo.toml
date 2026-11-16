@@ -1,0 +1,16 @@
+[package]
+name = "sharescreen-processing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "FFmpeg media processing for Sharescreen (recording muxing, conversion, thumbnails, compression)"
+
+[dependencies]
+sharescreen-core = { path = "../core" }
+ffmpeg-next = "9"
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
