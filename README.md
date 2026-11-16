@@ -13,8 +13,10 @@ auth remain.
 
 - `crates/core` — domain model + trait boundaries (no OS/FFmpeg deps).
 - `crates/config` — configuration + persistent preferences + validation.
-- `crates/capture` — screen capture backends.
+- `crates/capture` — screen capture backends (GStreamer on Linux, GDI on Windows).
 - `crates/audio` — microphone + system loopback capture.
+- `crates/gst` — GStreamer pipeline runner shared by capture and audio.
+- `crates/processing` — FFmpeg file processing: probe, thumbnails, convert, compress.
 - `crates/webrtc` — peer connections and track wiring.
 - `crates/call` — call session (signaling + WebRTC mesh).
 - `crates/media` — remote media decode and playback.
@@ -44,10 +46,15 @@ make dist     # portable package for the current OS
 Linux/macOS (tar.gz) and `scripts/build.ps1` on Windows (zip with the FFmpeg
 DLLs bundled). Use `make dist-windows` or `make dist-linux` to force one.
 
-Linux needs the GPUI and FFmpeg system dependencies: a Vulkan driver,
+Linux needs the GPUI and media system dependencies: a Vulkan driver,
 Wayland or X11 client libraries, `xkbcommon`, `fontconfig`, `clang`, `cmake`,
-and FFmpeg with the VAAPI, libvpx, and libopus encoders.
-On Arch: `pacman -S vulkan-icd-loader wayland libxkbcommon fontconfig clang cmake ffmpeg`.
+GStreamer 1.20+ with the PipeWire, PulseAudio and x264/vpx plugins, and FFmpeg
+with the VAAPI, libvpx, and libopus encoders.
+On Arch: `pacman -S vulkan-icd-loader wayland libxkbcommon fontconfig clang cmake ffmpeg gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-plugin-pipewire`.
+
+Screen capture and encoding use GStreamer on Linux. When it is missing the app
+falls back to the native portal + FFmpeg path; set the capture backend to
+`portal` in the config to force that path.
 
 ### Windows
 

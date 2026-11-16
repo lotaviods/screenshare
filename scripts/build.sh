@@ -113,8 +113,9 @@ cat > "$stage/README.txt" <<'EOF'
 Sharescreen portable build
 
 Run ./sharescreen from this folder. This build links against the system
-FFmpeg, Wayland/X11, Vulkan, xkbcommon, and fontconfig libraries. See the
-project README for the packages needed on your distribution.
+FFmpeg, GStreamer, Wayland/X11, Vulkan, xkbcommon, and fontconfig libraries.
+See the project README for the packages needed on your distribution. Without
+GStreamer the app falls back to the native portal + FFmpeg capture path.
 EOF
 
 if ((archive)); then
