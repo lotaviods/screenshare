@@ -326,7 +326,7 @@ fn spawn(
 /// Implemented per platform in the [`linux`] and [`windows`] submodules, where
 /// `pump` drains whatever the backend has ready and `next` returns the pending
 /// samples (or `None` when there are none).
-trait Capture {
+pub(crate) trait Capture {
     fn pump(&mut self) -> Result<(), String>;
     fn next(&mut self) -> Option<Vec<i16>>;
 }

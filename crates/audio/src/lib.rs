@@ -10,7 +10,9 @@
 //! WASAPI endpoint enumeration.
 #![cfg(any(target_os = "linux", windows))]
 
-mod native;
+#[cfg(target_os = "linux")]
+mod gst_capture;
+pub(crate) mod native;
 #[cfg(target_os = "linux")]
 mod pulse;
 #[cfg(windows)]

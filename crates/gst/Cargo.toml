@@ -1,0 +1,18 @@
+[package]
+name = "sharescreen-gst"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "GStreamer pipeline runner shared by capture and audio backends"
+
+# The GStreamer runtime is a real dependency only where it is installed. Linux
+# backends enable `gst-runtime`; a Windows build of the workspace leaves the
+# feature off, so no GStreamer SDK is needed to compile the tree.
+[features]
+gst-runtime = ["dep:gstreamer", "dep:gstreamer-app"]
+
+[dependencies]
+gstreamer = { version = "0.25", optional = true }
+gstreamer-app = { version = "0.25", optional = true }
+tracing.workspace = true

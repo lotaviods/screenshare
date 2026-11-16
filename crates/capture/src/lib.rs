@@ -7,7 +7,11 @@
 #![cfg(any(target_os = "linux", windows))]
 
 #[cfg(target_os = "linux")]
+mod gst;
+#[cfg(target_os = "linux")]
 mod native;
+#[cfg(target_os = "linux")]
+mod portal;
 #[cfg(target_os = "linux")]
 mod thumbnail;
 
@@ -52,6 +56,9 @@ fn send_while_running(
 
 /// Selects and owns a concrete capture backend.
 pub enum CaptureEngine {
+    /// GStreamer pipeline (portal PipeWire source → encoder → appsink).
+    #[cfg(target_os = "linux")]
+    Gst(gst::GstCapture),
     #[cfg(target_os = "linux")]
     Wayland(WaylandCapture),
     #[cfg(windows)]
@@ -62,6 +69,8 @@ impl CaptureEngine {
     pub fn failure(&self) -> Option<String> {
         match self {
             #[cfg(target_os = "linux")]
+            Self::Gst(capture) => capture.failure(),
+            #[cfg(target_os = "linux")]
             Self::Wayland(capture) => capture.failure(),
             #[cfg(windows)]
             Self::Windows(capture) => capture.failure(),
@@ -71,6 +80,8 @@ impl CaptureEngine {
     pub fn take_notice(&self) -> Option<String> {
         match self {
             #[cfg(target_os = "linux")]
+            Self::Gst(_) => None,
+            #[cfg(target_os = "linux")]
             Self::Wayland(_) => None,
             #[cfg(windows)]
             Self::Windows(capture) => capture.take_notice(),
@@ -79,6 +90,8 @@ impl CaptureEngine {
     /// Whether the current native capture worker has stopped unexpectedly.
     pub fn finished(&self) -> bool {
         match self {
+            #[cfg(target_os = "linux")]
+            Self::Gst(capture) => capture.finished(),
             #[cfg(target_os = "linux")]
             Self::Wayland(capture) => capture.finished(),
             #[cfg(windows)]
@@ -90,17 +103,27 @@ impl CaptureEngine {
     pub fn latest_preview(&self) -> Option<Vec<u8>> {
         match self {
             #[cfg(target_os = "linux")]
+            Self::Gst(capture) => capture.latest_preview(),
+            #[cfg(target_os = "linux")]
             Self::Wayland(w) => w.latest_preview(),
             #[cfg(windows)]
             Self::Windows(w) => w.latest_preview(),
         }
     }
 
-    /// Build the engine for the requested backend. `Auto` and `Portal` select
-    /// the desktop-portal path on Linux (which also covers X11 sessions via the
-    /// portal) and the native GDI path on Windows.
+    /// Build the engine for the requested backend.
+    ///
+    /// On Linux, `Auto` prefers GStreamer when the runtime and `pipewiresrc`
+    /// are installed, and falls back to the native portal + FFmpeg path. The
+    /// explicit `Portal` (and legacy `X11`) choice always selects the native
+    /// path, which gives users a fallback when a GStreamer encoder is missing.
     pub fn new(backend: CaptureBackend) -> Result<Self, CaptureError> {
         match backend {
+            #[cfg(target_os = "linux")]
+            CaptureBackend::Auto if gst::available() => {
+                tracing::info!("capture backend: GStreamer (auto)");
+                Ok(CaptureEngine::Gst(gst::GstCapture::default()))
+            }
             #[cfg(target_os = "linux")]
             CaptureBackend::Auto | CaptureBackend::Portal | CaptureBackend::X11 => {
                 Ok(CaptureEngine::Wayland(WaylandCapture::default()))
@@ -123,6 +146,8 @@ impl ScreenCapture for CaptureEngine {
     fn list_sources(&self) -> Vec<CaptureSource> {
         match self {
             #[cfg(target_os = "linux")]
+            Self::Gst(w) => w.list_sources(),
+            #[cfg(target_os = "linux")]
             Self::Wayland(w) => w.list_sources(),
             #[cfg(windows)]
             Self::Windows(w) => w.list_sources(),
@@ -137,6 +162,8 @@ impl ScreenCapture for CaptureEngine {
     ) -> Result<(), CaptureError> {
         match self {
             #[cfg(target_os = "linux")]
+            Self::Gst(w) => w.start(source, options, sink).await,
+            #[cfg(target_os = "linux")]
             Self::Wayland(w) => w.start(source, options, sink).await,
             #[cfg(windows)]
             Self::Windows(w) => w.start(source, options, sink).await,
@@ -145,6 +172,8 @@ impl ScreenCapture for CaptureEngine {
 
     async fn stop(&mut self) -> Result<(), CaptureError> {
         match self {
+            #[cfg(target_os = "linux")]
+            Self::Gst(w) => w.stop().await,
             #[cfg(target_os = "linux")]
             Self::Wayland(w) => w.stop().await,
             #[cfg(windows)]
